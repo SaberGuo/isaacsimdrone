@@ -301,7 +301,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "phi_max":        360.0,
             "delta_theta":    10.0,
             "delta_phi":      5.0,
-            "empty_value":    50.0,
+            "empty_value":    0.0,
             "max_vis_points": 10000,
         }
 

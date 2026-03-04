@@ -74,9 +74,9 @@ def obs_lidar_min_range_grid(
     phi_max: float = 360.0,
     delta_theta: float = 1.0,
     delta_phi: float = 5.0,
-    empty_value: float = 50.0,
+    empty_value: float = 0.0,
     max_vis_points: int | None = None,
-    max_distance: float = 10.0,
+    max_distance: float | None = None,
 ) -> torch.Tensor:
     """lidar_state_grid: (num_envs, T*P) flattened *closeness* in each bin.
 
@@ -155,18 +155,18 @@ def obs_lidar_min_range_grid(
 
     # Empty bin -> treat as max_distance (so closeness=0)
     # (Also clamp very far hits to max_distance for normalization)
+    if max_distance is None:
+        try:
+            max_distance = float(getattr(lidar.cfg, "max_distance", 50.0))
+        except Exception:
+            max_distance = 50.0
     max_d = torch.tensor(float(max_distance), device=env.device, dtype=torch.float32)
+
     min_dist = torch.where(torch.isfinite(min_dist), min_dist, max_d)
     min_dist = torch.clamp(min_dist, 0.0, max_d)
 
     # closeness = 1 - clamp(min_dist / max_distance, 0, 1)
     closeness = 1.0 - torch.clamp(min_dist / max_d, 0.0, 1.0)
-
-    # Keep compatibility: if user sets empty_value != 0, allow overriding empty bins closeness.
-    # Original requirement says empty -> closeness=0, so default behavior already matches.
-    if empty_value != 0.0:
-        # Interpret empty_value as *closeness* to fill empty bins, if desired.
-        empty_closeness = torch.tensor(float(empty_value), device=env.device, dtype=torch.float32)
 
 
     return closeness

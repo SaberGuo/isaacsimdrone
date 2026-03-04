@@ -266,10 +266,12 @@ def penalty_lidar_threat(
             phi_max=phi_max,
             delta_theta=delta_theta,
             delta_phi=delta_phi,
-            empty_value=max_d,
+            empty_value=0.0,
             max_vis_points=max_vis_points,
+            max_distance=max_d,
         )
-        min_dist = grid.min(dim=1).values
+        max_close = grid.max(dim=1).values
+        min_dist = max_d * (1.0 - max_close)
 
     x = (threshold - min_dist) / exp_scale
     x = torch.clamp(x, min=0.0)
@@ -307,8 +309,8 @@ def penalty_energy(
     ang_acc_scale = max(float(ang_acc_scale), 1e-6)
     max_penalty = float(max_penalty)
 
-    v = mdp.base_lin_vel(env, asset_cfg=asset_cfg)
-    w = mdp.base_ang_vel(env, asset_cfg=asset_cfg)
+    v = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg)
+    w = mdp.root_ang_vel_w(env, asset_cfg=asset_cfg)
 
     v_norm = _safe_norm(v)
     w_norm = _safe_norm(w)
