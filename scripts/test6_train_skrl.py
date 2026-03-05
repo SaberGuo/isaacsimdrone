@@ -1,3 +1,5 @@
+# /home/hjr/hjr_isaacdrone_ws/omniperception_isaacdrone/scripts/test6_train_skrl.py
+
 from __future__ import annotations
 
 import argparse
@@ -50,9 +52,10 @@ parser.add_argument("--grad_hist_samples", type=int, default=65536, help="Max sa
 parser.add_argument("--extra_tb_subdir", type=str, default="extra_tb", help="Subdir under experiment logdir")
 
 # PPO hyperparams (expose the key ones you may tune often)
-parser.add_argument("--rollouts", type=int, default=32, help="PPO rollouts (steps) before each update")
+# NOTE: Keep defaults conservative; you can override on CLI.
+parser.add_argument("--rollouts", type=int, default=64, help="PPO rollouts (steps) before each update")
 parser.add_argument("--learning_epochs", type=int, default=4)
-parser.add_argument("--mini_batches", type=int, default=4)
+parser.add_argument("--mini_batches", type=int, default=8)
 parser.add_argument("--learning_rate", type=float, default=3e-4)
 
 parser.add_argument("--checkpoint_interval", type=int, default=50000, help="Save checkpoint every N timesteps")
@@ -120,33 +123,89 @@ from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
 
 
 # -----------------------------------------------------------------------------
-# Structured Feature Extractor (NOT shared)
+# Initialization helpers
+# -----------------------------------------------------------------------------
+def _init_linear(m: nn.Module):
+    if isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight, gain=1.0)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
+
+
+# -----------------------------------------------------------------------------
+# Structured Feature Extractor (NOT shared) with input normalization
 # -----------------------------------------------------------------------------
 class StructuredFeatureExtractor(nn.Module):
+    """Two-tower encoder (state + lidar) with lightweight normalization.
+
+    Why this helps:
+      - state terms have very different scales (pos ~ 60, vel ~ 5, quat ~ 1, goal_delta ~ 60)
+      - lidar closeness is in [0, 1]
+    Without normalization, the network tends to ignore some terms (e.g. goal_delta) and gradients collapse.
+    """
+
     def __init__(self, state_dim: int, lidar_dim: int, feat_dim: int = 256):
         super().__init__()
         self.state_dim = int(state_dim)
         self.lidar_dim = int(lidar_dim)
         self.feat_dim = int(feat_dim)
 
+        # Fixed scale (best-effort) + LayerNorm
+        scale = torch.ones(self.state_dim, dtype=torch.float32)
+        if self.state_dim == 19:
+            # state layout:
+            # 0:3   root_pos (m)
+            # 3:7   root_quat (unit)
+            # 7:10  root_lin_vel (m/s)
+            # 10:13 root_ang_vel (rad/s)
+            # 13:16 projected_gravity (unit-ish)
+            # 16:19 goal_delta (m)
+            scale[0:3] = 1.0 / 60.0
+            scale[7:10] = 1.0 / 5.0
+            scale[10:13] = 1.0 / 10.0
+            scale[16:19] = 1.0 / 60.0
+
+        self.register_buffer("state_scale", scale.view(1, -1), persistent=False)
+        self.state_ln = nn.LayerNorm(self.state_dim)
+
+        self.lidar_ln = nn.LayerNorm(self.lidar_dim)
+
+        hidden = 256
+
         self.state_net = nn.Sequential(
-            nn.Linear(self.state_dim, 256),
-            nn.Tanh(),
+            nn.Linear(self.state_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
         )
 
         self.lidar_net = nn.Sequential(
-            nn.Linear(self.lidar_dim, 256),
-            nn.Tanh(),
+            nn.Linear(self.lidar_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
         )
 
         self.fuse_net = nn.Sequential(
-            nn.Linear(256 + 256, self.feat_dim),
-            nn.Tanh(),
+            nn.Linear(hidden + hidden, self.feat_dim),
+            nn.SiLU(),
         )
+
+        self.apply(_init_linear)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         s = obs[:, : self.state_dim]
         l = obs[:, self.state_dim : self.state_dim + self.lidar_dim]
+
+        # normalize state
+        s = s * self.state_scale.to(s.device)
+        s = torch.clamp(s, -5.0, 5.0)
+        s = self.state_ln(s)
+
+        # lidar closeness in [0,1] -> roughly centered [-1,1] + LN
+        l = torch.clamp(l, 0.0, 1.0)
+        l = l * 2.0 - 1.0
+        l = self.lidar_ln(l)
 
         s_feat = self.state_net(s)
         l_feat = self.lidar_net(l)
@@ -176,13 +235,17 @@ class Policy(GaussianMixin, Model):
 
         self.fe = StructuredFeatureExtractor(state_dim=state_dim, lidar_dim=lidar_dim, feat_dim=feat_dim)
         self.mean = nn.Linear(feat_dim, act_dim)
-        self.log_std_parameter = nn.Parameter(torch.zeros(act_dim))
+        self.log_std_parameter = nn.Parameter(torch.full((act_dim,), -0.5))  # slightly less exploration at init
+
+        self.apply(_init_linear)
 
     def compute(self, inputs, role):
         obs = inputs["states"]
         feat = self.fe(obs)
         mean = self.mean(feat)
-        log_std = self.log_std_parameter.expand_as(mean)
+
+        # clamp log_std to avoid extreme exploration / huge actions
+        log_std = torch.clamp(self.log_std_parameter, min=-3.0, max=1.0).expand_as(mean)
         return mean, log_std, {}
 
 
@@ -202,6 +265,8 @@ class Value(DeterministicMixin, Model):
 
         self.fe = StructuredFeatureExtractor(state_dim=state_dim, lidar_dim=lidar_dim, feat_dim=feat_dim)
         self.v = nn.Linear(feat_dim, 1)
+
+        self.apply(_init_linear)
 
     def compute(self, inputs, role):
         obs = inputs["states"]
@@ -268,6 +333,13 @@ def log_cuda_memory(writer: SummaryWriter, step: int):
 
 
 def log_reward_terms(writer: SummaryWriter, base_env, step: int):
+    """Log RewardManager internal per-term values.
+
+    IMPORTANT:
+      In IsaacLab, RewardManager stores term values in `_step_reward` as:
+          term_output * term_weight
+      (i.e. WITHOUT multiplying dt; dt is applied when accumulating the final step reward).
+    """
     rm = getattr(base_env, "reward_manager", None)
     if rm is None:
         return
@@ -357,6 +429,7 @@ def log_env_step_stats(
         writer.add_scalar("Env/episode_length_done_min", float(x.min().item()), step)
         writer.add_scalar("Env/episode_length_done_mean", float(x.mean().item()), step)
         writer.add_scalar("Env/episode_length_done_max", float(x.max().item()), step)
+        # NOTE: this is "how many env instances ended since last TB log", NOT success rate.
         writer.add_scalar("Env/episodes_done_count", float(len(ended_lengths)), step)
 
 
@@ -377,12 +450,32 @@ def log_reward_action_stats(writer: SummaryWriter, step: int, rewards: torch.Ten
         a = actions.float()
         if not torch.isfinite(a).all():
             a = _nan_to_num_inplace(a, nan=0.0, posinf=0.0, neginf=0.0)
-        writer.add_scalar("Action/mean", _to_float(a.mean()), step)
-        writer.add_scalar("Action/std", _to_float(a.std(unbiased=False)), step)
+        writer.add_scalar("Action/raw_mean", _to_float(a.mean()), step)
+        writer.add_scalar("Action/raw_std", _to_float(a.std(unbiased=False)), step)
+        writer.add_scalar("Action/raw_abs_mean", _to_float(a.abs().mean()), step)
         if a.dim() == 2:
             for i in range(a.shape[1]):
-                writer.add_scalar(f"Action/dim_{i}_mean", _to_float(a[:, i].mean()), step)
-                writer.add_scalar(f"Action/dim_{i}_std", _to_float(a[:, i].std(unbiased=False)), step)
+                writer.add_scalar(f"Action/raw_dim_{i}_mean", _to_float(a[:, i].mean()), step)
+                writer.add_scalar(f"Action/raw_dim_{i}_std", _to_float(a[:, i].std(unbiased=False)), step)
+
+
+def log_action_processed_stats(writer: SummaryWriter, base_env, step: int):
+    """Log processed (scaled/clipped) actions from ActionTerm."""
+    try:
+        term = base_env.action_manager.get_term("root_twist")
+        a = getattr(term, "processed_actions", None)
+        if not isinstance(a, torch.Tensor):
+            return
+        a = a.float()
+        writer.add_scalar("ActionProcessed/mean", _to_float(a.mean()), step)
+        writer.add_scalar("ActionProcessed/std", _to_float(a.std(unbiased=False)), step)
+        writer.add_scalar("ActionProcessed/abs_mean", _to_float(a.abs().mean()), step)
+        if a.dim() == 2:
+            for i in range(a.shape[1]):
+                writer.add_scalar(f"ActionProcessed/dim_{i}_mean", _to_float(a[:, i].mean()), step)
+                writer.add_scalar(f"ActionProcessed/dim_{i}_std", _to_float(a[:, i].std(unbiased=False)), step)
+    except Exception:
+        pass
 
 
 def log_gradients(
@@ -517,6 +610,7 @@ def main():
     print("[INFO] Creating env via gym.make(..., cfg=env_cfg)", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
     print(f"[INFO] Base env type: {type(base_env)}", flush=True)
+
     try:
         if hasattr(base_env, "scene") and hasattr(base_env.scene, "filter_collisions"):
             base_env.scene.filter_collisions(global_prim_paths=["/World/ground", "/World/Obstacles"])
@@ -535,6 +629,15 @@ def main():
     print(f"[INFO] observation_space: {env.observation_space}", flush=True)
     print(f"[INFO] action_space: {env.action_space}", flush=True)
     print(f"[INFO] num_envs: {env.num_envs}, device: {env.device}", flush=True)
+
+    # Helpful diagnostics for action bounds
+    try:
+        if hasattr(env.action_space, "low") and hasattr(env.action_space, "high"):
+            lo = env.action_space.low
+            hi = env.action_space.high
+            print(f"[INFO] action_space.low={lo}, high={hi}", flush=True)
+    except Exception:
+        pass
 
     obs_dim = int(env.observation_space.shape[0])
     act_dim = int(env.action_space.shape[0])
@@ -570,7 +673,7 @@ def main():
     agent_cfg["grad_norm_clip"] = 1.0
     agent_cfg["ratio_clip"] = 0.2
     agent_cfg["value_clip"] = 0.2
-    agent_cfg["entropy_loss_scale"] = 0.01
+    agent_cfg["entropy_loss_scale"] = 0.02  # slightly higher exploration for navigation
     agent_cfg["value_loss_scale"] = 0.5
 
     # -------------------------------------------------------------------------
@@ -729,6 +832,7 @@ def main():
                 last_log_time = now
 
                 log_reward_action_stats(writer, t, rewards, actions)
+                log_action_processed_stats(writer, base_env, t)
                 log_reward_terms(writer, base_env, t)
                 log_termination_ratios(writer, base_env, t)
                 log_env_step_stats(writer, t, episode_steps, ended_lengths)

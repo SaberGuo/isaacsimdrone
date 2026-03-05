@@ -7,6 +7,7 @@ from .test6_observations import obs_goal_delta, obs_lidar_min_range_grid
 
 from .test6_rewards import (
     reward_distance_to_goal,
+    reward_progress_to_goal,
     reward_height_tracking,
     reward_stability,
     reward_velocity_towards_goal,
@@ -35,6 +36,7 @@ __all__ = [
     "obs_lidar_min_range_grid",
     # rewards
     "reward_distance_to_goal",
+    "reward_progress_to_goal",
     "reward_height_tracking",
     "reward_stability",
     "reward_velocity_towards_goal",

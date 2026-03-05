@@ -8,6 +8,8 @@
 新增：
   - 为能量惩罚提供跨步速度缓存：_energy_prev_lin_vel_w / _energy_prev_ang_vel_w
     并在 reset_idx 时刷新，避免跨 episode 的“假加速度尖峰”
+  - 为 progress reward 提供距离缓存：_progress_prev_goal_dist
+    并在 reset_idx 时刷新，避免跨 episode 的“假进度尖峰”
 """
 
 from __future__ import annotations
@@ -91,6 +93,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
     Custom env that adds:
       - per-env goal buffer (goal_pos_w)
       - per-env prev velocity buffers for energy penalty
+      - per-env prev goal distance buffer for progress-to-goal reward
     Compatible with gym.make() kwargs used by IsaacLab registry.
     """
 
@@ -112,17 +115,22 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._energy_prev_lin_vel_w = torch.zeros((1, 3), dtype=torch.float32)
         self._energy_prev_ang_vel_w = torch.zeros((1, 3), dtype=torch.float32)
 
+        # For progress reward (distance decrease)
+        self._progress_prev_goal_dist = torch.zeros((1,), dtype=torch.float32)
+
         super().__init__(cfg=cfg)
 
         # Now num_envs and device are known
         self.goal_pos_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
         self._energy_prev_lin_vel_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
         self._energy_prev_ang_vel_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
+        self._progress_prev_goal_dist = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float32)
 
-        self._sample_goals(torch.arange(self.num_envs, device=self.device))
-
-        # init velocity caches from current sim state
-        self._refresh_energy_prev_buffers(torch.arange(self.num_envs, device=self.device))
+        # sample goals and init caches
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        self._sample_goals(env_ids)
+        self._refresh_energy_prev_buffers(env_ids)
+        self._refresh_progress_prev_dist(env_ids)
 
     # ----- goal sampling -----
     def _sample_goals(self, env_ids: torch.Tensor):
@@ -152,6 +160,15 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
             self._energy_prev_lin_vel_w[env_ids] = 0.0
             self._energy_prev_ang_vel_w[env_ids] = 0.0
 
+    def _refresh_progress_prev_dist(self, env_ids: torch.Tensor):
+        """Refresh prev goal distance buffer to avoid cross-episode progress spikes."""
+        try:
+            pos = mdp.root_pos_w(self, asset_cfg=SceneEntityCfg("robot"))  # (N,3)
+            d = torch.norm(self.goal_pos_w - pos, dim=-1)  # (N,)
+            self._progress_prev_goal_dist[env_ids] = d[env_ids].detach()
+        except Exception:
+            self._progress_prev_goal_dist[env_ids] = 0.0
+
     # ----- reset with re-sampled goals -----
     def reset_idx(self, env_ids: torch.Tensor | None = None):
         if env_ids is None:
@@ -162,8 +179,9 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
 
         obs, info = super().reset_idx(env_ids)
 
-        # refresh energy caches AFTER reset has written velocities to sim
+        # refresh caches AFTER reset has written sim state
         self._refresh_energy_prev_buffers(env_ids)
+        self._refresh_progress_prev_dist(env_ids)
 
         # optional info
         try:

@@ -33,6 +33,7 @@ from omniperception_isaacdrone.tasks.mdp import (
     obs_goal_delta,
     obs_lidar_min_range_grid,
     reward_distance_to_goal,
+    reward_progress_to_goal,
     reward_height_tracking,
     reward_stability,
     reward_velocity_towards_goal,
@@ -119,6 +120,7 @@ class Test6SceneCfg(InteractiveSceneCfg):
 @configclass
 class Test6SceneWithLidarCfg(Test6SceneCfg):
     if LIDAR_CFG is not None:
+        # Note: lidar_cfg.py has a placeholder prim_path; we replace it here
         lidar: LidarSensorCfg = LIDAR_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
 
@@ -159,19 +161,25 @@ class Test6EventCfg:
 
 @configclass
 class Test6RewardsCfg:
-    dist_to_goal      = RewTerm(func=reward_distance_to_goal,      weight=10.0,  params={})
-    vel_towards_goal  = RewTerm(func=reward_velocity_towards_goal, weight=2.0,   params={})
-    height            = RewTerm(func=reward_height_tracking,       weight=2.0,   params={})
-    stability         = RewTerm(func=reward_stability,             weight=1.5,   params={})
+    # goal shaping
+    progress_to_goal = RewTerm(func=reward_progress_to_goal, weight=3.0, params={})
+    dist_to_goal     = RewTerm(func=reward_distance_to_goal, weight=2.0, params={})
+    vel_towards_goal = RewTerm(func=reward_velocity_towards_goal, weight=0.5, params={})
 
-    lidar_threat      = RewTerm(func=penalty_lidar_threat,         weight=-1.0,  params={})
-    energy            = RewTerm(func=penalty_energy,               weight=-0.05, params={})
-    action_l2         = RewTerm(func=reward_action_l2,             weight=-0.01)
+    # stabilization / regularization
+    height    = RewTerm(func=reward_height_tracking, weight=1.0, params={})
+    stability = RewTerm(func=reward_stability,       weight=0.5, params={})
 
-    success_bonus     = RewTerm(func=reward_goal_reached,          weight=200.0,  params={})
-    collision_penalty = RewTerm(func=penalty_collision,            weight=-200.0, params={})
-    oob_penalty       = RewTerm(func=penalty_out_of_workspace,     weight=-150.0, params={})
-    timeout_penalty   = RewTerm(func=penalty_time_out,             weight=-100.0,  params={})
+    # safety & effort
+    lidar_threat = RewTerm(func=penalty_lidar_threat, weight=-1.0,  params={})
+    energy       = RewTerm(func=penalty_energy,       weight=-0.05, params={})
+    action_l2    = RewTerm(func=reward_action_l2,     weight=-0.02)
+
+    # terminal signals (NOTE: actual per-step reward integrates weight * dt)
+    success_bonus     = RewTerm(func=reward_goal_reached,      weight=3000.0,  params={})
+    collision_penalty = RewTerm(func=penalty_collision,        weight=-3000.0, params={})
+    oob_penalty       = RewTerm(func=penalty_out_of_workspace, weight=-3000.0, params={})
+    timeout_penalty   = RewTerm(func=penalty_time_out,         weight=-600.0,  params={})
 
 
 @configclass
@@ -198,7 +206,10 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             pass
 
         self.decimation = 2
-        max_steps = 500
+        # IMPORTANT: with vel_clip=5m/s and step_dt ~ 1/60s, 500 steps only allows ~41m travel.
+        # Your workspace/goal can require up to ~99m travel, so we extend the horizon.
+        max_steps = 1500
+
         self.sim.dt = 1.0 / 120.0
         self.sim.render_interval = self.decimation
         self.episode_length_s = float(max_steps) * float(self.sim.dt) * float(self.decimation)
@@ -212,10 +223,12 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "use_sim_total_mass":  True,
             "prevent_negative_thrust": True,
 
+            # action scaling (normalized -> physical command)
             "vel_scale":           3.0,
             "vel_clip":            5.0,
             "yaw_rate_scale":      2.0,
             "yaw_rate_clip":       3.0,
+
             "thrust_sign":         1.0,
             "g":                   9.81,
             "vel_gain":            (3.0, 3.0, 4.0),
@@ -227,12 +240,14 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "inertia_diag":        (0.02, 0.02, 0.04),
         }
 
+        # reset sampling
         self.events.reset_robot_base.params = {
             "asset_cfg":        SceneEntityCfg("robot"),
             "square_half_size": 35.0,
             "z_range":          (3.0, 7.0),
         }
 
+        # terminations
         GOAL_RADIUS = 1.0
         self.terminations.reached_goal.params = {
             "asset_cfg":  SceneEntityCfg("robot"),
@@ -249,7 +264,13 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "threshold":  1.0,
         }
 
-        self.rewards.dist_to_goal.params = {"asset_cfg": SceneEntityCfg("robot"), "std": 6.0}
+        # reward params
+        self.rewards.progress_to_goal.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
+            "speed_ref": 3.0,   # m/s (normalization)
+            "clip":      1.0,
+        }
+        self.rewards.dist_to_goal.params = {"asset_cfg": SceneEntityCfg("robot"), "std": 10.0}
         self.rewards.height.params       = {"asset_cfg": SceneEntityCfg("robot"), "target_z": 5.0, "std": 2.5}
         self.rewards.stability.params    = {"asset_cfg": SceneEntityCfg("robot"), "lin_std": 2.0, "ang_std": 6.0}
         self.rewards.vel_towards_goal.params = {
@@ -259,28 +280,32 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "use_relu":   True,
         }
 
+        # LiDAR safety penalty (safe_dist = 0.1 * max_range by default)
         self.rewards.lidar_threat.params = {
-            "lidar_name":   "lidar",
-            "threshold":    1.2,
-            "exp_scale":    0.25,
-            "cap":          5.0,
-            "use_grid":     False,
-            "theta_min":      30.0,
-            "theta_max":      90.0,
-            "phi_min":        0.0,
-            "phi_max":        360.0,
-            "delta_theta":    10.0,
-            "delta_phi":      5.0,
-            "max_vis_points": 10000,
+            "lidar_name":       "lidar",
+            "safe_dist":        None,
+            "safe_dist_ratio":  0.1,     # 0.1 * 50m = 5m
+            "exp_scale":        1.0,     # meters (controls steepness)
+            "cap":             5.0,
+            "use_grid":         True,    # grid avoids ground dominance via theta range
+            "theta_min":        30.0,
+            "theta_max":        90.0,
+            "phi_min":          0.0,
+            "phi_max":          360.0,
+            "delta_theta":      10.0,
+            "delta_phi":        5.0,
+            "max_vis_points":   12000,
         }
 
+        # energy penalty (rescaled to avoid always hitting max_penalty)
         self.rewards.energy.params = {
             "asset_cfg":       SceneEntityCfg("robot"),
-            "lin_vel_scale":   5.0,
-            "ang_vel_scale":   8.0,
-            "lin_acc_scale":   15.0,
-            "ang_acc_scale":   25.0,
+            "lin_vel_scale":   6.0,
+            "ang_vel_scale":   10.0,
+            "lin_acc_scale":   50.0,
+            "ang_acc_scale":   80.0,
             "include_acc":     True,
+            "acc_weight":      0.2,
             "max_penalty":     10.0,
         }
 
@@ -293,6 +318,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         }
         self.rewards.collision_penalty.params = {"sensor_cfg": SceneEntityCfg("contact_sensor"), "threshold": 1.0}
 
+        # obs lidar grid params
         self.observations.policy.lidar_grid.params = {
             "lidar_name":     "lidar",
             "theta_min":      30.0,
@@ -302,7 +328,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "delta_theta":    10.0,
             "delta_phi":      5.0,
             "empty_value":    0.0,
-            "max_vis_points": 10000,
+            "max_vis_points": 12000,
         }
 
 

@@ -1,3 +1,5 @@
+# omniperception_isaacdrone/tasks/mdp/test6_observations.py
+
 from __future__ import annotations
 
 import torch
@@ -26,6 +28,21 @@ def obs_goal_delta(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.T
         goal = goal[:1].expand(pos.shape[0], 3)
 
     return goal - pos
+
+
+def _get_lidar_ranges(lidar, default_min: float = 0.2, default_max: float = 50.0) -> tuple[float, float]:
+    """Best-effort read of lidar min/max range from cfg."""
+    min_r = float(default_min)
+    max_r = float(default_max)
+    try:
+        if hasattr(lidar, "cfg"):
+            if hasattr(lidar.cfg, "min_range"):
+                min_r = float(lidar.cfg.min_range)
+            if hasattr(lidar.cfg, "max_distance"):
+                max_r = float(lidar.cfg.max_distance)
+    except Exception:
+        pass
+    return min_r, max_r
 
 
 def _get_downsampled_pc_torch(env, lidar, env_ids: torch.Tensor, max_pts: int | None):
@@ -61,10 +78,8 @@ def _get_downsampled_pc_torch(env, lidar, env_ids: torch.Tensor, max_pts: int | 
 
 
 # -----------------------------------------------------------------------------
-# lidar_state: polar grid minimum range (flattened)
+# lidar_state: polar grid minimum range (flattened as closeness)
 # -----------------------------------------------------------------------------
-import torch
-
 def obs_lidar_min_range_grid(
     env: "ManagerBasedRLEnv",
     lidar_name: str = "lidar",
@@ -86,13 +101,17 @@ def obs_lidar_min_range_grid(
         closeness = 1 - clamp(min_dist / max_distance, 0, 1)
     Empty bin is treated as min_dist = max_distance -> closeness = 0.
 
-    Note:
-      - `empty_value` is kept for API compatibility but the output is closeness.
-      - If you want empty bins to be some other closeness, change `empty_closeness`.
+    IMPORTANT robustness fixes:
+      - ignore non-finite points
+      - ignore points with r <= min_range (e.g. zeros or self hits)
+      - clamp normalization by max_distance
     """
 
+    # bin counts
     T = int((theta_max - theta_min) / delta_theta)
     Pn = int((phi_max - phi_min) / delta_phi)
+    T = max(T, 1)
+    Pn = max(Pn, 1)
     out_shape = (env.num_envs, T * Pn)
 
     # If no scene/lidar -> output zeros (closeness=0)
@@ -103,6 +122,13 @@ def obs_lidar_min_range_grid(
         lidar = env.scene[lidar_name]
     except Exception:
         return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
+
+    # ranges
+    min_r_cfg, max_r_cfg = _get_lidar_ranges(lidar, default_min=0.2, default_max=50.0)
+    if max_distance is None:
+        max_distance = float(max_r_cfg)
+    max_d = float(max_distance)
+    min_r = float(min_r_cfg)
 
     env_ids = torch.arange(env.num_envs, device=env.device)
     pc, _ = _get_downsampled_pc_torch(env, lidar, env_ids, max_pts=max_vis_points)
@@ -116,6 +142,9 @@ def obs_lidar_min_range_grid(
     valid = torch.isfinite(x) & torch.isfinite(y) & torch.isfinite(z)
 
     r = torch.sqrt(x * x + y * y + z * z + 1e-12)
+
+    # reject near-zero / out-of-range points
+    valid = valid & (r > (min_r + 1e-3)) & (r <= (max_d + 1e-3))
 
     cos_theta = torch.clamp(z / r, -1.0, 1.0)
     theta = torch.rad2deg(torch.acos(cos_theta))
@@ -146,6 +175,7 @@ def obs_lidar_min_range_grid(
 
         lin_idx = t_idx * Pn + p_idx
 
+        # NOTE: loop over envs for correctness & simplicity (num_envs is small)
         for e in range(env.num_envs):
             me = m[e]
             if me.any():
@@ -154,20 +184,12 @@ def obs_lidar_min_range_grid(
                 min_dist[e].scatter_reduce_(0, idx_e, r_e, reduce="amin", include_self=True)
 
     # Empty bin -> treat as max_distance (so closeness=0)
-    # (Also clamp very far hits to max_distance for normalization)
-    if max_distance is None:
-        try:
-            max_distance = float(getattr(lidar.cfg, "max_distance", 50.0))
-        except Exception:
-            max_distance = 50.0
-    max_d = torch.tensor(float(max_distance), device=env.device, dtype=torch.float32)
+    max_d_t = torch.tensor(max_d, device=env.device, dtype=torch.float32)
 
-    min_dist = torch.where(torch.isfinite(min_dist), min_dist, max_d)
-    min_dist = torch.clamp(min_dist, 0.0, max_d)
+    min_dist = torch.where(torch.isfinite(min_dist), min_dist, max_d_t)
+    min_dist = torch.clamp(min_dist, 0.0, max_d_t)
 
     # closeness = 1 - clamp(min_dist / max_distance, 0, 1)
-    closeness = 1.0 - torch.clamp(min_dist / max_d, 0.0, 1.0)
+    closeness = 1.0 - torch.clamp(min_dist / max_d_t, 0.0, 1.0)
 
-
-    return closeness
-
+    return closeness.to(torch.float32)
