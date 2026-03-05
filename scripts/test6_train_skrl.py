@@ -237,6 +237,21 @@ def _sample_flat(t: torch.Tensor, max_samples: int) -> torch.Tensor:
     return x[idx]
 
 
+def _nan_to_num_inplace(x: torch.Tensor, nan: float = 0.0, posinf: float = 0.0, neginf: float = 0.0) -> torch.Tensor:
+    """Safe nan_to_num for tensors; returns a tensor (not necessarily in-place depending on backend)."""
+    try:
+        return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
+    except Exception:
+        # fallback (older torch): replace via masks
+        y = x
+        if torch.isnan(y).any():
+            y = torch.where(torch.isnan(y), torch.full_like(y, nan), y)
+        if torch.isinf(y).any():
+            y = torch.where(y == float("inf"), torch.full_like(y, posinf), y)
+            y = torch.where(y == float("-inf"), torch.full_like(y, neginf), y)
+        return y
+
+
 def log_cuda_memory(writer: SummaryWriter, step: int):
     if not args.log_cuda_mem:
         return
@@ -279,6 +294,16 @@ def log_reward_terms(writer: SummaryWriter, base_env, step: int):
 
     for i, name in enumerate(term_names):
         v = step_reward[:, i]
+
+        # If a term becomes non-finite, print it (to locate the first bad source)
+        if isinstance(v, torch.Tensor) and not torch.isfinite(v).all():
+            print(f"[WARN] Non-finite reward term '{name}' detected at step={step}", flush=True)
+            try:
+                writer.add_scalar(f"Debug/nonfinite_reward_term/{_sanitize_tb_tag(name)}", 1.0, step)
+            except Exception:
+                pass
+            v = _nan_to_num_inplace(v, nan=0.0, posinf=0.0, neginf=0.0)
+
         writer.add_scalar(f"RewardTermsWeighted/{_sanitize_tb_tag(name)}/min", _to_float(v.min()), step)
         writer.add_scalar(f"RewardTermsWeighted/{_sanitize_tb_tag(name)}/mean", _to_float(v.mean()), step)
         writer.add_scalar(f"RewardTermsWeighted/{_sanitize_tb_tag(name)}/max", _to_float(v.max()), step)
@@ -286,6 +311,8 @@ def log_reward_terms(writer: SummaryWriter, base_env, step: int):
         w = weights[i] if i < len(weights) else None
         if w is not None and abs(w) > 1e-12:
             raw = v / float(w)
+            if isinstance(raw, torch.Tensor) and not torch.isfinite(raw).all():
+                raw = _nan_to_num_inplace(raw, nan=0.0, posinf=0.0, neginf=0.0)
             writer.add_scalar(f"RewardTermsRaw/{_sanitize_tb_tag(name)}/min", _to_float(raw.min()), step)
             writer.add_scalar(f"RewardTermsRaw/{_sanitize_tb_tag(name)}/mean", _to_float(raw.mean()), step)
             writer.add_scalar(f"RewardTermsRaw/{_sanitize_tb_tag(name)}/max", _to_float(raw.max()), step)
@@ -303,6 +330,9 @@ def log_termination_ratios(writer: SummaryWriter, base_env, step: int):
     if not isinstance(last, torch.Tensor) or len(term_names) == 0:
         return
 
+    if not torch.isfinite(last).all():
+        last = _nan_to_num_inplace(last, nan=0.0, posinf=0.0, neginf=0.0)
+
     ratios = last.float().mean(dim=0)
     for i, name in enumerate(term_names):
         writer.add_scalar(f"Terminations/ratio_{_sanitize_tb_tag(name)}", _to_float(ratios[i]), step)
@@ -316,6 +346,8 @@ def log_env_step_stats(
 ):
     if isinstance(episode_steps_running, torch.Tensor) and episode_steps_running.numel() > 0:
         es = episode_steps_running.float()
+        if not torch.isfinite(es).all():
+            es = _nan_to_num_inplace(es, nan=0.0, posinf=0.0, neginf=0.0)
         writer.add_scalar("Env/episode_steps_running_min", _to_float(es.min()), step)
         writer.add_scalar("Env/episode_steps_running_mean", _to_float(es.mean()), step)
         writer.add_scalar("Env/episode_steps_running_max", _to_float(es.max()), step)
@@ -331,12 +363,20 @@ def log_env_step_stats(
 def log_reward_action_stats(writer: SummaryWriter, step: int, rewards: torch.Tensor, actions: torch.Tensor):
     if isinstance(rewards, torch.Tensor) and rewards.numel() > 0:
         r = rewards.float()
+        if not torch.isfinite(r).all():
+            try:
+                writer.add_scalar("Debug/nonfinite_rewards", 1.0, step)
+            except Exception:
+                pass
+            r = _nan_to_num_inplace(r, nan=0.0, posinf=0.0, neginf=0.0)
         writer.add_scalar("Reward/total_min", _to_float(r.min()), step)
         writer.add_scalar("Reward/total_mean", _to_float(r.mean()), step)
         writer.add_scalar("Reward/total_max", _to_float(r.max()), step)
 
     if isinstance(actions, torch.Tensor) and actions.numel() > 0:
         a = actions.float()
+        if not torch.isfinite(a).all():
+            a = _nan_to_num_inplace(a, nan=0.0, posinf=0.0, neginf=0.0)
         writer.add_scalar("Action/mean", _to_float(a.mean()), step)
         writer.add_scalar("Action/std", _to_float(a.std(unbiased=False)), step)
         if a.dim() == 2:
@@ -351,22 +391,53 @@ def log_gradients(
     step: int,
     max_samples: int,
 ):
+    """Robust gradient logging:
+    - histogram only logs finite samples
+    - if empty after filtering, skip (prevents 'histogram is empty' crash)
+    """
     for key, model in models.items():
         for name, p in model.named_parameters():
             if p.grad is None:
                 continue
+
             g = p.grad.detach()
-            writer.add_scalar(f"Gradients/{key}/norm/{_sanitize_tb_tag(name)}", _to_float(g.norm()), step)
 
+            # norm
+            try:
+                g_norm = g.norm()
+                if torch.isfinite(g_norm):
+                    writer.add_scalar(f"Gradients/{key}/norm/{_sanitize_tb_tag(name)}", _to_float(g_norm), step)
+                else:
+                    writer.add_scalar(f"Gradients/{key}/norm/{_sanitize_tb_tag(name)}", float("nan"), step)
+            except Exception:
+                pass
+
+            # sample + filter finite
             g_s = _sample_flat(g, max_samples=max_samples).float()
-            writer.add_histogram(f"Gradients/{key}/hist/{_sanitize_tb_tag(name)}", g_s.detach().cpu(), step)
+            finite = torch.isfinite(g_s)
+            try:
+                writer.add_scalar(
+                    f"Gradients/{key}/finite_ratio/{_sanitize_tb_tag(name)}",
+                    _to_float(finite.float().mean()) if g_s.numel() > 0 else 0.0,
+                    step,
+                )
+            except Exception:
+                pass
 
-            is_finite = torch.isfinite(g_s)
-            writer.add_scalar(
-                f"Gradients/{key}/finite_ratio/{_sanitize_tb_tag(name)}",
-                _to_float(is_finite.float().mean()),
-                step,
-            )
+            if not finite.any():
+                continue
+
+            g_s_f = g_s[finite].detach().cpu()
+            if g_s_f.numel() == 0:
+                continue
+
+            try:
+                writer.add_histogram(f"Gradients/{key}/hist/{_sanitize_tb_tag(name)}", g_s_f, step)
+            except ValueError:
+                # e.g. "The histogram is empty"
+                pass
+            except Exception:
+                pass
 
 
 def _extract_actions_from_act_output(act_output: Any, act_dim: int) -> torch.Tensor:
@@ -381,10 +452,8 @@ def _extract_actions_from_act_output(act_output: Any, act_dim: int) -> torch.Ten
     if isinstance(act_output, (tuple, list)):
         if len(act_output) == 0:
             raise RuntimeError("agent.act returned an empty tuple/list")
-        # 最常见：第 0 个就是动作
         if isinstance(act_output[0], torch.Tensor):
             return act_output[0]
-        # 保险：在 tuple/list 里找一个像 actions 的 tensor
         for item in act_output:
             if isinstance(item, torch.Tensor):
                 if (item.dim() == 2 and item.shape[-1] == act_dim) or (item.dim() == 1 and item.shape[0] == act_dim):
@@ -455,7 +524,6 @@ def main():
     except Exception as e:
         print(f"[WARN] scene.filter_collisions failed: {e}", flush=True)
 
-        
     try:
         base_env.reset()
         print("[INFO] base_env.reset() ok", flush=True)
@@ -593,6 +661,31 @@ def main():
             actions = _ensure_action_shape(actions, num_envs=env.num_envs, act_dim=act_dim)
 
             next_states, rewards, terminated, truncated, infos = env.step(actions)
+
+            # -----------------------------------------------------------------
+            # Non-finite guard (prevents a single NaN from poisoning PPO forever)
+            # -----------------------------------------------------------------
+            if isinstance(rewards, torch.Tensor) and not torch.isfinite(rewards).all():
+                print(f"[WARN] Non-finite rewards detected at t={t}", flush=True)
+                try:
+                    writer.add_scalar("Debug/nonfinite_rewards_step", 1.0, t)
+                except Exception:
+                    pass
+                rewards = _nan_to_num_inplace(rewards, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if isinstance(next_states, torch.Tensor) and not torch.isfinite(next_states).all():
+                print(f"[WARN] Non-finite observations detected at t={t}", flush=True)
+                try:
+                    writer.add_scalar("Debug/nonfinite_obs_step", 1.0, t)
+                except Exception:
+                    pass
+                next_states = _nan_to_num_inplace(next_states, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if isinstance(terminated, torch.Tensor) and not torch.isfinite(terminated).all():
+                terminated = _nan_to_num_inplace(terminated, nan=0.0, posinf=0.0, neginf=0.0).to(torch.bool)
+
+            if isinstance(truncated, torch.Tensor) and not torch.isfinite(truncated).all():
+                truncated = _nan_to_num_inplace(truncated, nan=0.0, posinf=0.0, neginf=0.0).to(torch.bool)
 
             # episode steps accounting
             episode_steps += 1

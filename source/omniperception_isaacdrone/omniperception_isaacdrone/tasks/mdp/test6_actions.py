@@ -22,6 +22,25 @@ def _quat_to_yaw(quat: torch.Tensor) -> torch.Tensor:
     return torch.atan2(r10, r00)
 
 
+def _get_step_dt(env: ManagerBasedRLEnv) -> float:
+    """Return RL step dt (sim.dt * decimation), robustly."""
+    # IsaacLab often provides env.step_dt
+    if hasattr(env, "step_dt"):
+        try:
+            return float(env.step_dt)
+        except Exception:
+            pass
+
+    # Fallback: sim.dt * decimation
+    try:
+        dt = float(env.cfg.sim.dt)
+        dec = float(getattr(env.cfg, "decimation", 1))
+        return dt * dec
+    except Exception:
+        # last resort
+        return 1.0 / 60.0
+
+
 class RootTwistVelocityActionTerm(ActionTerm):
     """4D 动作: [vx, vy, vz, yaw_rate]
     - vx,vy,vz: world frame desired velocity (m/s)
@@ -30,6 +49,7 @@ class RootTwistVelocityActionTerm(ActionTerm):
     关键修复点：
     1) 自动读取仿真里的“总质量”（sum over bodies），避免 cfg.mass 与仿真质量不一致导致推力不足。
     2) 可选：根据当前 vz 和 Kv_z，限制 target_vz 下界，避免要求“负推力”（会被 clamp 成 0）。
+    3) IMPORTANT: yaw_rate 的积分必须使用 RL step_dt（sim.dt * decimation），而不是 physics_dt。
     """
 
     def __init__(self, cfg: ActionTermCfg, env: ManagerBasedRLEnv):
@@ -38,7 +58,9 @@ class RootTwistVelocityActionTerm(ActionTerm):
         self._asset    = env.scene[cfg.asset_name]
         self._device   = env.device
         self._num_envs = env.num_envs
-        self._dt       = float(getattr(env, "physics_dt", env.cfg.sim.dt))
+
+        # IMPORTANT: apply_actions() is called at RL step frequency (NOT physics substeps)
+        self._dt = _get_step_dt(env)
 
         # action buffers
         self._raw_actions       = torch.zeros((self._num_envs, 4), device=self._device, dtype=torch.float32)
@@ -139,6 +161,7 @@ class RootTwistVelocityActionTerm(ActionTerm):
         print(f"[root_twist] Desired TOTAL mass (cfg.params.mass): {desired_total_mass:.4f} kg", flush=True)
         print(f"[root_twist] Sim TOTAL mass (sum bodies):         {sim_total0:.4f} kg", flush=True)
         print(f"[root_twist] Hover thrust needed (sim):          {sim_total0 * self._g:.3f} N", flush=True)
+        print(f"[root_twist] RL step_dt used for yaw integration: {self._dt:.6f} s", flush=True)
 
         rel_err = abs(sim_total0 - desired_total_mass) / max(abs(desired_total_mass), 1e-6)
         if rel_err > 0.05:
@@ -253,7 +276,6 @@ class RootTwistVelocityActionTerm(ActionTerm):
             if kv_z > 1e-6:
                 vz = root[:, 9]  # root_state_w: lin_vel_w is [7:10], so z is index 9
                 min_target_vz = vz - (self._g / kv_z)
-                # only clone if we need to modify
                 if torch.any(v_cmd[:, 2] < min_target_vz):
                     v_cmd = v_cmd.clone()
                     v_cmd[:, 2] = torch.maximum(v_cmd[:, 2], min_target_vz)
