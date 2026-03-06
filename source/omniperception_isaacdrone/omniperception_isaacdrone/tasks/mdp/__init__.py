@@ -3,7 +3,19 @@
 
 from .test6_actions import RootTwistVelocityActionTerm
 from .test6_events import reset_root_state_on_square_edge
-from .test6_observations import obs_goal_delta, obs_lidar_min_range_grid
+
+from .test6_observations import (
+    obs_goal_delta,
+    obs_lidar_min_range_grid,
+    # NEW normalized obs
+    obs_root_pos_norm,
+    obs_root_quat_norm,
+    obs_root_lin_vel_norm,
+    obs_root_ang_vel_norm,
+    obs_projected_gravity_norm,
+    obs_goal_delta_norm,
+    obs_state_norm,
+)
 
 from .test6_rewards import (
     reward_distance_to_goal,
@@ -34,6 +46,13 @@ __all__ = [
     # observations
     "obs_goal_delta",
     "obs_lidar_min_range_grid",
+    "obs_root_pos_norm",
+    "obs_root_quat_norm",
+    "obs_root_lin_vel_norm",
+    "obs_root_ang_vel_norm",
+    "obs_projected_gravity_norm",
+    "obs_goal_delta_norm",
+    "obs_state_norm",
     # rewards
     "reward_distance_to_goal",
     "reward_progress_to_goal",

@@ -1,5 +1,3 @@
-# /home/hjr/hjr_isaacdrone_ws/omniperception_isaacdrone/scripts/test6_train_skrl.py
-
 from __future__ import annotations
 
 import argparse
@@ -10,13 +8,12 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Any, Dict, List
 
 from isaaclab.app import AppLauncher
 
 # -----------------------------------------------------------------------------
-# (Optional) Reduce CUDA allocator fragmentation / help empty_cache be effective.
-# Must be set BEFORE importing torch.
+# Reduce CUDA allocator fragmentation (must be set before importing torch)
 # -----------------------------------------------------------------------------
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
@@ -24,9 +21,9 @@ os.environ.setdefault(
 )
 
 # -----------------------------------------------------------------------------
-# CLI (DO NOT add args that AppLauncher adds: --headless, --device, ...)
+# CLI (do not add args already provided by AppLauncher)
 # -----------------------------------------------------------------------------
-parser = argparse.ArgumentParser("Test6 skrl PPO training (IsaacLab) - manual loop (skrl 1.4.3 safe)")
+parser = argparse.ArgumentParser("Test6 skrl PPO training (IsaacLab) - manual loop")
 
 parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lidar-v0")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
@@ -34,13 +31,9 @@ parser.add_argument("--num_envs", type=int, default=32)
 parser.add_argument("--num_obstacles", type=int, default=50)
 
 parser.add_argument("--timesteps", type=int, default=2_000_000)
+parser.add_argument("--feat_dim", type=int, default=256, help="Final feature dim after state/lidar fusion")
 
-# Feature split (keep explicit to avoid silent mismatch if obs changes)
-parser.add_argument("--state_dim", type=int, default=19, help="State vector dim (non-lidar)")
-parser.add_argument("--lidar_dim", type=int, default=432, help="Lidar grid dim")
-parser.add_argument("--feat_dim", type=int, default=256, help="Final feature dim after fusion")
-
-# Extra TensorBoard logging controls (our custom writer)
+# Extra TensorBoard logging controls
 parser.add_argument("--tb_interval", type=int, default=2000, help="Extra TB scalar logging interval (env steps)")
 parser.add_argument(
     "--grad_hist_interval",
@@ -51,8 +44,7 @@ parser.add_argument(
 parser.add_argument("--grad_hist_samples", type=int, default=65536, help="Max samples per tensor for histogram")
 parser.add_argument("--extra_tb_subdir", type=str, default="extra_tb", help="Subdir under experiment logdir")
 
-# PPO hyperparams (expose the key ones you may tune often)
-# NOTE: Keep defaults conservative; you can override on CLI.
+# PPO hyperparameters
 parser.add_argument("--rollouts", type=int, default=64, help="PPO rollouts (steps) before each update")
 parser.add_argument("--learning_epochs", type=int, default=4)
 parser.add_argument("--mini_batches", type=int, default=8)
@@ -77,12 +69,10 @@ parser.add_argument(
     help="Call gc.collect() + torch.cuda.empty_cache() every N env steps. 0 disables.",
 )
 
-# default ON, allow disabling
 parser.set_defaults(log_cuda_mem=True)
 parser.add_argument("--log_cuda_mem", action="store_true", help="Enable CUDA memory logging to TensorBoard")
 parser.add_argument("--no_log_cuda_mem", action="store_false", dest="log_cuda_mem", help="Disable CUDA memory logging")
 
-# optional debug
 parser.add_argument(
     "--debug_act",
     action="store_true",
@@ -90,7 +80,6 @@ parser.add_argument(
     help="Print agent.act return structure at the first step for debugging",
 )
 
-# AppLauncher args
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -103,9 +92,11 @@ simulation_app = app_launcher.app
 # -----------------------------------------------------------------------------
 # Imports AFTER app launch
 # -----------------------------------------------------------------------------
+import gymnasium as gym
+import numpy as np
 import torch
 import torch.nn as nn
-import gymnasium as gym
+from gymnasium.spaces import Box
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -116,10 +107,9 @@ from isaaclab_tasks.utils import parse_env_cfg
 from omniperception_isaacdrone.envs.test6_env import ObstacleSpawner
 
 # skrl
-from skrl.envs.wrappers.torch import wrap_env
-from skrl.memories.torch import RandomMemory
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
-from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
+from skrl.memories.torch import RandomMemory
+from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 
 
 # -----------------------------------------------------------------------------
@@ -133,15 +123,14 @@ def _init_linear(m: nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Structured Feature Extractor (NOT shared) with input normalization
+# Structured Feature Extractor with normalized state/lidar assumptions
 # -----------------------------------------------------------------------------
 class StructuredFeatureExtractor(nn.Module):
-    """Two-tower encoder (state + lidar) with lightweight normalization.
+    """Two-tower encoder for normalized observations.
 
-    Why this helps:
-      - state terms have very different scales (pos ~ 60, vel ~ 5, quat ~ 1, goal_delta ~ 60)
-      - lidar closeness is in [0, 1]
-    Without normalization, the network tends to ignore some terms (e.g. goal_delta) and gradients collapse.
+    Assumptions:
+      - state terms are already normalized into [-1, 1]
+      - lidar closeness terms are already normalized into [0, 1]
     """
 
     def __init__(self, state_dim: int, lidar_dim: int, feat_dim: int = 256):
@@ -150,24 +139,13 @@ class StructuredFeatureExtractor(nn.Module):
         self.lidar_dim = int(lidar_dim)
         self.feat_dim = int(feat_dim)
 
-        # Fixed scale (best-effort) + LayerNorm
-        scale = torch.ones(self.state_dim, dtype=torch.float32)
-        if self.state_dim == 19:
-            # state layout:
-            # 0:3   root_pos (m)
-            # 3:7   root_quat (unit)
-            # 7:10  root_lin_vel (m/s)
-            # 10:13 root_ang_vel (rad/s)
-            # 13:16 projected_gravity (unit-ish)
-            # 16:19 goal_delta (m)
-            scale[0:3] = 1.0 / 60.0
-            scale[7:10] = 1.0 / 5.0
-            scale[10:13] = 1.0 / 10.0
-            scale[16:19] = 1.0 / 60.0
+        self.register_buffer(
+            "state_scale",
+            torch.ones((1, self.state_dim), dtype=torch.float32),
+            persistent=False,
+        )
 
-        self.register_buffer("state_scale", scale.view(1, -1), persistent=False)
         self.state_ln = nn.LayerNorm(self.state_dim)
-
         self.lidar_ln = nn.LayerNorm(self.lidar_dim)
 
         hidden = 256
@@ -197,12 +175,10 @@ class StructuredFeatureExtractor(nn.Module):
         s = obs[:, : self.state_dim]
         l = obs[:, self.state_dim : self.state_dim + self.lidar_dim]
 
-        # normalize state
         s = s * self.state_scale.to(s.device)
-        s = torch.clamp(s, -5.0, 5.0)
+        s = torch.clamp(s, -1.0, 1.0)
         s = self.state_ln(s)
 
-        # lidar closeness in [0,1] -> roughly centered [-1,1] + LN
         l = torch.clamp(l, 0.0, 1.0)
         l = l * 2.0 - 1.0
         l = self.lidar_ln(l)
@@ -229,13 +205,12 @@ class Policy(GaussianMixin, Model):
         if obs_dim != expected:
             raise RuntimeError(
                 f"[Policy] Observation dim mismatch: obs_dim={obs_dim} but state_dim+lidar_dim={expected} "
-                f"(state_dim={state_dim}, lidar_dim={lidar_dim}). "
-                "If you changed observation terms, update --state_dim/--lidar_dim."
+                f"(state_dim={state_dim}, lidar_dim={lidar_dim})."
             )
 
         self.fe = StructuredFeatureExtractor(state_dim=state_dim, lidar_dim=lidar_dim, feat_dim=feat_dim)
         self.mean = nn.Linear(feat_dim, act_dim)
-        self.log_std_parameter = nn.Parameter(torch.full((act_dim,), -0.5))  # slightly less exploration at init
+        self.log_std_parameter = nn.Parameter(torch.full((act_dim,), -0.5))
 
         self.apply(_init_linear)
 
@@ -243,8 +218,6 @@ class Policy(GaussianMixin, Model):
         obs = inputs["states"]
         feat = self.fe(obs)
         mean = self.mean(feat)
-
-        # clamp log_std to avoid extreme exploration / huge actions
         log_std = torch.clamp(self.log_std_parameter, min=-3.0, max=1.0).expand_as(mean)
         return mean, log_std, {}
 
@@ -259,8 +232,7 @@ class Value(DeterministicMixin, Model):
         if obs_dim != expected:
             raise RuntimeError(
                 f"[Value] Observation dim mismatch: obs_dim={obs_dim} but state_dim+lidar_dim={expected} "
-                f"(state_dim={state_dim}, lidar_dim={lidar_dim}). "
-                "If you changed observation terms, update --state_dim/--lidar_dim."
+                f"(state_dim={state_dim}, lidar_dim={lidar_dim})."
             )
 
         self.fe = StructuredFeatureExtractor(state_dim=state_dim, lidar_dim=lidar_dim, feat_dim=feat_dim)
@@ -276,7 +248,84 @@ class Value(DeterministicMixin, Model):
 
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Space helpers
+# -----------------------------------------------------------------------------
+def _extract_single_policy_obs_space(base_env) -> Box:
+    sp = getattr(base_env, "single_observation_space", None)
+    if isinstance(sp, gym.spaces.Dict):
+        policy = sp.spaces.get("policy", None)
+        if isinstance(policy, gym.spaces.Box):
+            return policy
+
+    obs_space = getattr(base_env, "observation_space", None)
+    if isinstance(obs_space, gym.spaces.Dict):
+        policy = obs_space.spaces.get("policy", None)
+        if isinstance(policy, gym.spaces.Box):
+            return policy
+    if isinstance(obs_space, gym.spaces.Box):
+        return obs_space
+
+    raise RuntimeError(f"Cannot extract single policy observation space from env type {type(base_env)}")
+
+
+def _extract_single_action_space(base_env) -> Box:
+    sp = getattr(base_env, "single_action_space", None)
+    if isinstance(sp, gym.spaces.Box):
+        return sp
+
+    act_space = getattr(base_env, "action_space", None)
+    if isinstance(act_space, gym.spaces.Box):
+        if len(act_space.shape) == 1:
+            return act_space
+        raise RuntimeError(
+            f"Action space is batched or malformed: shape={act_space.shape}. "
+            "Expected single_action_space to be defined on the environment."
+        )
+
+    raise RuntimeError(f"Cannot extract single action space from env type {type(base_env)}")
+
+
+def _assert_finite_box_bounds(space: Box, name: str):
+    if not isinstance(space, Box):
+        raise RuntimeError(f"{name} is not a gymnasium.spaces.Box: {type(space)}")
+
+    low_finite = np.isfinite(space.low).all()
+    high_finite = np.isfinite(space.high).all()
+    if not (low_finite and high_finite):
+        raise RuntimeError(
+            f"{name} is still unbounded: "
+            f"low_finite={low_finite}, high_finite={high_finite}, "
+            f"shape={space.shape}. "
+            "Please verify that MyDroneRLEnv._configure_gym_env_spaces is the version that defines semantic bounds."
+        )
+
+
+def _box_bound_summary(space: Box) -> str:
+    return (
+        f"shape={space.shape}, "
+        f"low[min,max]=({float(np.min(space.low)):.3f}, {float(np.max(space.low)):.3f}), "
+        f"high[min,max]=({float(np.min(space.high)):.3f}, {float(np.max(space.high)):.3f})"
+    )
+
+
+def _get_state_lidar_dims(base_env, obs_dim: int) -> tuple[int, int]:
+    state_dim = int(getattr(base_env, "policy_state_dim", 0))
+    lidar_dim = int(getattr(base_env, "policy_lidar_dim", 0))
+
+    if state_dim <= 0 or state_dim + lidar_dim != obs_dim:
+        norm_cfg = getattr(getattr(base_env, "cfg", None), "normalization", None)
+        state_dim = int(getattr(norm_cfg, "state_dim", 19))
+        if state_dim <= 0 or state_dim > obs_dim:
+            raise RuntimeError(
+                f"Invalid state_dim inferred from env: state_dim={state_dim}, obs_dim={obs_dim}."
+            )
+        lidar_dim = obs_dim - state_dim
+
+    return state_dim, lidar_dim
+
+
+# -----------------------------------------------------------------------------
+# General helpers
 # -----------------------------------------------------------------------------
 def _sanitize_tb_tag(tag: str) -> str:
     return tag.replace(".", "/")
@@ -303,11 +352,9 @@ def _sample_flat(t: torch.Tensor, max_samples: int) -> torch.Tensor:
 
 
 def _nan_to_num_inplace(x: torch.Tensor, nan: float = 0.0, posinf: float = 0.0, neginf: float = 0.0) -> torch.Tensor:
-    """Safe nan_to_num for tensors; returns a tensor (not necessarily in-place depending on backend)."""
     try:
         return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
     except Exception:
-        # fallback (older torch): replace via masks
         y = x
         if torch.isnan(y).any():
             y = torch.where(torch.isnan(y), torch.full_like(y, nan), y)
@@ -315,6 +362,37 @@ def _nan_to_num_inplace(x: torch.Tensor, nan: float = 0.0, posinf: float = 0.0, 
             y = torch.where(y == float("inf"), torch.full_like(y, posinf), y)
             y = torch.where(y == float("-inf"), torch.full_like(y, neginf), y)
         return y
+
+
+def _extract_policy_obs(obs: Any) -> torch.Tensor:
+    if isinstance(obs, torch.Tensor):
+        return obs
+    if isinstance(obs, dict):
+        if "policy" in obs and isinstance(obs["policy"], torch.Tensor):
+            return obs["policy"]
+        for v in obs.values():
+            if isinstance(v, torch.Tensor):
+                return v
+    raise RuntimeError(f"Unsupported observation type: {type(obs)}")
+
+
+def _ensure_state_shape(states: torch.Tensor, num_envs: int, obs_dim: int) -> torch.Tensor:
+    if not isinstance(states, torch.Tensor):
+        raise RuntimeError(f"states is not a torch.Tensor: {type(states)}")
+
+    if states.dim() == 2 and states.shape[0] == num_envs and states.shape[1] == obs_dim:
+        return states
+
+    if states.dim() == 1 and states.numel() == num_envs * obs_dim:
+        return states.view(num_envs, obs_dim)
+
+    if states.dim() == 2 and states.shape[0] == 1 and states.shape[1] == num_envs * obs_dim:
+        return states.view(num_envs, obs_dim)
+
+    raise RuntimeError(
+        f"[FATAL] Invalid state shape: got {tuple(states.shape)}, expected ({num_envs}, {obs_dim}) "
+        f"or flat {num_envs * obs_dim}"
+    )
 
 
 def log_cuda_memory(writer: SummaryWriter, step: int):
@@ -333,13 +411,6 @@ def log_cuda_memory(writer: SummaryWriter, step: int):
 
 
 def log_reward_terms(writer: SummaryWriter, base_env, step: int):
-    """Log RewardManager internal per-term values.
-
-    IMPORTANT:
-      In IsaacLab, RewardManager stores term values in `_step_reward` as:
-          term_output * term_weight
-      (i.e. WITHOUT multiplying dt; dt is applied when accumulating the final step reward).
-    """
     rm = getattr(base_env, "reward_manager", None)
     if rm is None:
         return
@@ -367,7 +438,6 @@ def log_reward_terms(writer: SummaryWriter, base_env, step: int):
     for i, name in enumerate(term_names):
         v = step_reward[:, i]
 
-        # If a term becomes non-finite, print it (to locate the first bad source)
         if isinstance(v, torch.Tensor) and not torch.isfinite(v).all():
             print(f"[WARN] Non-finite reward term '{name}' detected at step={step}", flush=True)
             try:
@@ -429,7 +499,6 @@ def log_env_step_stats(
         writer.add_scalar("Env/episode_length_done_min", float(x.min().item()), step)
         writer.add_scalar("Env/episode_length_done_mean", float(x.mean().item()), step)
         writer.add_scalar("Env/episode_length_done_max", float(x.max().item()), step)
-        # NOTE: this is "how many env instances ended since last TB log", NOT success rate.
         writer.add_scalar("Env/episodes_done_count", float(len(ended_lengths)), step)
 
 
@@ -460,7 +529,6 @@ def log_reward_action_stats(writer: SummaryWriter, step: int, rewards: torch.Ten
 
 
 def log_action_processed_stats(writer: SummaryWriter, base_env, step: int):
-    """Log processed (scaled/clipped) actions from ActionTerm."""
     try:
         term = base_env.action_manager.get_term("root_twist")
         a = getattr(term, "processed_actions", None)
@@ -484,10 +552,6 @@ def log_gradients(
     step: int,
     max_samples: int,
 ):
-    """Robust gradient logging:
-    - histogram only logs finite samples
-    - if empty after filtering, skip (prevents 'histogram is empty' crash)
-    """
     for key, model in models.items():
         for name, p in model.named_parameters():
             if p.grad is None:
@@ -495,7 +559,6 @@ def log_gradients(
 
             g = p.grad.detach()
 
-            # norm
             try:
                 g_norm = g.norm()
                 if torch.isfinite(g_norm):
@@ -505,7 +568,6 @@ def log_gradients(
             except Exception:
                 pass
 
-            # sample + filter finite
             g_s = _sample_flat(g, max_samples=max_samples).float()
             finite = torch.isfinite(g_s)
             try:
@@ -527,18 +589,12 @@ def log_gradients(
             try:
                 writer.add_histogram(f"Gradients/{key}/hist/{_sanitize_tb_tag(name)}", g_s_f, step)
             except ValueError:
-                # e.g. "The histogram is empty"
                 pass
             except Exception:
                 pass
 
 
 def _extract_actions_from_act_output(act_output: Any, act_dim: int) -> torch.Tensor:
-    """skrl 1.4.3 下 agent.act 可能返回:
-       - Tensor: actions
-       - tuple/list: (actions, log_prob, values, ...)
-       - dict: {"actions": actions, ...} (少见，但做兼容)
-    """
     if isinstance(act_output, torch.Tensor):
         return act_output
 
@@ -564,15 +620,11 @@ def _extract_actions_from_act_output(act_output: Any, act_dim: int) -> torch.Ten
 
 
 def _ensure_action_shape(actions: torch.Tensor, num_envs: int, act_dim: int) -> torch.Tensor:
-    """Force action shape to (num_envs, act_dim)."""
     if not isinstance(actions, torch.Tensor):
         raise RuntimeError(f"actions is not a torch.Tensor: {type(actions)}")
 
-    # (act_dim,) -> (num_envs, act_dim)
     if actions.dim() == 1 and actions.shape[0] == act_dim:
         actions = actions.unsqueeze(0).repeat(num_envs, 1)
-
-    # (1, act_dim) -> (num_envs, act_dim)
     elif actions.dim() == 2 and actions.shape[0] == 1 and actions.shape[1] == act_dim and num_envs > 1:
         actions = actions.repeat(num_envs, 1)
 
@@ -587,9 +639,6 @@ def _ensure_action_shape(actions: torch.Tensor, num_envs: int, act_dim: int) -> 
 def main():
     print(f"[INFO] task={args.task}, num_envs={args.num_envs}, device={args.device}", flush=True)
 
-    # -------------------------------------------------------------------------
-    # 1) parse cfg from registry
-    # -------------------------------------------------------------------------
     env_cfg = parse_env_cfg(
         args.task,
         device=args.device,
@@ -598,15 +647,9 @@ def main():
     )
     print("[INFO] env_cfg parsed", flush=True)
 
-    # -------------------------------------------------------------------------
-    # 2) spawn obstacles BEFORE env creation
-    # -------------------------------------------------------------------------
     print("[INFO] Spawning shared obstacles...", flush=True)
     ObstacleSpawner(num_obstacles=int(args.num_obstacles)).spawn_obstacles()
 
-    # -------------------------------------------------------------------------
-    # 3) create base env and wrap for skrl
-    # -------------------------------------------------------------------------
     print("[INFO] Creating env via gym.make(..., cfg=env_cfg)", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
     print(f"[INFO] Base env type: {type(base_env)}", flush=True)
@@ -622,46 +665,81 @@ def main():
         base_env.reset()
         print("[INFO] base_env.reset() ok", flush=True)
     except Exception as e:
-        print(f"[WARN] base_env.reset() failed before wrap (will continue): {e}", flush=True)
+        print(f"[WARN] base_env.reset() failed before training (will continue): {e}", flush=True)
 
-    env = wrap_env(base_env, wrapper="isaaclab")
-    print(f"[INFO] Wrapped env type: {type(env)}", flush=True)
-    print(f"[INFO] observation_space: {env.observation_space}", flush=True)
-    print(f"[INFO] action_space: {env.action_space}", flush=True)
-    print(f"[INFO] num_envs: {env.num_envs}, device: {env.device}", flush=True)
+    # -------------------------------------------------------------------------
+    # Use finite semantic spaces defined by MyDroneRLEnv itself
+    # -------------------------------------------------------------------------
+    flat_obs_space = _extract_single_policy_obs_space(base_env)
+    flat_act_space = _extract_single_action_space(base_env)
 
-    # Helpful diagnostics for action bounds
-    try:
-        if hasattr(env.action_space, "low") and hasattr(env.action_space, "high"):
-            lo = env.action_space.low
-            hi = env.action_space.high
-            print(f"[INFO] action_space.low={lo}, high={hi}", flush=True)
-    except Exception:
-        pass
+    _assert_finite_box_bounds(flat_obs_space, "single policy observation space")
+    _assert_finite_box_bounds(flat_act_space, "single action space")
 
-    obs_dim = int(env.observation_space.shape[0])
-    act_dim = int(env.action_space.shape[0])
+    obs_dim = int(np.prod(flat_obs_space.shape))
+    act_dim = int(np.prod(flat_act_space.shape))
+    state_dim, lidar_dim = _get_state_lidar_dims(base_env, obs_dim=obs_dim)
+
     print(
-        f"[INFO] obs_dim={obs_dim}, state_dim={args.state_dim}, lidar_dim={args.lidar_dim}, feat_dim={args.feat_dim}",
+        f"[INFO] Finite policy observation space: {_box_bound_summary(flat_obs_space)}",
+        flush=True,
+    )
+    print(
+        f"[INFO] Finite action space: {_box_bound_summary(flat_act_space)}",
+        flush=True,
+    )
+    print(
+        f"[INFO] Using env-defined dims for skrl: obs_dim={obs_dim}, state_dim={state_dim}, "
+        f"lidar_dim={lidar_dim}, act_dim={act_dim}, feat_dim={args.feat_dim}",
         flush=True,
     )
 
     # -------------------------------------------------------------------------
-    # 4) models
+    # Wrap env for skrl
+    # -------------------------------------------------------------------------
+    try:
+        from skrl.envs.wrappers.torch import wrap_env
+        env = wrap_env(base_env, wrapper="isaaclab")
+    except Exception as e:
+        print(f"[WARN] wrap_env failed, fallback to base_env directly: {e}", flush=True)
+        env = base_env
+
+    print(f"[INFO] Wrapped env type: {type(env)}", flush=True)
+    print(f"[INFO] observation_space: {getattr(env, 'observation_space', None)}", flush=True)
+    print(f"[INFO] action_space: {getattr(env, 'action_space', None)}", flush=True)
+    print(f"[INFO] num_envs: {getattr(env, 'num_envs', None)}, device: {getattr(env, 'device', None)}", flush=True)
+
+    wrapped_obs_space = getattr(env, "observation_space", None)
+    wrapped_act_space = getattr(env, "action_space", None)
+    if isinstance(wrapped_obs_space, Box):
+        _assert_finite_box_bounds(wrapped_obs_space, "wrapped observation space")
+    if isinstance(wrapped_act_space, Box):
+        _assert_finite_box_bounds(wrapped_act_space, "wrapped action space")
+
+    # -------------------------------------------------------------------------
+    # Models
     # -------------------------------------------------------------------------
     models = {
         "policy": Policy(
-            env.observation_space, env.action_space, env.device,
-            state_dim=args.state_dim, lidar_dim=args.lidar_dim, feat_dim=args.feat_dim
+            flat_obs_space,
+            flat_act_space,
+            getattr(env, "device", args.device),
+            state_dim=state_dim,
+            lidar_dim=lidar_dim,
+            feat_dim=args.feat_dim,
         ),
         "value": Value(
-            env.observation_space, env.action_space, env.device,
-            state_dim=args.state_dim, lidar_dim=args.lidar_dim, feat_dim=args.feat_dim
+            flat_obs_space,
+            flat_act_space,
+            getattr(env, "device", args.device),
+            state_dim=state_dim,
+            lidar_dim=lidar_dim,
+            feat_dim=args.feat_dim,
         ),
     }
 
     # -------------------------------------------------------------------------
-    # 5) PPO cfg
+    # PPO config
     # -------------------------------------------------------------------------
     agent_cfg = copy.deepcopy(PPO_DEFAULT_CONFIG)
     agent_cfg["rollouts"] = int(args.rollouts)
@@ -673,11 +751,11 @@ def main():
     agent_cfg["grad_norm_clip"] = 1.0
     agent_cfg["ratio_clip"] = 0.2
     agent_cfg["value_clip"] = 0.2
-    agent_cfg["entropy_loss_scale"] = 0.02  # slightly higher exploration for navigation
+    agent_cfg["entropy_loss_scale"] = 0.02
     agent_cfg["value_loss_scale"] = 0.5
 
     # -------------------------------------------------------------------------
-    # 6) Experiment dir
+    # Experiment dir
     # -------------------------------------------------------------------------
     script_dir = Path(__file__).resolve().parent
     project_dir = script_dir.parent
@@ -700,45 +778,56 @@ def main():
 
     try:
         writer.add_text("run/args", str(vars(args)), 0)
-        writer.add_text("run/obs_action", f"obs_dim={obs_dim}, act_dim={act_dim}", 0)
+        writer.add_text(
+            "run/obs_action",
+            f"obs_dim={obs_dim}, state_dim={state_dim}, lidar_dim={lidar_dim}, act_dim={act_dim}",
+            0,
+        )
+        writer.add_text("run/obs_bounds", _box_bound_summary(flat_obs_space), 0)
+        writer.add_text("run/action_bounds", _box_bound_summary(flat_act_space), 0)
     except Exception:
         pass
 
     # -------------------------------------------------------------------------
-    # 7) memory
+    # Memory
     # -------------------------------------------------------------------------
+    num_envs = int(getattr(env, "num_envs", args.num_envs))
+    device = getattr(env, "device", torch.device(args.device))
+
     memory = RandomMemory(
         memory_size=int(agent_cfg["rollouts"]),
-        num_envs=env.num_envs,
-        device=env.device,
+        num_envs=num_envs,
+        device=device,
     )
 
     # -------------------------------------------------------------------------
-    # 8) agent
+    # Agent
     # -------------------------------------------------------------------------
     agent = PPO(
         models=models,
         memory=memory,
         cfg=agent_cfg,
-        observation_space=env.observation_space,
-        action_space=env.action_space,
-        device=env.device,
+        observation_space=flat_obs_space,
+        action_space=flat_act_space,
+        device=device,
     )
     agent.init()
 
     # -------------------------------------------------------------------------
-    # 9) manual training loop
+    # Manual training loop
     # -------------------------------------------------------------------------
     print("[INFO] Starting training loop (manual, skrl-safe)...", flush=True)
 
-    states, infos = env.reset()
+    raw_obs, infos = env.reset()
+    states = _ensure_state_shape(_extract_policy_obs(raw_obs), num_envs=num_envs, obs_dim=obs_dim)
+
     try:
         if hasattr(agent, "reset"):
             agent.reset()
     except Exception:
         pass
 
-    episode_steps = torch.zeros((env.num_envs,), device=env.device, dtype=torch.int32)
+    episode_steps = torch.zeros((num_envs,), device=device, dtype=torch.int32)
     ended_lengths: List[int] = []
 
     rollouts = int(agent_cfg["rollouts"])
@@ -761,13 +850,11 @@ def main():
                     print(f"[DEBUG] len(act_output)={len(act_output)}; elem types={[type(x) for x in act_output]}", flush=True)
 
             actions = _extract_actions_from_act_output(act_output, act_dim=act_dim)
-            actions = _ensure_action_shape(actions, num_envs=env.num_envs, act_dim=act_dim)
+            actions = _ensure_action_shape(actions, num_envs=num_envs, act_dim=act_dim)
 
-            next_states, rewards, terminated, truncated, infos = env.step(actions)
+            next_raw_obs, rewards, terminated, truncated, infos = env.step(actions)
+            next_states = _ensure_state_shape(_extract_policy_obs(next_raw_obs), num_envs=num_envs, obs_dim=obs_dim)
 
-            # -----------------------------------------------------------------
-            # Non-finite guard (prevents a single NaN from poisoning PPO forever)
-            # -----------------------------------------------------------------
             if isinstance(rewards, torch.Tensor) and not torch.isfinite(rewards).all():
                 print(f"[WARN] Non-finite rewards detected at t={t}", flush=True)
                 try:
@@ -790,9 +877,8 @@ def main():
             if isinstance(truncated, torch.Tensor) and not torch.isfinite(truncated).all():
                 truncated = _nan_to_num_inplace(truncated, nan=0.0, posinf=0.0, neginf=0.0).to(torch.bool)
 
-            # episode steps accounting
             episode_steps += 1
-            done = (terminated | truncated)
+            done = terminated | truncated
             if isinstance(done, torch.Tensor):
                 done = done.squeeze(-1)
                 if done.any():
@@ -800,7 +886,6 @@ def main():
                     ended_lengths.extend([int(x) for x in lens])
                     episode_steps[done] = 0
 
-            # record transitions (avoid passing infos by default)
             record_infos = infos if args.keep_infos else {}
 
             with torch.no_grad():
@@ -819,9 +904,11 @@ def main():
             agent.post_interaction(timestep=t, timesteps=total_steps)
 
             if not args.headless:
-                env.render()
+                try:
+                    env.render()
+                except Exception:
+                    pass
 
-            # TB logging
             if args.tb_interval > 0 and (t % int(args.tb_interval) == 0):
                 now = time.time()
                 dt = max(now - last_log_time, 1e-6)
@@ -841,7 +928,6 @@ def main():
                 log_cuda_memory(writer, t)
                 writer.flush()
 
-            # gradient hist logging
             if int(args.grad_hist_interval) > 0 and rollouts > 0:
                 if (t + 1) % rollouts == 0:
                     update_idx = (t + 1) // rollouts
@@ -849,13 +935,11 @@ def main():
                         log_gradients(writer, models=models, step=t, max_samples=int(args.grad_hist_samples))
                         writer.flush()
 
-            # periodic cleanup
             if int(args.cuda_clean_interval) > 0 and (t % int(args.cuda_clean_interval) == 0):
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-            # progress bar
             try:
                 if isinstance(rewards, torch.Tensor):
                     pbar.set_description(f"t={t} R(mean)={rewards.float().mean().item():.3f}")
@@ -873,7 +957,11 @@ def main():
         writer.close()
     except Exception:
         pass
-    env.close()
+
+    try:
+        env.close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

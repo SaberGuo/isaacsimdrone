@@ -1,17 +1,3 @@
-# ~/hjr_isaacdrone_ws/omniperception_isaacdrone/source/omniperception_isaacdrone/omniperception_isaacdrone/envs/test6_env.py
-
-"""
-职责：
-  1. MyDroneRLEnv  — 带 goal_pos_w 的自定义 ManagerBasedRLEnv
-  2. ObstacleSpawner — 共享障碍物生成工具（训练/评估脚本调用）
-
-新增：
-  - 为能量惩罚提供跨步速度缓存：_energy_prev_lin_vel_w / _energy_prev_ang_vel_w
-    并在 reset_idx 时刷新，避免跨 episode 的“假加速度尖峰”
-  - 为 progress reward 提供距离缓存：_progress_prev_goal_dist
-    并在 reset_idx 时刷新，避免跨 episode 的“假进度尖峰”
-"""
-
 from __future__ import annotations
 
 import numpy as np
@@ -25,7 +11,7 @@ from isaaclab.managers import SceneEntityCfg
 
 
 # =============================================================================
-# 共享障碍物生成
+# Shared obstacle spawning
 # =============================================================================
 class ObstacleSpawner:
     def __init__(
@@ -70,7 +56,7 @@ class ObstacleSpawner:
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     rigid_body_enabled=True,
                     disable_gravity=True,
-                    kinematic_enabled=True,  # kinematic -> 不受物理驱动但保留碰撞
+                    kinematic_enabled=True,
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(),
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
@@ -86,19 +72,30 @@ class ObstacleSpawner:
 
 
 # =============================================================================
-# Env：带 goal buffer 的自定义 ManagerBasedRLEnv
+# Env: goal buffer + finite semantic gym spaces
 # =============================================================================
 class MyDroneRLEnv(ManagerBasedRLEnv):
-    """
-    Custom env that adds:
+    """Custom UAV RL environment.
+
+    Responsibilities:
       - per-env goal buffer (goal_pos_w)
       - per-env prev velocity buffers for energy penalty
-      - per-env prev goal distance buffer for progress-to-goal reward
-    Compatible with gym.make() kwargs used by IsaacLab registry.
+      - per-env prev goal distance buffer for progress reward
+      - finite semantic gym spaces for policy observations/actions
+
+    Why the explicit gym-space override is required:
+      - IsaacLab's ManagerBasedRLEnv builds concatenated observation groups as
+        Box(-inf, inf, ...) and the action space as Box(-inf, inf, ...) by default.
+      - For this task, the actual semantic ranges are known:
+          * policy state terms are normalized to [-1, 1]
+          * lidar closeness is normalized to [0, 1]
+          * raw policy actions are normalized to [-1, 1]
+      - skrl reads `single_observation_space["policy"]` and `single_action_space`
+        from the unwrapped environment. Therefore the finite semantic spaces must
+        be defined directly on the environment, not only inside the model.
     """
 
     def __init__(self, cfg=None, **kwargs):
-        # Pop registry-specific kwargs that gym.make passes but we don't need
         kwargs.pop("env_cfg_entry_point", None)
         kwargs.pop("rl_games_cfg_entry_point", None)
         kwargs.pop("rsl_rl_cfg_entry_point", None)
@@ -108,15 +105,17 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         if cfg is None:
             cfg = kwargs.pop("env_cfg", None)
 
-        # Temp placeholders (resized after super().__init__)
+        # Temporary placeholders. Resized after super().__init__()
         self.goal_pos_w = torch.zeros((1, 3), dtype=torch.float32)
-
-        # For energy penalty (finite-difference acceleration)
         self._energy_prev_lin_vel_w = torch.zeros((1, 3), dtype=torch.float32)
         self._energy_prev_ang_vel_w = torch.zeros((1, 3), dtype=torch.float32)
-
-        # For progress reward (distance decrease)
         self._progress_prev_goal_dist = torch.zeros((1,), dtype=torch.float32)
+
+        # Filled in by _configure_gym_env_spaces during super().__init__()
+        self.policy_obs_dim: int = 0
+        self.policy_state_dim: int = 0
+        self.policy_lidar_dim: int = 0
+        self.policy_action_dim: int = 0
 
         super().__init__(cfg=cfg)
 
@@ -126,13 +125,123 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._energy_prev_ang_vel_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
         self._progress_prev_goal_dist = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float32)
 
-        # sample goals and init caches
         env_ids = torch.arange(self.num_envs, device=self.device)
         self._sample_goals(env_ids)
         self._refresh_energy_prev_buffers(env_ids)
         self._refresh_progress_prev_dist(env_ids)
 
-    # ----- goal sampling -----
+    # -------------------------------------------------------------------------
+    # Gym spaces
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _shape_tuple(dim) -> tuple[int, ...]:
+        if isinstance(dim, int):
+            return (int(dim),)
+        return tuple(int(x) for x in dim)
+
+    def _build_policy_observation_box(self):
+        import gymnasium as gym
+
+        try:
+            obs_shape = self._shape_tuple(self.observation_manager.group_obs_dim["policy"])
+        except Exception as exc:
+            raise RuntimeError("Policy observation group 'policy' is missing.") from exc
+
+        if len(obs_shape) != 1:
+            raise RuntimeError(
+                f"Expected 1D concatenated policy observation, but got shape={obs_shape}. "
+                "Please keep policy observations concatenated for this task."
+            )
+
+        obs_dim = int(obs_shape[0])
+        state_dim = int(getattr(getattr(self.cfg, "normalization", None), "state_dim", 19))
+        if state_dim <= 0 or state_dim > obs_dim:
+            raise RuntimeError(
+                f"Invalid normalization.state_dim={state_dim}. "
+                f"It must satisfy 0 < state_dim <= policy_obs_dim ({obs_dim})."
+            )
+
+        lidar_dim = obs_dim - state_dim
+
+        low = -np.ones((obs_dim,), dtype=np.float32)
+        high = np.ones((obs_dim,), dtype=np.float32)
+        if lidar_dim > 0:
+            low[state_dim:] = 0.0
+
+        policy_box = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+        return policy_box, obs_dim, state_dim, lidar_dim
+
+    def _build_default_non_policy_group_space(self, group_name: str):
+        import gymnasium as gym
+
+        has_concatenated_obs = self.observation_manager.group_obs_concatenate[group_name]
+        group_dim = self.observation_manager.group_obs_dim[group_name]
+
+        if has_concatenated_obs:
+            return gym.spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=self._shape_tuple(group_dim),
+                dtype=np.float32,
+            )
+
+        group_term_names = self.observation_manager.active_terms[group_name]
+        group_term_cfgs = self.observation_manager._group_obs_term_cfgs[group_name]
+
+        term_dict = {}
+        for term_name, term_dim, term_cfg in zip(group_term_names, group_dim, group_term_cfgs):
+            low = -np.inf if getattr(term_cfg, "clip", None) is None else term_cfg.clip[0]
+            high = np.inf if getattr(term_cfg, "clip", None) is None else term_cfg.clip[1]
+            term_dict[term_name] = gym.spaces.Box(
+                low=low,
+                high=high,
+                shape=self._shape_tuple(term_dim),
+                dtype=np.float32,
+            )
+        return gym.spaces.Dict(term_dict)
+
+    def _configure_gym_env_spaces(self):
+        """Configure semantic finite gym spaces for this UAV task."""
+        import gymnasium as gym
+
+        policy_box, obs_dim, state_dim, lidar_dim = self._build_policy_observation_box()
+
+        action_dim = int(sum(self.action_manager.action_term_dim))
+        if action_dim <= 0:
+            raise RuntimeError(f"Invalid action_dim={action_dim} inferred from ActionManager.")
+
+        action_box = gym.spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32)
+
+        single_obs_spaces = {}
+        for group_name in self.observation_manager.active_terms.keys():
+            if group_name == "policy":
+                single_obs_spaces[group_name] = policy_box
+            else:
+                single_obs_spaces[group_name] = self._build_default_non_policy_group_space(group_name)
+
+        self.single_observation_space = gym.spaces.Dict(single_obs_spaces)
+        self.single_action_space = action_box
+
+        self.observation_space = gym.vector.utils.batch_space(self.single_observation_space, self.num_envs)
+        self.action_space = gym.vector.utils.batch_space(self.single_action_space, self.num_envs)
+
+        self.policy_obs_dim = obs_dim
+        self.policy_state_dim = state_dim
+        self.policy_lidar_dim = lidar_dim
+        self.policy_action_dim = action_dim
+
+        print(
+            "[MyDroneRLEnv] Using semantic single-env gym spaces: "
+            f"policy_obs_dim={obs_dim} (state={state_dim}, lidar={lidar_dim}), "
+            f"action_dim={action_dim}, "
+            f"policy_low=[{float(policy_box.low.min()):.1f}, {float(policy_box.low.max()):.1f}], "
+            f"policy_high=[{float(policy_box.high.min()):.1f}, {float(policy_box.high.max()):.1f}]",
+            flush=True,
+        )
+
+    # -------------------------------------------------------------------------
+    # Goal sampling / caches
+    # -------------------------------------------------------------------------
     def _sample_goals(self, env_ids: torch.Tensor):
         square_half_size = 35.0
         goal_z_min = 3.0
@@ -148,7 +257,6 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self.goal_pos_w[env_ids, 2] = gz
 
     def _refresh_energy_prev_buffers(self, env_ids: torch.Tensor):
-        """Refresh prev velocity buffers to avoid cross-episode acceleration spikes."""
         try:
             v = mdp.root_lin_vel_w(self, asset_cfg=SceneEntityCfg("robot"))
             w = mdp.root_ang_vel_w(self, asset_cfg=SceneEntityCfg("robot"))
@@ -156,39 +264,53 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
             self._energy_prev_lin_vel_w[env_ids] = v[env_ids].detach()
             self._energy_prev_ang_vel_w[env_ids] = w[env_ids].detach()
         except Exception:
-            # fallback: zeros
             self._energy_prev_lin_vel_w[env_ids] = 0.0
             self._energy_prev_ang_vel_w[env_ids] = 0.0
 
     def _refresh_progress_prev_dist(self, env_ids: torch.Tensor):
-        """Refresh prev goal distance buffer to avoid cross-episode progress spikes."""
         try:
-            pos = mdp.root_pos_w(self, asset_cfg=SceneEntityCfg("robot"))  # (N,3)
-            d = torch.norm(self.goal_pos_w - pos, dim=-1)  # (N,)
+            pos = mdp.root_pos_w(self, asset_cfg=SceneEntityCfg("robot"))
+            d = torch.norm(self.goal_pos_w - pos, dim=-1)
             self._progress_prev_goal_dist[env_ids] = d[env_ids].detach()
         except Exception:
             self._progress_prev_goal_dist[env_ids] = 0.0
 
-    # ----- reset with re-sampled goals -----
-    def reset_idx(self, env_ids: torch.Tensor | None = None):
-        if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=self.device)
+    # -------------------------------------------------------------------------
+    # Reset compatibility across IsaacLab versions
+    # -------------------------------------------------------------------------
+    def _call_parent_reset_idx(self, env_ids: torch.Tensor):
+        parent = super()
+        if hasattr(parent, "_reset_idx"):
+            return parent._reset_idx(env_ids)
+        if hasattr(parent, "reset_idx"):
+            return parent.reset_idx(env_ids)
+        raise AttributeError("Parent environment provides neither _reset_idx nor reset_idx.")
 
-        # resample goal
-        self._sample_goals(env_ids)
-
-        obs, info = super().reset_idx(env_ids)
-
-        # refresh caches AFTER reset has written sim state
+    def _post_reset_refresh(self, env_ids: torch.Tensor):
         self._refresh_energy_prev_buffers(env_ids)
         self._refresh_progress_prev_dist(env_ids)
-
-        # optional info
         try:
             pos = mdp.root_pos_w(self, asset_cfg=SceneEntityCfg("robot"))
-            info["goal_state_delta"] = (self.goal_pos_w - pos).detach()
-            info["goal_pos_w"] = self.goal_pos_w.detach()
+            if not hasattr(self, "extras") or not isinstance(self.extras, dict):
+                self.extras = {}
+            log_dict = self.extras.get("log", {})
+            if not isinstance(log_dict, dict):
+                log_dict = {}
+            log_dict["goal_state_delta"] = (self.goal_pos_w - pos).detach()
+            log_dict["goal_pos_w"] = self.goal_pos_w.detach()
+            self.extras["log"] = log_dict
         except Exception:
             pass
 
-        return obs, info
+    def _reset_idx(self, env_ids: torch.Tensor | None = None):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+
+        self._sample_goals(env_ids)
+        out = self._call_parent_reset_idx(env_ids)
+        self._post_reset_refresh(env_ids)
+        return out
+
+    # Compatibility shim for versions/workflows that still call reset_idx
+    def reset_idx(self, env_ids: torch.Tensor | None = None):
+        return self._reset_idx(env_ids)
