@@ -37,9 +37,18 @@ parser.add_argument("--rollouts", type=int, default=64)
 parser.add_argument("--learning_epochs", type=int, default=4)
 parser.add_argument("--mini_batches", type=int, default=8)
 parser.add_argument("--learning_rate", type=float, default=1e-4)
+parser.add_argument("--_lambda", type=float, default=0.95)
+parser.add_argument("--discount_factor", type=float, default=0.99)
+
+parser.add_argument("--ratio_clip", type=float, default=0.2)
+parser.add_argument("--value_clip", type=float, default=0.2)
+parser.add_argument("--value_loss_scale", type=float, default=0.5)
 parser.add_argument("--grad_norm_clip", type=float, default=0.5)
 parser.add_argument("--entropy_coef", type=float, default=0.0)
 parser.add_argument("--kl_threshold", type=float, default=0.02)
+parser.add_argument("--clip_predicted_values", action="store_true")
+parser.add_argument("--no_clip_predicted_values", dest="clip_predicted_values", action="store_false")
+parser.set_defaults(clip_predicted_values=True)
 
 parser.add_argument("--reward_scale", type=float, default=0.02)
 parser.add_argument("--reward_clip", type=float, default=100.0)
@@ -48,6 +57,10 @@ parser.add_argument("--tb_interval", type=int, default=2000)
 parser.add_argument("--checkpoint_interval", type=int, default=50000)
 parser.add_argument("--cuda_clean_interval", type=int, default=2000)
 parser.add_argument("--extra_tb_subdir", type=str, default="extra_tb")
+
+parser.add_argument("--log_cuda_mem", dest="log_cuda_mem", action="store_true")
+parser.add_argument("--no_log_cuda_mem", dest="log_cuda_mem", action="store_false")
+parser.set_defaults(log_cuda_mem=True)
 
 parser.add_argument(
     "--keep_infos",
@@ -67,12 +80,7 @@ parser.add_argument(
     default=65536,
     help="Maximum gradient samples per parameter for histogram logging.",
 )
-parser.add_argument(
-    "--log_cuda_mem",
-    action="store_true",
-    default=True,
-    help="Enable CUDA memory logging.",
-)
+
 parser.add_argument(
     "--debug_act",
     action="store_true",
@@ -89,26 +97,54 @@ args = parser.parse_args()
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
-import gymnasium as gym
-import numpy as np
 import torch
+import numpy as np
 import torch.nn as nn
-from gymnasium.spaces import Box
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
-
+import gymnasium as gym
 import omniperception_isaacdrone.tasks.test6_registry as _test6_registry  # noqa: F401
-from isaaclab_tasks.utils import parse_env_cfg
-from omniperception_isaacdrone.envs.test6_env import ObstacleSpawner
 
-from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from tqdm import tqdm
+from gymnasium.spaces import Box
+from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
+from isaaclab_tasks.utils import parse_env_cfg
+from torch.utils.tensorboard import SummaryWriter
+from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from omniperception_isaacdrone.envs.test6_env import ObstacleSpawner
 from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 
 
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+def format_array_preview(x: np.ndarray, max_items: int = 16) -> str:
+    x = np.asarray(x).reshape(-1)
+    if x.size <= max_items:
+        return np.array2string(x, precision=3, separator=", ")
+    head = x[:max_items]
+    return f"{np.array2string(head, precision=3, separator=', ')} ... (total={x.size})"
+
+
+def print_space_bounds(name: str, space: gym.Space) -> None:
+    print(f"\n[SPACE] {name}: type={type(space).__name__}", flush=True)
+
+    if isinstance(space, gym.spaces.Dict):
+        print(f"[SPACE] {name}.keys={list(space.spaces.keys())}", flush=True)
+        for k, subspace in space.spaces.items():
+            print_space_bounds(f"{name}.{k}", subspace)
+        return
+
+    if isinstance(space, gym.spaces.Box):
+        print(f"[SPACE] {name}.shape={space.shape}, dtype={space.dtype}", flush=True)
+        print(f"[SPACE] {name}.low preview={format_array_preview(space.low)}", flush=True)
+        print(f"[SPACE] {name}.high preview={format_array_preview(space.high)}", flush=True)
+        print(f"[SPACE] {name}.low.min={float(np.min(space.low))}, low.max={float(np.max(space.low))}", flush=True)
+        print(f"[SPACE] {name}.high.min={float(np.min(space.high))}, high.max={float(np.max(space.high))}", flush=True)
+        return
+
+    print(f"[SPACE] {name} = {space}", flush=True)
+
+
 def init_hidden(m: nn.Module) -> None:
     if isinstance(m, nn.Linear):
         nn.init.orthogonal_(m.weight, gain=np.sqrt(2.0))
@@ -291,11 +327,13 @@ def get_state_lidar_dims(base_env: Any, obs_dim: int) -> tuple[int, int]:
     return state_dim, obs_dim - state_dim
 
 
-def patch_env_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int, int, Box, Box]:
+def build_skrl_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int, int, gym.spaces.Dict, Box]:
     num_envs = int(getattr(base_env, "num_envs", 1))
+
     act_space = getattr(base_env, "single_action_space", None)
     if not isinstance(act_space, gym.spaces.Box):
         act_space = getattr(base_env, "action_space", None)
+
     act_dim = infer_single_dim_from_box(act_space, num_envs) if isinstance(act_space, gym.spaces.Box) else 4
 
     obs_dim = state_dim + lidar_dim
@@ -311,12 +349,48 @@ def patch_env_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int
         dtype=np.float32,
     )
     obs_space = gym.spaces.Dict({"policy": obs_box})
+    return obs_dim, act_dim, obs_space, act_box
 
-    base_env.observation_space = obs_space
-    base_env.single_observation_space = obs_space
-    base_env.action_space = act_box
-    base_env.single_action_space = act_box
-    return obs_dim, act_dim, obs_box, act_box
+
+class SkrlSpaceAdapter(gym.Wrapper):
+    """Expose skrl-friendly spaces/observations without mutating the base IsaacLab env."""
+
+    def __init__(
+        self,
+        env: gym.Env,
+        obs_space: gym.spaces.Dict,
+        act_space: Box,
+        state_dim: int,
+        lidar_dim: int,
+    ):
+        super().__init__(env)
+        self.state_dim = int(state_dim)
+        self.lidar_dim = int(lidar_dim)
+        self.obs_dim = self.state_dim + self.lidar_dim
+
+        # Only patch the wrapper-facing spaces, never the base env itself.
+        self.observation_space = obs_space
+        self.single_observation_space = obs_space
+        self.action_space = act_space
+        self.single_action_space = act_space
+
+        # Forward common vector-env attributes used by skrl / training code
+        self.num_envs = int(getattr(env, "num_envs", 1))
+        self.device = getattr(env, "device", None)
+
+    def _convert_obs(self, raw_obs: Any) -> dict[str, torch.Tensor]:
+        x = extract_policy_obs(raw_obs)
+        x = ensure_obs_shape(x, self.num_envs, self.obs_dim)
+        x = sanitize_states(x, state_dim=self.state_dim, lidar_dim=self.lidar_dim)
+        return {"policy": x}
+
+    def reset(self, **kwargs):
+        raw_obs, infos = self.env.reset(**kwargs)
+        return self._convert_obs(raw_obs), infos
+
+    def step(self, actions):
+        raw_obs, rewards, terminated, truncated, infos = self.env.step(actions)
+        return self._convert_obs(raw_obs), rewards, terminated, truncated, infos
 
 
 def models_are_finite(models: dict[str, nn.Module]) -> bool:
@@ -327,7 +401,7 @@ def models_are_finite(models: dict[str, nn.Module]) -> bool:
     return True
 
 
-def snapshot_models(models: dict[str, nn.Module]) -> dict[str, dict[str, torch.Tensor]]:
+def snapshot_models(models: dict[str, dict[str, nn.Module]]) -> dict[str, dict[str, torch.Tensor]]:
     return {
         name: {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         for name, model in models.items()
@@ -363,6 +437,35 @@ def extract_tb_reward_terms(base_env: Any) -> Dict[str, torch.Tensor]:
         return data
     return {}
 
+def extract_reward_weights(base_env: Any) -> Dict[str, float]:
+    """Extract reward term weights from env.cfg.rewards by field name."""
+    out: Dict[str, float] = {}
+
+    rewards_cfg = getattr(getattr(base_env, "cfg", None), "rewards", None)
+    if rewards_cfg is None:
+        return out
+
+    # configclass instances typically expose term cfgs as attributes
+    for name in dir(rewards_cfg):
+        if name.startswith("_"):
+            continue
+        try:
+            term_cfg = getattr(rewards_cfg, name)
+        except Exception:
+            continue
+
+        weight = getattr(term_cfg, "weight", None)
+        if weight is None:
+            continue
+
+        try:
+            out[name] = float(weight)
+        except Exception:
+            pass
+
+    return out
+
+
 
 def extract_tb_aux_terms(base_env: Any) -> Dict[str, torch.Tensor]:
     data = getattr(base_env, "_tb_aux_terms", None)
@@ -393,8 +496,13 @@ class RewardWindowAccumulator:
 
     def reset(self) -> None:
         self.window_steps = 0
-        self.env_samples = 0
 
+        # raw reward term statistics (before reward weight)
+        self.term_sum: Dict[str, float] = {}
+        self.term_min: Dict[str, float] = {}
+        self.term_max: Dict[str, float] = {}
+
+        # weighted reward term statistics (after reward weight)
         self.weighted_sum: Dict[str, float] = {}
         self.weighted_min: Dict[str, float] = {}
         self.weighted_max: Dict[str, float] = {}
@@ -414,12 +522,12 @@ class RewardWindowAccumulator:
     def update(
         self,
         reward_terms: Dict[str, torch.Tensor],
+        reward_weights: Dict[str, float],
         aux_terms: Dict[str, torch.Tensor],
         rewards_raw: torch.Tensor,
         rewards_train: torch.Tensor,
     ) -> None:
         self.window_steps += 1
-        self.env_samples += int(rewards_raw.numel())
 
         r_raw = torch.nan_to_num(rewards_raw.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
         r_train = torch.nan_to_num(rewards_train.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -438,18 +546,33 @@ class RewardWindowAccumulator:
         self.train_reward_min = train_min if self.train_reward_min is None else min(self.train_reward_min, train_min)
         self.train_reward_max = train_max if self.train_reward_max is None else max(self.train_reward_max, train_max)
 
+        # reward terms: raw + weighted
         for name, value in reward_terms.items():
             if not isinstance(value, torch.Tensor) or value.numel() == 0:
                 continue
+
             v = torch.nan_to_num(value.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
-            mean_v = float(v.mean().item())
-            min_v = float(v.min().item())
-            max_v = float(v.max().item())
 
-            self.weighted_sum[name] = self.weighted_sum.get(name, 0.0) + mean_v
-            self.weighted_min[name] = min_v if name not in self.weighted_min else min(self.weighted_min[name], min_v)
-            self.weighted_max[name] = max_v if name not in self.weighted_max else max(self.weighted_max[name], max_v)
+            raw_mean_v = float(v.mean().item())
+            raw_min_v = float(v.min().item())
+            raw_max_v = float(v.max().item())
 
+            self.term_sum[name] = self.term_sum.get(name, 0.0) + raw_mean_v
+            self.term_min[name] = raw_min_v if name not in self.term_min else min(self.term_min[name], raw_min_v)
+            self.term_max[name] = raw_max_v if name not in self.term_max else max(self.term_max[name], raw_max_v)
+
+            w = float(reward_weights.get(name, 1.0))
+            vw = v * w
+
+            weighted_mean_v = float(vw.mean().item())
+            weighted_min_v = float(vw.min().item())
+            weighted_max_v = float(vw.max().item())
+
+            self.weighted_sum[name] = self.weighted_sum.get(name, 0.0) + weighted_mean_v
+            self.weighted_min[name] = weighted_min_v if name not in self.weighted_min else min(self.weighted_min[name], weighted_min_v)
+            self.weighted_max[name] = weighted_max_v if name not in self.weighted_max else max(self.weighted_max[name], weighted_max_v)
+
+        # aux terms
         for name, value in aux_terms.items():
             if not isinstance(value, torch.Tensor) or value.numel() == 0:
                 continue
@@ -474,18 +597,25 @@ class RewardWindowAccumulator:
         writer.add_scalar("RewardWindow/train_min", float(self.train_reward_min if self.train_reward_min is not None else 0.0), step)
         writer.add_scalar("RewardWindow/train_max", float(self.train_reward_max if self.train_reward_max is not None else 0.0), step)
 
+        # raw per-term reward outputs
+        for name in sorted(self.term_sum.keys()):
+            tag = sanitize_tb_tag(name)
+            writer.add_scalar(f"RewardTermsRaw/{tag}/mean", self.term_sum[name] / float(self.window_steps), step)
+            writer.add_scalar(f"RewardTermsRaw/{tag}/min", self.term_min[name], step)
+            writer.add_scalar(f"RewardTermsRaw/{tag}/max", self.term_max[name], step)
+
+        # weighted per-term reward outputs
         for name in sorted(self.weighted_sum.keys()):
             tag = sanitize_tb_tag(name)
-            writer.add_scalar(f"RewardTermsWindow/{tag}/mean", self.weighted_sum[name] / float(self.window_steps), step)
-            writer.add_scalar(f"RewardTermsWindow/{tag}/min", self.weighted_min[name], step)
-            writer.add_scalar(f"RewardTermsWindow/{tag}/max", self.weighted_max[name], step)
+            writer.add_scalar(f"RewardTermsWeighted/{tag}/mean", self.weighted_sum[name] / float(self.window_steps), step)
+            writer.add_scalar(f"RewardTermsWeighted/{tag}/min", self.weighted_min[name], step)
+            writer.add_scalar(f"RewardTermsWeighted/{tag}/max", self.weighted_max[name], step)
 
         for name in sorted(self.aux_sum.keys()):
             tag = sanitize_tb_tag(name)
             writer.add_scalar(f"AuxWindow/{tag}/mean", self.aux_sum[name] / float(self.window_steps), step)
             writer.add_scalar(f"AuxWindow/{tag}/min", self.aux_min[name], step)
             writer.add_scalar(f"AuxWindow/{tag}/max", self.aux_max[name], step)
-
 
 class EpisodeInfoAccumulator:
     def __init__(self) -> None:
@@ -801,14 +931,7 @@ def main() -> None:
 
     print("[INFO] Creating env...", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
-
-    try:
-        if hasattr(base_env, "scene") and hasattr(base_env.scene, "filter_collisions"):
-            base_env.scene.filter_collisions(global_prim_paths=["/World/ground", "/World/Obstacles"])
-    except Exception as exc:
-        print(f"[WARN] scene.filter_collisions failed: {exc}", flush=True)
-
-    base_env.reset()
+    base_env.scene.filter_collisions(global_prim_paths=["/World/ground", "/World/Obstacles"])
 
     space = getattr(base_env, "single_observation_space", None)
     policy_space = (
@@ -816,20 +939,27 @@ def main() -> None:
         if isinstance(space, gym.spaces.Dict)
         else getattr(base_env, "observation_space", None)
     )
-    if not isinstance(policy_space, gym.spaces.Box):
-        raise RuntimeError(f"[FATAL] Could not get policy observation Box. got={type(policy_space)}")
+
+    if policy_space is None:
+        raise RuntimeError("policy observation space not found")
 
     obs_dim_raw = int(np.prod(policy_space.shape))
     state_dim, lidar_dim = get_state_lidar_dims(base_env, obs_dim_raw)
-    obs_dim, act_dim, obs_space, act_space = patch_env_spaces(base_env, state_dim, lidar_dim)
+    obs_dim, act_dim, obs_space, act_space = build_skrl_spaces(base_env, state_dim, lidar_dim)
 
-    try:
-        from skrl.envs.wrappers.torch import wrap_env
+    print_space_bounds("skrl_obs_space", obs_space)
+    print_space_bounds("skrl_act_space", act_space)
 
-        env = wrap_env(base_env, wrapper="isaaclab")
-    except Exception as exc:
-        print(f"[WARN] wrap_env failed, fallback to base_env directly: {exc}", flush=True)
-        env = base_env
+
+    adapted_env = SkrlSpaceAdapter(
+        base_env,
+        obs_space=obs_space,
+        act_space=act_space,
+        state_dim=state_dim,
+        lidar_dim=lidar_dim,
+    )
+
+    env = wrap_env(adapted_env, wrapper="isaaclab")
 
     num_envs = int(getattr(env, "num_envs", args.num_envs))
     device = torch.device(getattr(env, "device", args.device))
@@ -848,18 +978,16 @@ def main() -> None:
     cfg["rollouts"] = int(args.rollouts)
     cfg["learning_epochs"] = int(args.learning_epochs)
     cfg["mini_batches"] = int(args.mini_batches)
-    cfg["discount_factor"] = 0.99
-    cfg["lambda"] = 0.95
+    cfg["discount_factor"] = float(args.discount_factor)
+    cfg["lambda"] = float(args._lambda)
     cfg["learning_rate"] = float(args.learning_rate)
-    cfg["ratio_clip"] = 0.2
-    cfg["value_clip"] = 0.2
-    cfg["value_loss_scale"] = 0.5
+    cfg["ratio_clip"] = float(args.ratio_clip)
+    cfg["value_clip"] = float(args.value_clip)
+    cfg["value_loss_scale"] = float(args.value_loss_scale)
     cfg["entropy_loss_scale"] = float(args.entropy_coef)
     cfg["grad_norm_clip"] = float(args.grad_norm_clip)
-    if "clip_predicted_values" in cfg:
-        cfg["clip_predicted_values"] = True
-    if "kl_threshold" in cfg:
-        cfg["kl_threshold"] = float(args.kl_threshold)
+    cfg["clip_predicted_values"] = bool(args.clip_predicted_values)
+    cfg["kl_threshold"] = float(args.kl_threshold)
 
     script_dir = Path(__file__).resolve().parent
     project_dir = script_dir.parent
@@ -893,6 +1021,7 @@ def main() -> None:
     )
     agent.init()
 
+    # Only reset once: remove the old base_env.reset()
     raw_obs, infos = env.reset()
     states = sanitize_states(
         ensure_obs_shape(extract_policy_obs(raw_obs), num_envs, obs_dim),
@@ -905,6 +1034,10 @@ def main() -> None:
     last_log_step = 0
     last_log_time = time.time()
     last_good_snapshot = snapshot_models(models)
+
+    reward_weights = extract_reward_weights(base_env)
+    print(f"[INFO] reward weights: {reward_weights}", flush=True)
+
 
     reward_window = RewardWindowAccumulator()
     info_window = EpisodeInfoAccumulator()
@@ -961,6 +1094,7 @@ def main() -> None:
             aux_terms = extract_tb_aux_terms(base_env)
             reward_window.update(
                 reward_terms=reward_terms,
+                reward_weights=reward_weights,
                 aux_terms=aux_terms,
                 rewards_raw=rewards,
                 rewards_train=train_rewards,
@@ -1075,6 +1209,7 @@ if __name__ == "__main__":
     except Exception:
         print("\n[ERROR] Unhandled exception:\n", flush=True)
         traceback.print_exc()
+        raise
     finally:
         simulation_app.close()
         print("[INFO] Simulation app closed", flush=True)

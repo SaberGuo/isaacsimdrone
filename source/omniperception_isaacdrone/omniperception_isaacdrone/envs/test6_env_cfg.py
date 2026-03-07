@@ -183,7 +183,7 @@ class Test6EventCfg:
 @configclass
 class Test6RewardsCfg:
     # goal shaping
-    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=10.0, params={})
+    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=50.0, params={})
     dist_to_goal     = RewTerm(func=my_mdp.reward_distance_to_goal, weight=10.0, params={})
     vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=0.5, params={})
 
