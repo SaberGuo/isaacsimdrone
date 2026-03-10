@@ -7,6 +7,7 @@ import inspect
 import os
 import time
 import traceback
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -44,23 +45,22 @@ parser.add_argument("--ratio_clip", type=float, default=0.2)
 parser.add_argument("--value_clip", type=float, default=0.2)
 parser.add_argument("--value_loss_scale", type=float, default=0.5)
 parser.add_argument("--grad_norm_clip", type=float, default=0.5)
-parser.add_argument("--entropy_coef", type=float, default=0.0)
+parser.add_argument("--entropy_coef", type=float, default=1e-3)
 parser.add_argument("--kl_threshold", type=float, default=0.02)
 parser.add_argument("--clip_predicted_values", action="store_true")
 parser.add_argument("--no_clip_predicted_values", dest="clip_predicted_values", action="store_false")
 parser.set_defaults(clip_predicted_values=True)
 
-parser.add_argument("--reward_scale", type=float, default=0.02)
-parser.add_argument("--reward_clip", type=float, default=100.0)
+parser.add_argument("--reward_scale", type=float, default=1.0)
+parser.add_argument("--reward_clip", type=float, default=500.0)
 
-parser.add_argument("--tb_interval", type=int, default=2000)
+parser.add_argument("--tb_interval", type=int, default=500)
+parser.add_argument("--dist_interval", type=int, default=500)
+parser.add_argument("--dist_window", type=int, default=10)
+parser.add_argument("--dist_max_samples", type=int, default=2048)
 parser.add_argument("--checkpoint_interval", type=int, default=50000)
 parser.add_argument("--cuda_clean_interval", type=int, default=2000)
 parser.add_argument("--extra_tb_subdir", type=str, default="extra_tb")
-
-parser.add_argument("--log_cuda_mem", dest="log_cuda_mem", action="store_true")
-parser.add_argument("--no_log_cuda_mem", dest="log_cuda_mem", action="store_false")
-parser.set_defaults(log_cuda_mem=True)
 
 parser.add_argument(
     "--keep_infos",
@@ -80,7 +80,6 @@ parser.add_argument(
     default=65536,
     help="Maximum gradient samples per parameter for histogram logging.",
 )
-
 parser.add_argument(
     "--debug_act",
     action="store_true",
@@ -97,21 +96,45 @@ args = parser.parse_args()
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
-import torch
-import numpy as np
-import torch.nn as nn
 import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
 import omniperception_isaacdrone.tasks.test6_registry as _test6_registry  # noqa: F401
-
-from tqdm import tqdm
 from gymnasium.spaces import Box
+from isaaclab_tasks.utils import parse_env_cfg
+from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
-from isaaclab_tasks.utils import parse_env_cfg
-from torch.utils.tensorboard import SummaryWriter
-from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
-from omniperception_isaacdrone.envs.test6_env import ObstacleSpawner
 from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+from omniperception_isaacdrone.envs.test6_env import ObstacleSpawner
+
+
+STATE_OBS_NAMES_19 = [
+    "root_pos_x",
+    "root_pos_y",
+    "root_pos_z",
+    "root_quat_w",
+    "root_quat_x",
+    "root_quat_y",
+    "root_quat_z",
+    "root_lin_vel_x",
+    "root_lin_vel_y",
+    "root_lin_vel_z",
+    "root_ang_vel_x",
+    "root_ang_vel_y",
+    "root_ang_vel_z",
+    "projected_gravity_x",
+    "projected_gravity_y",
+    "projected_gravity_z",
+    "goal_delta_x",
+    "goal_delta_y",
+    "goal_delta_z",
+]
+ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
 
 
 # -----------------------------------------------------------------------------
@@ -169,38 +192,6 @@ def sanitize_tb_tag(tag: str) -> str:
 
 
 def to_float(x: Any) -> float:
-    if isinstance(x, (float, int)):
-        return float(x)
-    if isinstance(x, torch.Tensor):
-        y = x.detach().float()
-        if y.numel() == 0:
-            return 0.0
-        if not torch.isfinite(y).all():
-            y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-        return float(y.mean().item())
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
-
-
-def value_sum(x: Any) -> float:
-    if isinstance(x, (float, int)):
-        return float(x)
-    if isinstance(x, torch.Tensor):
-        y = x.detach().float()
-        if y.numel() == 0:
-            return 0.0
-        if not torch.isfinite(y).all():
-            y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-        return float(y.sum().item())
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
-
-
-def value_mean(x: Any) -> float:
     if isinstance(x, (float, int)):
         return float(x)
     if isinstance(x, torch.Tensor):
@@ -290,7 +281,7 @@ def sanitize_states(states: torch.Tensor, state_dim: int, lidar_dim: int) -> tor
     state = torch.clamp(states[:, :state_dim], -1.0, 1.0)
     if lidar_dim <= 0:
         return state
-    lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim], 0.0, 1.0)
+    lidar = torch.clamp(states[:, state_dim : state_dim + lidar_dim], 0.0, 1.0)
     return torch.cat([state, lidar], dim=-1)
 
 
@@ -368,13 +359,11 @@ class SkrlSpaceAdapter(gym.Wrapper):
         self.lidar_dim = int(lidar_dim)
         self.obs_dim = self.state_dim + self.lidar_dim
 
-        # Only patch the wrapper-facing spaces, never the base env itself.
         self.observation_space = obs_space
         self.single_observation_space = obs_space
         self.action_space = act_space
         self.single_action_space = act_space
 
-        # Forward common vector-env attributes used by skrl / training code
         self.num_envs = int(getattr(env, "num_envs", 1))
         self.device = getattr(env, "device", None)
 
@@ -401,20 +390,11 @@ def models_are_finite(models: dict[str, nn.Module]) -> bool:
     return True
 
 
-def snapshot_models(models: dict[str, dict[str, nn.Module]]) -> dict[str, dict[str, torch.Tensor]]:
+def snapshot_models(models: dict[str, nn.Module]) -> dict[str, dict[str, torch.Tensor]]:
     return {
         name: {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         for name, model in models.items()
     }
-
-
-def log_cuda(writer: SummaryWriter, step: int) -> None:
-    if args.log_cuda_mem and torch.cuda.is_available():
-        writer.add_scalar("CUDA/allocated_mb", torch.cuda.memory_allocated() / 1024**2, step)
-        writer.add_scalar("CUDA/reserved_mb", torch.cuda.memory_reserved() / 1024**2, step)
-        writer.add_scalar("CUDA/max_allocated_mb", torch.cuda.max_memory_allocated() / 1024**2, step)
-        if hasattr(torch.cuda, "max_memory_reserved"):
-            writer.add_scalar("CUDA/max_reserved_mb", torch.cuda.max_memory_reserved() / 1024**2, step)
 
 
 def extract_log_dict(infos: Any) -> Dict[str, Any]:
@@ -431,21 +411,36 @@ def extract_log_dict(infos: Any) -> Dict[str, Any]:
     return {}
 
 
-def extract_tb_reward_terms(base_env: Any) -> Dict[str, torch.Tensor]:
-    data = getattr(base_env, "_tb_reward_terms", None)
-    if isinstance(data, dict):
-        return data
-    return {}
+def get_env_step_dt(base_env: Any) -> float:
+    if hasattr(base_env, "step_dt"):
+        try:
+            return float(base_env.step_dt)
+        except Exception:
+            pass
+    try:
+        return float(base_env.cfg.sim.dt) * float(base_env.cfg.decimation)
+    except Exception:
+        return 1.0 / 60.0
+
 
 def extract_reward_weights(base_env: Any) -> Dict[str, float]:
-    """Extract reward term weights from env.cfg.rewards by field name."""
     out: Dict[str, float] = {}
+
+    reward_manager = getattr(base_env, "reward_manager", None)
+    if reward_manager is not None:
+        try:
+            for name in list(getattr(reward_manager, "active_terms", [])):
+                term_cfg = reward_manager.get_term_cfg(name)
+                out[name] = float(term_cfg.weight)
+            if len(out) > 0:
+                return out
+        except Exception:
+            pass
 
     rewards_cfg = getattr(getattr(base_env, "cfg", None), "rewards", None)
     if rewards_cfg is None:
         return out
 
-    # configclass instances typically expose term cfgs as attributes
     for name in dir(rewards_cfg):
         if name.startswith("_"):
             continue
@@ -453,22 +448,18 @@ def extract_reward_weights(base_env: Any) -> Dict[str, float]:
             term_cfg = getattr(rewards_cfg, name)
         except Exception:
             continue
-
         weight = getattr(term_cfg, "weight", None)
         if weight is None:
             continue
-
         try:
             out[name] = float(weight)
         except Exception:
             pass
-
     return out
 
 
-
-def extract_tb_aux_terms(base_env: Any) -> Dict[str, torch.Tensor]:
-    data = getattr(base_env, "_tb_aux_terms", None)
+def extract_tb_reward_terms(base_env: Any) -> Dict[str, torch.Tensor]:
+    data = getattr(base_env, "_tb_reward_terms", None)
     if isinstance(data, dict):
         return data
     return {}
@@ -487,292 +478,238 @@ def clear_tb_caches(base_env: Any) -> None:
         pass
 
 
-# -----------------------------------------------------------------------------
-# Reward / Episode accumulators
-# -----------------------------------------------------------------------------
-class RewardWindowAccumulator:
+def extract_reward_manager_weighted_terms(base_env: Any) -> Dict[str, torch.Tensor]:
+    reward_manager = getattr(base_env, "reward_manager", None)
+    if reward_manager is None:
+        return {}
+
+    term_names = list(getattr(reward_manager, "_term_names", []))
+    step_reward = getattr(reward_manager, "_step_reward", None)
+    if not isinstance(step_reward, torch.Tensor):
+        return {}
+    if step_reward.dim() != 2 or step_reward.shape[1] != len(term_names):
+        return {}
+
+    out: Dict[str, torch.Tensor] = {}
+    for i, name in enumerate(term_names):
+        out[name] = step_reward[:, i].detach()
+    return out
+
+
+def build_reward_term_views(
+    base_env: Any,
+    reward_weights: Dict[str, float],
+    reward_scale: float,
+    reward_clip: float,
+) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    raw_cache = extract_tb_reward_terms(base_env)
+    weighted_terms = extract_reward_manager_weighted_terms(base_env)
+
+    term_names = set(reward_weights.keys()) | set(raw_cache.keys()) | set(weighted_terms.keys())
+    if len(term_names) == 0:
+        return {}, {}, {}
+
+    raw_terms: Dict[str, torch.Tensor] = {}
+    weighted_out: Dict[str, torch.Tensor] = {}
+    for name in sorted(term_names):
+        w = float(reward_weights.get(name, 1.0))
+        if name in weighted_terms:
+            weighted = torch.nan_to_num(weighted_terms[name].detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+        elif name in raw_cache:
+            weighted = torch.nan_to_num(raw_cache[name].detach().float(), nan=0.0, posinf=0.0, neginf=0.0) * w
+        else:
+            continue
+        weighted_out[name] = weighted
+
+        if name in raw_cache:
+            raw = torch.nan_to_num(raw_cache[name].detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+        elif abs(w) > 1e-12:
+            raw = weighted / w
+        else:
+            raw = torch.zeros_like(weighted)
+        raw_terms[name] = raw
+
+    if len(weighted_out) == 0:
+        return raw_terms, weighted_out, {}
+
+    dt = float(get_env_step_dt(base_env))
+    total_preclip = None
+    for value in weighted_out.values():
+        contrib = value * dt * float(reward_scale)
+        total_preclip = contrib if total_preclip is None else (total_preclip + contrib)
+
+    if total_preclip is None:
+        return raw_terms, weighted_out, {}
+
+    if reward_clip > 0.0:
+        total_clipped = torch.clamp(total_preclip, -float(reward_clip), float(reward_clip))
+    else:
+        total_clipped = total_preclip
+
+    clip_factor = torch.ones_like(total_preclip)
+    nz = total_preclip.abs() > 1e-8
+    clip_factor[nz] = total_clipped[nz] / total_preclip[nz]
+
+    scaled_terms: Dict[str, torch.Tensor] = {}
+    for name, value in weighted_out.items():
+        scaled_terms[name] = value * dt * float(reward_scale) * clip_factor
+
+    return raw_terms, weighted_out, scaled_terms
+
+
+class TensorDictStats:
     def __init__(self) -> None:
         self.reset()
 
     def reset(self) -> None:
         self.window_steps = 0
+        self.sum: Dict[str, float] = {}
+        self.min: Dict[str, float] = {}
+        self.max: Dict[str, float] = {}
 
-        # raw reward term statistics (before reward weight)
-        self.term_sum: Dict[str, float] = {}
-        self.term_min: Dict[str, float] = {}
-        self.term_max: Dict[str, float] = {}
-
-        # weighted reward term statistics (after reward weight)
-        self.weighted_sum: Dict[str, float] = {}
-        self.weighted_min: Dict[str, float] = {}
-        self.weighted_max: Dict[str, float] = {}
-
-        self.aux_sum: Dict[str, float] = {}
-        self.aux_min: Dict[str, float] = {}
-        self.aux_max: Dict[str, float] = {}
-
-        self.raw_reward_mean_sum = 0.0
-        self.raw_reward_min = None
-        self.raw_reward_max = None
-
-        self.train_reward_mean_sum = 0.0
-        self.train_reward_min = None
-        self.train_reward_max = None
-
-    def update(
-        self,
-        reward_terms: Dict[str, torch.Tensor],
-        reward_weights: Dict[str, float],
-        aux_terms: Dict[str, torch.Tensor],
-        rewards_raw: torch.Tensor,
-        rewards_train: torch.Tensor,
-    ) -> None:
+    def update(self, values: Dict[str, torch.Tensor]) -> None:
+        if len(values) == 0:
+            return
         self.window_steps += 1
-
-        r_raw = torch.nan_to_num(rewards_raw.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
-        r_train = torch.nan_to_num(rewards_train.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
-
-        raw_mean = float(r_raw.mean().item())
-        raw_min = float(r_raw.min().item())
-        raw_max = float(r_raw.max().item())
-        train_mean = float(r_train.mean().item())
-        train_min = float(r_train.min().item())
-        train_max = float(r_train.max().item())
-
-        self.raw_reward_mean_sum += raw_mean
-        self.train_reward_mean_sum += train_mean
-        self.raw_reward_min = raw_min if self.raw_reward_min is None else min(self.raw_reward_min, raw_min)
-        self.raw_reward_max = raw_max if self.raw_reward_max is None else max(self.raw_reward_max, raw_max)
-        self.train_reward_min = train_min if self.train_reward_min is None else min(self.train_reward_min, train_min)
-        self.train_reward_max = train_max if self.train_reward_max is None else max(self.train_reward_max, train_max)
-
-        # reward terms: raw + weighted
-        for name, value in reward_terms.items():
-            if not isinstance(value, torch.Tensor) or value.numel() == 0:
-                continue
-
-            v = torch.nan_to_num(value.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
-
-            raw_mean_v = float(v.mean().item())
-            raw_min_v = float(v.min().item())
-            raw_max_v = float(v.max().item())
-
-            self.term_sum[name] = self.term_sum.get(name, 0.0) + raw_mean_v
-            self.term_min[name] = raw_min_v if name not in self.term_min else min(self.term_min[name], raw_min_v)
-            self.term_max[name] = raw_max_v if name not in self.term_max else max(self.term_max[name], raw_max_v)
-
-            w = float(reward_weights.get(name, 1.0))
-            vw = v * w
-
-            weighted_mean_v = float(vw.mean().item())
-            weighted_min_v = float(vw.min().item())
-            weighted_max_v = float(vw.max().item())
-
-            self.weighted_sum[name] = self.weighted_sum.get(name, 0.0) + weighted_mean_v
-            self.weighted_min[name] = weighted_min_v if name not in self.weighted_min else min(self.weighted_min[name], weighted_min_v)
-            self.weighted_max[name] = weighted_max_v if name not in self.weighted_max else max(self.weighted_max[name], weighted_max_v)
-
-        # aux terms
-        for name, value in aux_terms.items():
+        for name, value in values.items():
             if not isinstance(value, torch.Tensor) or value.numel() == 0:
                 continue
             v = torch.nan_to_num(value.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
             mean_v = float(v.mean().item())
             min_v = float(v.min().item())
             max_v = float(v.max().item())
+            self.sum[name] = self.sum.get(name, 0.0) + mean_v
+            self.min[name] = min_v if name not in self.min else min(self.min[name], min_v)
+            self.max[name] = max_v if name not in self.max else max(self.max[name], max_v)
 
-            self.aux_sum[name] = self.aux_sum.get(name, 0.0) + mean_v
-            self.aux_min[name] = min_v if name not in self.aux_min else min(self.aux_min[name], min_v)
-            self.aux_max[name] = max_v if name not in self.aux_max else max(self.aux_max[name], max_v)
-
-    def flush(self, writer: SummaryWriter, step: int) -> None:
+    def flush(self, writer: SummaryWriter, prefix: str, step: int) -> None:
         if self.window_steps <= 0:
             return
-
-        writer.add_scalar("RewardWindow/raw_mean", self.raw_reward_mean_sum / float(self.window_steps), step)
-        writer.add_scalar("RewardWindow/raw_min", float(self.raw_reward_min if self.raw_reward_min is not None else 0.0), step)
-        writer.add_scalar("RewardWindow/raw_max", float(self.raw_reward_max if self.raw_reward_max is not None else 0.0), step)
-
-        writer.add_scalar("RewardWindow/train_mean", self.train_reward_mean_sum / float(self.window_steps), step)
-        writer.add_scalar("RewardWindow/train_min", float(self.train_reward_min if self.train_reward_min is not None else 0.0), step)
-        writer.add_scalar("RewardWindow/train_max", float(self.train_reward_max if self.train_reward_max is not None else 0.0), step)
-
-        # raw per-term reward outputs
-        for name in sorted(self.term_sum.keys()):
+        for name in sorted(self.sum.keys()):
             tag = sanitize_tb_tag(name)
-            writer.add_scalar(f"RewardTermsRaw/{tag}/mean", self.term_sum[name] / float(self.window_steps), step)
-            writer.add_scalar(f"RewardTermsRaw/{tag}/min", self.term_min[name], step)
-            writer.add_scalar(f"RewardTermsRaw/{tag}/max", self.term_max[name], step)
+            writer.add_scalar(f"{prefix}/{tag}/mean", self.sum[name] / float(self.window_steps), step)
+            writer.add_scalar(f"{prefix}/{tag}/min", self.min[name], step)
+            writer.add_scalar(f"{prefix}/{tag}/max", self.max[name], step)
 
-        # weighted per-term reward outputs
-        for name in sorted(self.weighted_sum.keys()):
-            tag = sanitize_tb_tag(name)
-            writer.add_scalar(f"RewardTermsWeighted/{tag}/mean", self.weighted_sum[name] / float(self.window_steps), step)
-            writer.add_scalar(f"RewardTermsWeighted/{tag}/min", self.weighted_min[name], step)
-            writer.add_scalar(f"RewardTermsWeighted/{tag}/max", self.weighted_max[name], step)
 
-        for name in sorted(self.aux_sum.keys()):
-            tag = sanitize_tb_tag(name)
-            writer.add_scalar(f"AuxWindow/{tag}/mean", self.aux_sum[name] / float(self.window_steps), step)
-            writer.add_scalar(f"AuxWindow/{tag}/min", self.aux_min[name], step)
-            writer.add_scalar(f"AuxWindow/{tag}/max", self.aux_max[name], step)
+class RewardBreakdownAccumulator:
+    def __init__(self) -> None:
+        self.raw = TensorDictStats()
+        self.weighted = TensorDictStats()
+        self.scaled = TensorDictStats()
 
-class EpisodeInfoAccumulator:
+    def reset(self) -> None:
+        self.raw.reset()
+        self.weighted.reset()
+        self.scaled.reset()
+
+    def update(
+        self,
+        raw_terms: Dict[str, torch.Tensor],
+        weighted_terms: Dict[str, torch.Tensor],
+        scaled_terms: Dict[str, torch.Tensor],
+    ) -> None:
+        self.raw.update(raw_terms)
+        self.weighted.update(weighted_terms)
+        self.scaled.update(scaled_terms)
+
+    def flush(self, writer: SummaryWriter, step: int) -> None:
+        self.raw.flush(writer, "RewardRaw", step)
+        self.weighted.flush(writer, "RewardWeighted", step)
+        self.scaled.flush(writer, "RewardScaled", step)
+
+
+class TerminationAccumulator:
     def __init__(self) -> None:
         self.reset()
 
     def reset(self) -> None:
-        self.reward_sum: Dict[str, float] = {}
-        self.reward_mean_sum: Dict[str, float] = {}
-        self.reward_count: Dict[str, int] = {}
+        self.total_episodes = 0.0
+        self.term_counts: Dict[str, float] = {}
 
-        self.term_sum: Dict[str, float] = {}
-        self.term_mean_sum: Dict[str, float] = {}
-        self.term_count: Dict[str, int] = {}
-
-        self.other_sum: Dict[str, float] = {}
-        self.other_mean_sum: Dict[str, float] = {}
-        self.other_count: Dict[str, int] = {}
-
-    def update(self, infos: Any) -> None:
+    def update(self, infos: Any, done_count: int) -> None:
+        self.total_episodes += float(done_count)
         log_dict = extract_log_dict(infos)
         if len(log_dict) == 0:
             return
-
         for key, value in log_dict.items():
-            if key.startswith("Episode_Reward/"):
-                self.reward_sum[key] = self.reward_sum.get(key, 0.0) + value_sum(value)
-                self.reward_mean_sum[key] = self.reward_mean_sum.get(key, 0.0) + value_mean(value)
-                self.reward_count[key] = self.reward_count.get(key, 0) + 1
-            elif key.startswith("Episode_Termination/"):
-                self.term_sum[key] = self.term_sum.get(key, 0.0) + value_sum(value)
-                self.term_mean_sum[key] = self.term_mean_sum.get(key, 0.0) + value_mean(value)
-                self.term_count[key] = self.term_count.get(key, 0) + 1
-            else:
-                self.other_sum[key] = self.other_sum.get(key, 0.0) + value_sum(value)
-                self.other_mean_sum[key] = self.other_mean_sum.get(key, 0.0) + value_mean(value)
-                self.other_count[key] = self.other_count.get(key, 0) + 1
+            if not key.startswith("Episode_Termination/"):
+                continue
+            name = key.split("/", 1)[1]
+            self.term_counts[name] = self.term_counts.get(name, 0.0) + to_float(value)
 
     def flush(self, writer: SummaryWriter, step: int) -> None:
-        for key in sorted(self.reward_sum.keys()):
-            tag = sanitize_tb_tag(key.split("/", 1)[1])
-            cnt = max(self.reward_count.get(key, 0), 1)
-            writer.add_scalar(f"Episode_Reward/{tag}", self.reward_mean_sum[key] / float(cnt), step)
-            writer.add_scalar(f"Episode_Reward/{tag}/sum", self.reward_sum[key], step)
-            writer.add_scalar(f"Episode_Reward/{tag}/count", float(self.reward_count[key]), step)
-
-        for key in sorted(self.term_sum.keys()):
-            tag = sanitize_tb_tag(key.split("/", 1)[1])
-            cnt = max(self.term_count.get(key, 0), 1)
-            writer.add_scalar(f"Episode_Termination/{tag}", self.term_sum[key], step)
-            writer.add_scalar(f"Episode_Termination/{tag}/mean", self.term_mean_sum[key] / float(cnt), step)
-            writer.add_scalar(f"Episode_Termination/{tag}/count", float(self.term_count[key]), step)
-
-        for key in sorted(self.other_sum.keys()):
-            tag = sanitize_tb_tag(key)
-            cnt = max(self.other_count.get(key, 0), 1)
-            writer.add_scalar(f"Episode_Info/{tag}", self.other_mean_sum[key] / float(cnt), step)
-            writer.add_scalar(f"Episode_Info/{tag}/sum", self.other_sum[key], step)
-            writer.add_scalar(f"Episode_Info/{tag}/count", float(self.other_count[key]), step)
+        writer.add_scalar("Termination/episodes_done", self.total_episodes, step)
+        denom = max(self.total_episodes, 1.0)
+        for name in sorted(self.term_counts.keys()):
+            tag = sanitize_tb_tag(name)
+            count = float(self.term_counts[name])
+            writer.add_scalar(f"Termination/{tag}/count", count, step)
+            writer.add_scalar(f"Termination/{tag}/ratio", count / denom, step)
 
 
-# -----------------------------------------------------------------------------
-# Logging helpers
-# -----------------------------------------------------------------------------
-def log_reward_action_stats(
-    writer: SummaryWriter,
-    step: int,
-    rewards_raw: torch.Tensor,
-    rewards_train: torch.Tensor,
-    actions: torch.Tensor,
-) -> None:
-    if isinstance(rewards_raw, torch.Tensor) and rewards_raw.numel() > 0:
-        r = torch.nan_to_num(rewards_raw.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        writer.add_scalar("Reward/raw_min", to_float(r.min()), step)
-        writer.add_scalar("Reward/raw_mean", to_float(r.mean()), step)
-        writer.add_scalar("Reward/raw_max", to_float(r.max()), step)
+class RollingHistogramLogger:
+    def __init__(self, obs_names: List[str], action_names: List[str], window: int, max_samples: int = 0) -> None:
+        self.obs_names = list(obs_names)
+        self.action_names = list(action_names)
+        self.window = max(int(window), 1)
+        self.max_samples = int(max_samples)
+        self.obs_buffers = [deque(maxlen=self.window) for _ in self.obs_names]
+        self.action_buffers = [deque(maxlen=self.window) for _ in self.action_names]
 
-    if isinstance(rewards_train, torch.Tensor) and rewards_train.numel() > 0:
-        r = torch.nan_to_num(rewards_train.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        writer.add_scalar("Reward/train_min", to_float(r.min()), step)
-        writer.add_scalar("Reward/train_mean", to_float(r.mean()), step)
-        writer.add_scalar("Reward/train_max", to_float(r.max()), step)
+    def _prepare_column(self, x: torch.Tensor) -> torch.Tensor:
+        y = torch.nan_to_num(x.detach().float().reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        if self.max_samples > 0 and y.numel() > self.max_samples:
+            idx = torch.randint(0, y.numel(), (self.max_samples,), device=y.device)
+            y = y[idx]
+        return y.cpu()
 
-    if isinstance(actions, torch.Tensor) and actions.numel() > 0:
-        a = torch.nan_to_num(actions.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        writer.add_scalar("Action/mean", to_float(a.mean()), step)
-        writer.add_scalar("Action/std", to_float(a.std(unbiased=False)), step)
-        writer.add_scalar("Action/abs_mean", to_float(a.abs().mean()), step)
-        if a.dim() == 2:
-            for i in range(a.shape[1]):
-                writer.add_scalar(f"Action/dim_{i}_mean", to_float(a[:, i].mean()), step)
-                writer.add_scalar(f"Action/dim_{i}_std", to_float(a[:, i].std(unbiased=False)), step)
+    def update(self, states: torch.Tensor, actions: torch.Tensor, state_dim: int) -> None:
+        obs_dim = min(len(self.obs_names), int(state_dim), int(states.shape[1]))
+        for i in range(obs_dim):
+            self.obs_buffers[i].append(self._prepare_column(states[:, i]))
 
+        act_dim = min(len(self.action_names), int(actions.shape[1]))
+        for i in range(act_dim):
+            self.action_buffers[i].append(self._prepare_column(actions[:, i]))
 
-def log_action_processed_stats(writer: SummaryWriter, base_env: Any, step: int) -> None:
-    try:
-        term = base_env.action_manager.get_term("root_twist")
-        a = getattr(term, "processed_actions", None)
-        if not isinstance(a, torch.Tensor) or a.numel() == 0:
-            return
-        a = torch.nan_to_num(a.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
-        writer.add_scalar("ActionProcessed/mean", to_float(a.mean()), step)
-        writer.add_scalar("ActionProcessed/std", to_float(a.std(unbiased=False)), step)
-        writer.add_scalar("ActionProcessed/abs_mean", to_float(a.abs().mean()), step)
-        if a.dim() == 2:
-            for i in range(a.shape[1]):
-                writer.add_scalar(f"ActionProcessed/dim_{i}_mean", to_float(a[:, i].mean()), step)
-                writer.add_scalar(f"ActionProcessed/dim_{i}_std", to_float(a[:, i].std(unbiased=False)), step)
-    except Exception:
-        pass
+    def flush(self, writer: SummaryWriter, step: int) -> None:
+        for name, buffer in zip(self.obs_names, self.obs_buffers):
+            if len(buffer) == 0:
+                continue
+            writer.add_histogram(f"ObservationDist/{sanitize_tb_tag(name)}", torch.cat(list(buffer), dim=0), step)
+
+        for name, buffer in zip(self.action_names, self.action_buffers):
+            if len(buffer) == 0:
+                continue
+            writer.add_histogram(f"ActionDist/{sanitize_tb_tag(name)}", torch.cat(list(buffer), dim=0), step)
 
 
-def log_env_step_stats(
-    writer: SummaryWriter,
-    step: int,
-    episode_steps_running: torch.Tensor,
-    ended_lengths: List[int],
-) -> None:
-    if isinstance(episode_steps_running, torch.Tensor) and episode_steps_running.numel() > 0:
-        es = torch.nan_to_num(episode_steps_running.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        writer.add_scalar("Env/episode_steps_running_min", to_float(es.min()), step)
-        writer.add_scalar("Env/episode_steps_running_mean", to_float(es.mean()), step)
-        writer.add_scalar("Env/episode_steps_running_max", to_float(es.max()), step)
+class SkrlLossMirror:
+    def __init__(self) -> None:
+        self.reset()
 
-    if len(ended_lengths) > 0:
-        x = torch.tensor(ended_lengths, dtype=torch.float32)
-        writer.add_scalar("Env/episode_length_done_min", float(x.min().item()), step)
-        writer.add_scalar("Env/episode_length_done_mean", float(x.mean().item()), step)
-        writer.add_scalar("Env/episode_length_done_max", float(x.max().item()), step)
-        writer.add_scalar("Env/episodes_done_count", float(len(ended_lengths)), step)
+    def reset(self) -> None:
+        self.policy_losses: List[float] = []
+        self.value_losses: List[float] = []
 
+    def bind(self, agent: PPO) -> None:
+        def wrapped_track_data(tag: str, value: float):
+            low = str(tag).lower()
+            value_f = to_float(value)
+            if "loss" in low and "policy" in low:
+                self.policy_losses.append(value_f)
+            elif "loss" in low and "value" in low:
+                self.value_losses.append(value_f)
 
-def log_policy_stats(writer: SummaryWriter, models: dict[str, nn.Module], step: int) -> None:
-    policy = models.get("policy", None)
-    value = models.get("value", None)
-    if policy is not None and hasattr(policy, "log_std_parameter"):
-        try:
-            x = policy.log_std_parameter.detach().float()
-            writer.add_scalar("Policy/log_std_mean", float(x.mean().item()), step)
-            writer.add_scalar("Policy/log_std_min", float(x.min().item()), step)
-            writer.add_scalar("Policy/log_std_max", float(x.max().item()), step)
-        except Exception:
-            pass
+        agent.track_data = wrapped_track_data
 
-    if value is not None:
-        try:
-            total_norm_sq = 0.0
-            count = 0
-            for p in value.parameters():
-                y = p.detach().float()
-                if y.numel() == 0:
-                    continue
-                total_norm_sq += float((y * y).sum().item())
-                count += y.numel()
-            if count > 0:
-                writer.add_scalar("Value/param_rms", (total_norm_sq / float(count)) ** 0.5, step)
-        except Exception:
-            pass
+    def flush(self, writer: SummaryWriter, step: int) -> None:
+        if len(self.policy_losses) > 0:
+            writer.add_scalar("Loss/policy", float(np.mean(self.policy_losses)), step)
+        if len(self.value_losses) > 0:
+            writer.add_scalar("Loss/value", float(np.mean(self.value_losses)), step)
+        self.reset()
 
 
 def log_gradients(writer: SummaryWriter, models: dict[str, nn.Module], step: int, max_samples: int) -> None:
@@ -851,7 +788,7 @@ class StructuredFeatureExtractor(nn.Module):
         if self.lidar_dim <= 0:
             return self.fuse_net(state)
 
-        lidar = torch.clamp(obs[:, self.state_dim: self.state_dim + self.lidar_dim], 0.0, 1.0)
+        lidar = torch.clamp(obs[:, self.state_dim : self.state_dim + self.lidar_dim], 0.0, 1.0)
         lidar = self.lidar_net(self.lidar_ln(lidar * 2.0 - 1.0))
         return self.fuse_net(torch.cat([state, lidar], dim=-1))
 
@@ -904,6 +841,18 @@ class Value(DeterministicMixin, Model):
         return self.value(self.fe(inputs["states"])), {}
 
 
+def build_state_names(state_dim: int) -> List[str]:
+    if int(state_dim) == len(STATE_OBS_NAMES_19):
+        return list(STATE_OBS_NAMES_19)
+    return [f"state_{i}" for i in range(int(state_dim))]
+
+
+def build_action_names(act_dim: int) -> List[str]:
+    if int(act_dim) == len(ACTION_NAMES_4):
+        return list(ACTION_NAMES_4)
+    return [f"action_{i}" for i in range(int(act_dim))]
+
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -939,7 +888,6 @@ def main() -> None:
         if isinstance(space, gym.spaces.Dict)
         else getattr(base_env, "observation_space", None)
     )
-
     if policy_space is None:
         raise RuntimeError("policy observation space not found")
 
@@ -950,7 +898,6 @@ def main() -> None:
     print_space_bounds("skrl_obs_space", obs_space)
     print_space_bounds("skrl_act_space", act_space)
 
-
     adapted_env = SkrlSpaceAdapter(
         base_env,
         obs_space=obs_space,
@@ -958,11 +905,11 @@ def main() -> None:
         state_dim=state_dim,
         lidar_dim=lidar_dim,
     )
-
     env = wrap_env(adapted_env, wrapper="isaaclab")
 
     num_envs = int(getattr(env, "num_envs", args.num_envs))
     device = torch.device(getattr(env, "device", args.device))
+    step_dt = get_env_step_dt(base_env)
 
     print(
         f"[INFO] skrl spaces -> obs={obs_dim} (state={state_dim}, lidar={lidar_dim}), act={act_dim}",
@@ -1004,11 +951,12 @@ def main() -> None:
     cfg["experiment"]["write_interval"] = int(args.tb_interval)
     cfg["experiment"]["checkpoint_interval"] = int(args.checkpoint_interval)
 
-    print(f"[INFO] TensorBoard logdir: {exp_dir}", flush=True)
+    print(f"[INFO] Custom TensorBoard logdir: {tb_dir}", flush=True)
 
     writer = SummaryWriter(log_dir=str(tb_dir))
     writer.add_text("run/args", str(vars(args)), 0)
     writer.add_text("run/dims", f"obs={obs_dim}, state={state_dim}, lidar={lidar_dim}, act={act_dim}", 0)
+    writer.add_text("run/step_dt", f"{step_dt:.8f}", 0)
 
     memory = RandomMemory(memory_size=int(args.rollouts), num_envs=num_envs, device=device)
     agent = PPO(
@@ -1021,7 +969,9 @@ def main() -> None:
     )
     agent.init()
 
-    # Only reset once: remove the old base_env.reset()
+    loss_mirror = SkrlLossMirror()
+    loss_mirror.bind(agent)
+
     raw_obs, infos = env.reset()
     states = sanitize_states(
         ensure_obs_shape(extract_policy_obs(raw_obs), num_envs, obs_dim),
@@ -1029,24 +979,28 @@ def main() -> None:
         lidar_dim=lidar_dim,
     )
 
-    episode_steps = torch.zeros((num_envs,), device=device, dtype=torch.int32)
-    ended_lengths: List[int] = []
-    last_log_step = 0
-    last_log_time = time.time()
     last_good_snapshot = snapshot_models(models)
 
     reward_weights = extract_reward_weights(base_env)
-    print(f"[INFO] reward weights: {reward_weights}", flush=True)
+    effective_per_step = {k: float(v) * step_dt * float(args.reward_scale) for k, v in reward_weights.items()}
+    print(f"[INFO] reward weights(raw): {reward_weights}", flush=True)
+    print(f"[INFO] reward weights(effective per-step before total clip): {effective_per_step}", flush=True)
 
-
-    reward_window = RewardWindowAccumulator()
-    info_window = EpisodeInfoAccumulator()
+    reward_window = RewardBreakdownAccumulator()
+    termination_window = TerminationAccumulator()
+    hist_logger = RollingHistogramLogger(
+        obs_names=build_state_names(state_dim),
+        action_names=build_action_names(act_dim),
+        window=int(args.dist_window),
+        max_samples=int(args.dist_max_samples),
+    )
 
     print("[INFO] Starting training loop...", flush=True)
     pbar = tqdm(range(int(args.timesteps)), ncols=110)
 
     try:
         for t in pbar:
+            global_step = t + 1
             agent.pre_interaction(timestep=t, timesteps=int(args.timesteps))
 
             with torch.no_grad():
@@ -1062,7 +1016,7 @@ def main() -> None:
                 raise RuntimeError(f"Non-finite actions detected before env.step at t={t}")
             actions = sanitize_actions(actions)
 
-            rollout_boundary = ((t + 1) % int(args.rollouts) == 0)
+            rollout_boundary = (global_step % int(args.rollouts) == 0)
             if rollout_boundary:
                 last_good_snapshot = snapshot_models(models)
 
@@ -1090,19 +1044,19 @@ def main() -> None:
             ).bool()
             train_rewards = scale_rewards(rewards, scale=args.reward_scale, clip=args.reward_clip)
 
-            reward_terms = extract_tb_reward_terms(base_env)
-            aux_terms = extract_tb_aux_terms(base_env)
-            reward_window.update(
-                reward_terms=reward_terms,
+            raw_terms, weighted_terms, scaled_terms = build_reward_term_views(
+                base_env,
                 reward_weights=reward_weights,
-                aux_terms=aux_terms,
-                rewards_raw=rewards,
-                rewards_train=train_rewards,
+                reward_scale=float(args.reward_scale),
+                reward_clip=float(args.reward_clip),
             )
-            info_window.update(infos)
+            reward_window.update(raw_terms=raw_terms, weighted_terms=weighted_terms, scaled_terms=scaled_terms)
+            clear_tb_caches(base_env)
+
+            done_count = int((terminated | truncated).sum().item())
+            termination_window.update(infos, done_count=done_count)
 
             record_infos = infos if args.keep_infos else {}
-
             with torch.no_grad():
                 agent.record_transition(
                     states=states,
@@ -1117,6 +1071,8 @@ def main() -> None:
                 )
 
             agent.post_interaction(timestep=t, timesteps=int(args.timesteps))
+            if rollout_boundary:
+                loss_mirror.flush(writer, global_step)
 
             if rollout_boundary and not models_are_finite(models):
                 debug_dir = exp_dir / "debug"
@@ -1127,65 +1083,54 @@ def main() -> None:
                     f"Snapshot saved to {debug_dir}."
                 )
 
-            done = (terminated | truncated).squeeze(-1)
-            episode_steps += 1
-            if done.any():
-                ended_lengths.extend([int(x) for x in episode_steps[done].detach().cpu().tolist()])
-                episode_steps[done] = 0
-
             if not args.headless:
                 try:
                     env.render()
                 except Exception:
                     pass
 
-            should_log = int(args.tb_interval) > 0 and (
-                ((t + 1) % int(args.tb_interval) == 0) or ((t + 1) == int(args.timesteps))
+            should_log_dist = int(args.dist_interval) > 0 and (
+                (global_step % int(args.dist_interval) == 0) or (global_step == int(args.timesteps))
             )
-            if should_log:
-                now = time.time()
-                fps = float(max((t + 1) - last_log_step, 1)) / max(now - last_log_time, 1e-6)
+            should_log_scalars = int(args.tb_interval) > 0 and (
+                (global_step % int(args.tb_interval) == 0) or (global_step == int(args.timesteps))
+            )
 
-                writer.add_scalar("Perf/fps", fps, t)
-                log_reward_action_stats(writer, t, rewards_raw=rewards, rewards_train=train_rewards, actions=actions)
-                log_action_processed_stats(writer, base_env, t)
-                log_env_step_stats(writer, t, episode_steps_running=episode_steps, ended_lengths=ended_lengths)
-                log_policy_stats(writer, models, t)
-                reward_window.flush(writer, t)
-                info_window.flush(writer, t)
-                log_cuda(writer, t)
-
-                writer.flush()
-
-                ended_lengths.clear()
-                reward_window.reset()
-                info_window.reset()
-                clear_tb_caches(base_env)
-
-                last_log_time = now
-                last_log_step = t + 1
-
-            if int(args.grad_hist_interval) > 0 and rollout_boundary:
-                update_idx = (t + 1) // int(args.rollouts)
-                if update_idx % int(args.grad_hist_interval) == 0:
-                    log_gradients(writer, models, t, int(args.grad_hist_samples))
+            if should_log_dist:
+                hist_logger.update(states=states, actions=actions, state_dim=state_dim)
+                hist_logger.flush(writer, global_step)
+                if not should_log_scalars:
                     writer.flush()
 
-            if int(args.checkpoint_interval) > 0 and ((t + 1) % int(args.checkpoint_interval) == 0):
+            if should_log_scalars:
+                reward_window.flush(writer, global_step)
+                termination_window.flush(writer, global_step)
+                writer.flush()
+
+                reward_window.reset()
+                termination_window.reset()
+
+            if int(args.grad_hist_interval) > 0 and rollout_boundary:
+                update_idx = global_step // int(args.rollouts)
+                if update_idx % int(args.grad_hist_interval) == 0:
+                    log_gradients(writer, models, global_step, int(args.grad_hist_samples))
+                    writer.flush()
+
+            if int(args.checkpoint_interval) > 0 and (global_step % int(args.checkpoint_interval) == 0):
                 ckpt_dir = exp_dir / "manual_checkpoints"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(
                     {name: model.state_dict() for name, model in models.items()},
-                    ckpt_dir / f"models_t{t+1}.pt",
+                    ckpt_dir / f"models_t{global_step}.pt",
                 )
 
-            if int(args.cuda_clean_interval) > 0 and ((t + 1) % int(args.cuda_clean_interval) == 0):
+            if int(args.cuda_clean_interval) > 0 and (global_step % int(args.cuda_clean_interval) == 0):
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
             pbar.set_description(
-                f"t={t} rawR={rewards.mean().item():+.3f} trainR={train_rewards.mean().item():+.3f}"
+                f"t={t} envR={rewards.mean().item():+.3f} trainR={train_rewards.mean().item():+.3f} done={done_count}"
             )
             states = next_states
 

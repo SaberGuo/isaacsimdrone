@@ -66,7 +66,7 @@ class RootTwistVelocityActionTerm(ActionTerm):
         params = getattr(cfg, "params", None) or {}
         p_get = params.get if isinstance(params, dict) else lambda k, d=None: getattr(params, k, d)
 
-        self._vel_scale = float(p_get("vel_scale", 3.0))
+        self._vel_scale = float(p_get("vel_scale", 4.0))
         self._vel_clip = float(p_get("vel_clip", 5.0))
         self._yaw_rate_scale = float(p_get("yaw_rate_scale", 2.0))
         self._yaw_rate_clip = float(p_get("yaw_rate_clip", 3.0))

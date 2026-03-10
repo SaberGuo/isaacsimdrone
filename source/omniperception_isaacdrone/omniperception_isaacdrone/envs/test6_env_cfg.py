@@ -1,9 +1,8 @@
 # omniperception_isaacdrone/envs/test6_env_cfg.py
 from __future__ import annotations
 
-import isaaclab.sim as sim_utils
 import isaaclab.envs.mdp as mdp
-
+import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import (
@@ -12,13 +11,13 @@ from isaaclab.managers import (
     ObservationGroupCfg as ObsGroup,
     ObservationTermCfg as ObsTerm,
     RewardTermCfg as RewTerm,
-    TerminationTermCfg as DoneTerm,
     SceneEntityCfg,
+    TerminationTermCfg as DoneTerm,
 )
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensorCfg, LidarSensorCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.sensors import LidarSensorCfg, ContactSensorCfg
 
 from omniperception_isaacdrone.assets.robots.drone_cfg import DRONE_CFG, DRONE_MASS
 
@@ -27,32 +26,24 @@ try:
 except Exception:
     LIDAR_CFG = None
 
-# MDP module (your custom actions/obs/rewards/terminations)
 from omniperception_isaacdrone.tasks import mdp as my_mdp
 
 
 # -----------------------------------------------------------------------------
-# Normalization hyper-params (used by obs_*_norm in test6_observations.py
-# and by MyDroneRLEnv._set_normalized_spaces)
+# Normalization hyper-params
 # -----------------------------------------------------------------------------
 @configclass
 class NormalizationCfg:
-    # Workspace bounds (keep consistent with termination/workspace definition)
     x_bounds: tuple[float, float] = (-60.0, 60.0)
     y_bounds: tuple[float, float] = (-60.0, 60.0)
     z_bounds: tuple[float, float] = (1.0, 10.0)
 
-    # 1.1 * diagonal scale
     diag_scale: float = 1.1
 
-    # Velocity normalization
-    lin_vel_max: float = 5.0   # vmax (m/s)
-    ang_vel_max: float = 10.0  # wmax (rad/s)
+    lin_vel_max: float = 5.0
+    ang_vel_max: float = 10.0
 
-    # Quaternion hemisphere for continuity
     quat_hemisphere: bool = True
-
-    # Used by env._set_normalized_spaces to split state/lidar dims
     state_dim: int = 19
 
 
@@ -77,14 +68,13 @@ class Test6SceneCfg(InteractiveSceneCfg):
 
     robot: ArticulationCfg = DRONE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-    # NOTE: keep modifications inline, avoid extra temp variables in class body
     robot.spawn = DRONE_CFG.spawn.replace(
-        scale=(1, 1, 1),
+        scale=(10, 10, 10),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,
-            linear_damping=0.0,
-            angular_damping=0.0,
+            linear_damping=0.05,
+            angular_damping=0.05,
             max_linear_velocity=100.0,
             max_angular_velocity=100.0,
             max_depenetration_velocity=10.0,
@@ -99,7 +89,6 @@ class Test6SceneCfg(InteractiveSceneCfg):
         joint_pos={".*": 0.0},
     )
 
-    # Contact sensor: disable filtering to avoid pattern mismatch with global obstacles
     contact_sensor: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/body",
         update_period=0.0,
@@ -140,7 +129,6 @@ class Test6ActionsCfg:
 class Test6ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
-        # 19D normalized state ([-1,1] except quaternion naturally in [-1,1])
         root_pos = ObsTerm(func=my_mdp.obs_root_pos_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_quat = ObsTerm(func=my_mdp.obs_root_quat_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_lin_vel = ObsTerm(func=my_mdp.obs_root_lin_vel_norm, params={"asset_cfg": SceneEntityCfg("robot")})
@@ -148,11 +136,7 @@ class Test6ObservationsCfg:
         projected_gravity = ObsTerm(func=my_mdp.obs_projected_gravity_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         goal_delta = ObsTerm(func=my_mdp.obs_goal_delta_norm, params={"asset_cfg": SceneEntityCfg("robot")})
 
-        # LiDAR grid closeness in [0,1]
-        # IMPORTANT: choose params that yield lidar_dim=432:
-        #   theta: 30->90 step 10 => 6 bins
-        #   phi:   0->360 step 5  => 72 bins
-        #   6*72 = 432
+        # 6 x 72 = 432
         lidar_grid = ObsTerm(
             func=my_mdp.obs_lidar_min_range_grid,
             params=dict(
@@ -182,52 +166,49 @@ class Test6EventCfg:
 
 @configclass
 class Test6RewardsCfg:
-    # goal shaping
-    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=50.0, params={})
-    dist_to_goal     = RewTerm(func=my_mdp.reward_distance_to_goal, weight=10.0, params={})
-    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=0.5, params={})
+    # goal shaping: keep progress as the dominant dense term, but weaken static "hover nicely" incentives
+    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=40.0, params={})
+    dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=1.0, params={})
+    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=5.0, params={})
 
-    # stabilization / regularization
-    height    = RewTerm(func=my_mdp.reward_height_tracking, weight=1.0, params={})
-    stability = RewTerm(func=my_mdp.reward_stability,       weight=0.5, params={})
+    # stabilization / regularization: make them true regularizers instead of main objectives
+    height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.1, params={})
+    stability = RewTerm(func=my_mdp.reward_stability, weight=0.05, params={})
 
     # safety & effort
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-1.0,  params={})
-    energy       = RewTerm(func=my_mdp.penalty_energy,       weight=-0.05, params={})
-    action_l2    = RewTerm(func=my_mdp.reward_action_l2,     weight=-0.002)
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-1.0, params={})
+    energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.05, params={})
+    action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.002)
 
-    # terminal signals
-    success_bonus     = RewTerm(func=my_mdp.reward_goal_reached,      weight=300.0,  params={})
-    collision_penalty = RewTerm(func=my_mdp.penalty_collision,        weight=-300.0, params={})
-    oob_penalty       = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-300.0, params={})
-    timeout_penalty   = RewTerm(func=my_mdp.penalty_time_out,         weight=-200.0,  params={})
+    # terminal signals: raise them so they remain salient after IsaacLab multiplies by dt
+    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=1800.0, params={})
+    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-1800.0, params={})
+    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-1800.0, params={})
+    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-1500.0, params={})
 
 
 @configclass
 class Test6TerminationsCfg:
-    time_out     = DoneTerm(func=mdp.time_out, time_out=True)
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)
     reached_goal = DoneTerm(func=my_mdp.termination_reached_goal, params={})
-    oob          = DoneTerm(func=my_mdp.termination_out_of_workspace, params={})
-    collision    = DoneTerm(func=my_mdp.termination_collision, params={})
+    oob = DoneTerm(func=my_mdp.termination_out_of_workspace, params={})
+    collision = DoneTerm(func=my_mdp.termination_collision, params={})
 
 
 @configclass
 class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
     normalization: NormalizationCfg = NormalizationCfg()
 
-    scene:        Test6SceneCfg        = Test6SceneCfg(num_envs=1, env_spacing=0.0)
+    scene: Test6SceneCfg = Test6SceneCfg(num_envs=1, env_spacing=0.0)
     observations: Test6ObservationsCfg = Test6ObservationsCfg()
-    actions:      Test6ActionsCfg      = Test6ActionsCfg()
-    events:       Test6EventCfg        = Test6EventCfg()
-    rewards:      Test6RewardsCfg      = Test6RewardsCfg()
+    actions: Test6ActionsCfg = Test6ActionsCfg()
+    events: Test6EventCfg = Test6EventCfg()
+    rewards: Test6RewardsCfg = Test6RewardsCfg()
     terminations: Test6TerminationsCfg = Test6TerminationsCfg()
 
     def __post_init__(self):
         super().__post_init__()
 
-        # ----------------------------
-        # Simulation / episode settings
-        # ----------------------------
         self.decimation = 2
         max_steps = 1500
 
@@ -235,127 +216,125 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.render_interval = self.decimation
         self.episode_length_s = float(max_steps) * float(self.sim.dt) * float(self.decimation)
 
-        self.viewer.eye    = (60.0, 60.0, 40.0)
-        self.viewer.lookat = (0.0,  0.0,  5.0)
+        self.viewer.eye = (60.0, 60.0, 40.0)
+        self.viewer.lookat = (0.0, 0.0, 5.0)
 
-        # ----------------------------
-        # Workspace / normalization bounds (keep consistent everywhere)
-        # ----------------------------
         WORKSPACE_X = (-60.0, 60.0)
         WORKSPACE_Y = (-60.0, 60.0)
         WORKSPACE_Z = (1.0, 10.0)
-        GOAL_RADIUS = 1.0
+        GOAL_RADIUS = 2.0
 
         self.normalization.x_bounds = WORKSPACE_X
         self.normalization.y_bounds = WORKSPACE_Y
         self.normalization.z_bounds = WORKSPACE_Z
 
-        # ----------------------------
-        # Controller params (ActionTerm)
-        # ----------------------------
         self.actions.root_twist.params = {
-            "mass":                   DRONE_MASS,
-            "use_sim_total_mass":     True,
+            "mass": DRONE_MASS,
+            "use_sim_total_mass": True,
             "prevent_negative_thrust": True,
-
-            # action scaling (normalized [-1,1] -> physical command)
-            "vel_scale":              3.0,
-            "vel_clip":               5.0,
-            "yaw_rate_scale":         2.0,
-            "yaw_rate_clip":          30.0,
-
-            "thrust_sign":            1.0,
-            "g":                      9.81,
-            "vel_gain":               (3.0, 3.0, 4.0),
-            "pos_gain":               (0.0, 0.0, 0.0),
-            "attitude_gain":          (6.0, 6.0, 1.5),
-            "ang_rate_gain":          (0.25, 0.25, 0.18),
-            "thrust_limit_factor":    3,
-            "torque_limit":           (200.0, 200.0, 200.0),
-            "inertia_diag":           (0.02, 0.02, 0.04),
+            "vel_scale": 5.0,
+            "vel_clip": 8.0,
+            "yaw_rate_scale": 3.14,
+            "yaw_rate_clip": 6.28,
+            "thrust_sign": 1.0,
+            "g": 9.81,
+            "vel_gain": (3.0, 3.0, 4.0),
+            "pos_gain": (0.0, 0.0, 0.0),
+            "attitude_gain": (6.0, 6.0, 1.5),
+            "ang_rate_gain": (0.25, 0.25, 0.18),
+            "thrust_limit_factor": 3,
+            "torque_limit": (0.2, 0.2, 0.1),
+            "inertia_diag": (0.02, 0.02, 0.04),
         }
 
-        # ----------------------------
-        # Reset sampling
-        # ----------------------------
         self.events.reset_robot_base.params = {
-            "asset_cfg":        SceneEntityCfg("robot"),
+            "asset_cfg": SceneEntityCfg("robot"),
             "square_half_size": 35.0,
-            "z_range":          (3.0, 7.0),
+            "z_range": (3.0, 7.0),
         }
 
-        # ----------------------------
-        # Terminations
-        # ----------------------------
         self.terminations.reached_goal.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "threshold": GOAL_RADIUS,
         }
         self.terminations.oob.params = {
             "asset_cfg": SceneEntityCfg("robot"),
-            "x_bounds":  WORKSPACE_X,
-            "y_bounds":  WORKSPACE_Y,
-            "z_bounds":  WORKSPACE_Z,
+            "x_bounds": WORKSPACE_X,
+            "y_bounds": WORKSPACE_Y,
+            "z_bounds": WORKSPACE_Z,
         }
         self.terminations.collision.params = {
             "sensor_cfg": SceneEntityCfg("contact_sensor"),
-            "threshold":  1.0,
+            "threshold": 1.0,
         }
 
-        # ----------------------------
-        # Reward params
-        # ----------------------------
         self.rewards.progress_to_goal.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "speed_ref": 3.0,
-            "clip":      1.0,
+            "clip": 1.0,
         }
-        self.rewards.dist_to_goal.params = {"asset_cfg": SceneEntityCfg("robot"), "std": 10.0}
-        self.rewards.height.params       = {"asset_cfg": SceneEntityCfg("robot"), "target_z": 5.0, "std": 2.5}
-        self.rewards.stability.params    = {"asset_cfg": SceneEntityCfg("robot"), "lin_std": 2.0, "ang_std": 6.0}
+        self.rewards.dist_to_goal.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
+            "std": 10.0,
+        }
+        self.rewards.height.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
+            "target_z": 5.0,
+            "std": 2.5,
+        }
+        self.rewards.stability.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
+            "lin_std": 2.0,
+            "ang_std": 6.0,
+        }
         self.rewards.vel_towards_goal.params = {
-            "asset_cfg":  SceneEntityCfg("robot"),
-            "min_speed":  0.2,
-            "speed_ref":  3.0,
-            "use_relu":   True,
+            "asset_cfg": SceneEntityCfg("robot"),
+            "min_speed": 0.2,
+            "speed_ref": 3.0,
+            "use_relu": True,
         }
 
-        # LiDAR safety penalty (separate from observation grid)
         self.rewards.lidar_threat.params = {
-            "lidar_name":       "lidar",
-            "safe_dist":        None,
-            "safe_dist_ratio":  0.1,     # 0.1 * 50m = 5m
-            "exp_scale":        1.0,
-            "cap":             5.0,
-            "use_grid":         True,
-            "theta_min":        30.0,
-            "theta_max":        90.0,
-            "phi_min":          0.0,
-            "phi_max":          360.0,
-            "delta_theta":      10.0,
-            "delta_phi":        5.0,
-            "max_vis_points":   12000,
+            "lidar_name": "lidar",
+            "safe_dist": None,
+            "safe_dist_ratio": 0.06,  # 0.06 * 50m = 3m
+            "exp_scale": 1.0,
+            "cap": 5.0,
+            "use_grid": True,
+            "theta_min": 30.0,
+            "theta_max": 90.0,
+            "phi_min": 0.0,
+            "phi_max": 360.0,
+            "delta_theta": 10.0,
+            "delta_phi": 5.0,
+            "max_vis_points": 12000,
         }
 
         self.rewards.energy.params = {
-            "asset_cfg":       SceneEntityCfg("robot"),
-            "lin_vel_scale":   100.0,
-            "ang_vel_scale":   100.0,
-            "lin_acc_scale":   100.0,
-            "ang_acc_scale":   100.0,
-            "include_acc":     True,
-            "acc_weight":      0.2,
-            "max_penalty":     1.0,
+            "asset_cfg": SceneEntityCfg("robot"),
+            "lin_vel_scale": 100.0,
+            "ang_vel_scale": 100.0,
+            "lin_acc_scale": 100.0,
+            "ang_acc_scale": 100.0,
+            "include_acc": True,
+            "acc_weight": 0.2,
+            "max_penalty": 1.0,
         }
 
-        self.rewards.success_bonus.params = {"asset_cfg": SceneEntityCfg("robot"), "threshold": GOAL_RADIUS}
+        self.rewards.success_bonus.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
+            "threshold": GOAL_RADIUS,
+        }
         self.rewards.oob_penalty.params = {
             "asset_cfg": SceneEntityCfg("robot"),
-            "x_bounds":  WORKSPACE_X,
-            "y_bounds":  WORKSPACE_Y,
-            "z_bounds":  WORKSPACE_Z,
+            "x_bounds": WORKSPACE_X,
+            "y_bounds": WORKSPACE_Y,
+            "z_bounds": WORKSPACE_Z,
         }
-        self.rewards.collision_penalty.params = {"sensor_cfg": SceneEntityCfg("contact_sensor"), "threshold": 1.0}
+        self.rewards.collision_penalty.params = {
+            "sensor_cfg": SceneEntityCfg("contact_sensor"),
+            "threshold": 1.0,
+        }
 
 
 @configclass

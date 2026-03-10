@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import torch
 
 import isaaclab.envs.mdp as mdp
@@ -11,9 +10,9 @@ from isaaclab.managers import SceneEntityCfg
 
 from .test6_observations import obs_lidar_min_range_grid
 from .test6_terminations import (
-    termination_reached_goal,
-    termination_out_of_workspace,
     termination_collision,
+    termination_out_of_workspace,
+    termination_reached_goal,
 )
 
 
@@ -76,7 +75,6 @@ def _get_goal_pos(env: ManagerBasedRLEnv, pos: torch.Tensor) -> torch.Tensor:
 
 
 def _get_step_dt(env: ManagerBasedRLEnv) -> float:
-    # IsaacLab usually provides env.step_dt; if not, fallback to sim.dt * decimation
     if hasattr(env, "step_dt"):
         try:
             return float(env.step_dt)
@@ -85,7 +83,6 @@ def _get_step_dt(env: ManagerBasedRLEnv) -> float:
     try:
         return float(env.cfg.sim.dt) * float(env.cfg.decimation)
     except Exception:
-        # last resort: assume 60Hz RL step
         return 1.0 / 60.0
 
 
@@ -103,10 +100,10 @@ def _get_lidar_max_distance(lidar) -> float:
 # -----------------------------------------------------------------------------
 def reward_distance_to_goal(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, std: float = 6.0) -> torch.Tensor:
     """Bounded goal proximity reward: exp(-0.5*(d/std)^2) in (0, 1]."""
-    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)  # (N,3)
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
     goal = _get_goal_pos(env, pos)
 
-    d = _safe_norm(goal - pos)  # (N,)
+    d = _safe_norm(goal - pos)
     std = max(float(std), 1e-6)
 
     r = d / std
@@ -119,7 +116,7 @@ def reward_distance_to_goal(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, s
 
 
 # -----------------------------------------------------------------------------
-# NEW: dense progress reward (approach goal => positive, go away => negative)
+# dense progress reward (approach goal => positive, go away => negative)
 # -----------------------------------------------------------------------------
 def reward_progress_to_goal(
     env: ManagerBasedRLEnv,
@@ -127,45 +124,38 @@ def reward_progress_to_goal(
     speed_ref: float = 3.0,
     clip: float = 1.0,
 ) -> torch.Tensor:
-    """Dense shaping reward based on *distance decrease* to the goal.
+    """Dense shaping reward based on distance decrease to the goal.
 
-    We compute:
-        delta_d = prev_dist - current_dist
-        towards_speed = delta_d / step_dt
-        out = clamp(towards_speed / speed_ref, -clip, clip)
-
-    - Positive when moving toward goal.
-    - Negative when moving away.
-    - Zero if no progress.
-
-    NOTE: We keep a per-env cache on `env._progress_prev_goal_dist` and refresh it in env.reset_idx
-    (recommended). If not present, we initialize and output zeros (no spike).
+    delta_d = prev_dist - current_dist
+    towards_speed = delta_d / step_dt
+    out = clamp(towards_speed / speed_ref, -clip, clip)
     """
     pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
     goal = _get_goal_pos(env, pos)
-    d = _safe_norm(goal - pos)  # (N,)
+    d = _safe_norm(goal - pos)
 
-    # cache
     prev = getattr(env, "_progress_prev_goal_dist", None)
     if prev is None or (not isinstance(prev, torch.Tensor)) or prev.shape != d.shape:
         setattr(env, "_progress_prev_goal_dist", d.detach().clone())
+        towards_speed = torch.zeros_like(d)
         out = torch.zeros_like(d)
     else:
         dt = max(_get_step_dt(env), 1e-6)
         delta = prev - d
         towards_speed = delta / dt
         denom = max(float(speed_ref), 1e-6)
-        out = towards_speed / denom
-        out = torch.clamp(out, min=-float(clip), max=float(clip))
+        out = torch.clamp(towards_speed / denom, min=-float(clip), max=float(clip))
         env._progress_prev_goal_dist = d.detach().clone()
 
-    _tb_store_reward(env, "progress_to_goal", out.to(torch.float32))
-    _tb_store_aux(env, "goal_progress_norm", out.to(torch.float32))
-    return out.to(torch.float32)
+    out = out.to(torch.float32)
+    _tb_store_reward(env, "progress_to_goal", out)
+    _tb_store_aux(env, "goal_progress_norm", out)
+    _tb_store_aux(env, "goal_progress_speed", towards_speed.to(torch.float32))
+    return out
 
 
 # -----------------------------------------------------------------------------
-# (keep) height tracking
+# height tracking
 # -----------------------------------------------------------------------------
 def reward_height_tracking(
     env: ManagerBasedRLEnv,
@@ -185,7 +175,7 @@ def reward_height_tracking(
 
 
 # -----------------------------------------------------------------------------
-# (keep) stability reward
+# stability reward
 # -----------------------------------------------------------------------------
 def reward_stability(
     env: ManagerBasedRLEnv,
@@ -222,50 +212,58 @@ def reward_velocity_towards_goal(
     speed_ref: float = 3.0,
     use_relu: bool = True,
 ) -> torch.Tensor:
+    """Reward the velocity component projected onto the goal direction.
+
+    Compared with the old cos(theta) * speed-factor form, this version directly uses
+    the signed projected speed, so the magnitude is easier to interpret and matches
+    the physical meaning of "moving towards the goal" more closely.
+    """
     pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
     goal = _get_goal_pos(env, pos)
 
-    v = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg)  # (N,3)
-    speed = _safe_norm(v)  # (N,)
+    v = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg)
+    speed = _safe_norm(v)
 
     dir_vec = goal - pos
-    dir_unit = dir_vec / (_safe_norm(dir_vec).unsqueeze(-1) + 1e-6)
+    dir_norm = _safe_norm(dir_vec)
+    dir_unit = dir_vec / (dir_norm.unsqueeze(-1) + 1e-6)
 
-    cos = torch.sum(v * dir_unit, dim=-1) / (speed + 1e-6)
-    cos = torch.clamp(cos, -1.0, 1.0)
+    projected_speed = torch.sum(v * dir_unit, dim=-1)
+    cos = torch.clamp(projected_speed / (speed + 1e-6), -1.0, 1.0)
 
     if use_relu:
-        cos = torch.clamp(cos, min=0.0)
+        projected_speed = torch.clamp(projected_speed, min=0.0)
 
     min_speed = float(min_speed)
     if min_speed > 0.0:
-        cos = torch.where(speed >= min_speed, cos, torch.zeros_like(cos))
+        projected_speed = torch.where(speed >= min_speed, projected_speed, torch.zeros_like(projected_speed))
 
-    speed_ref = float(speed_ref)
-    if speed_ref > 1e-6:
-        speed_fac = torch.clamp(speed / speed_ref, 0.0, 1.0)
-        cos = cos * speed_fac
+    denom = max(float(speed_ref), 1e-6)
+    if use_relu:
+        out = torch.clamp(projected_speed / denom, 0.0, 1.0)
+    else:
+        out = torch.clamp(projected_speed / denom, -1.0, 1.0)
 
-    _tb_store_reward(env, "vel_towards_goal", cos)
+    out = out.to(torch.float32)
+    _tb_store_reward(env, "vel_towards_goal", out)
     _tb_store_aux(env, "speed", speed)
-    return cos
+    _tb_store_aux(env, "goal_direction_cos", cos)
+    _tb_store_aux(env, "towards_speed", projected_speed.to(torch.float32))
+    return out
 
 
 # -----------------------------------------------------------------------------
-# ② LiDAR safety penalty (0 when min_dist >= safe_dist, exp penalty when smaller)
+# ② LiDAR safety penalty
 # -----------------------------------------------------------------------------
 def penalty_lidar_threat(
     env: ManagerBasedRLEnv,
     lidar_name: str = "lidar",
-    # NEW preferred params
     safe_dist: float | None = None,
     safe_dist_ratio: float = 0.1,
     exp_scale: float = 1.0,
     cap: float = 5.0,
     use_grid: bool = True,
-    # backward-compatible params (old name)
     threshold: float | None = None,
-    # grid parameters
     theta_min: float = 30.0,
     theta_max: float = 90.0,
     phi_min: float = 0.0,
@@ -274,17 +272,6 @@ def penalty_lidar_threat(
     delta_phi: float = 5.0,
     max_vis_points: int | None = None,
 ) -> torch.Tensor:
-    """Safety-style LiDAR penalty.
-
-    Desired behavior:
-      - If min distance to obstacle >= safe_dist: penalty = 0
-      - If min distance < safe_dist: penalty increases exponentially as distance decreases
-      - Penalty capped at `cap`
-
-    Notes:
-      - If `safe_dist` is None, use `safe_dist_ratio * lidar_max_distance`
-      - For obstacle-only avoidance, we strongly recommend `use_grid=True` with theta range excluding ground rays.
-    """
     exp_scale = max(float(exp_scale), 1e-6)
     cap = float(cap)
 
@@ -299,10 +286,8 @@ def penalty_lidar_threat(
     env_ids = torch.arange(env.num_envs, device=env.device)
     max_d = _get_lidar_max_distance(lidar)
 
-    # backward compat: old "threshold" means safe_dist
     if safe_dist is None and threshold is not None:
         safe_dist = float(threshold)
-
     if safe_dist is None:
         safe_dist = float(safe_dist_ratio) * float(max_d)
     safe_dist = float(safe_dist)
@@ -321,7 +306,7 @@ def penalty_lidar_threat(
             max_vis_points=max_vis_points,
             max_distance=max_d,
         )
-        max_close = grid.max(dim=1).values  # (N,)
+        max_close = grid.max(dim=1).values
         min_dist = float(max_d) * (1.0 - max_close)
     else:
         dist = lidar.get_distances(env_ids)
@@ -331,16 +316,12 @@ def penalty_lidar_threat(
         if dist.dim() == 1:
             dist = dist.unsqueeze(0)
         dist = dist.to(dtype=torch.float32)
-
         dist = torch.where(torch.isfinite(dist), dist, torch.full_like(dist, max_d))
         dist = torch.where(dist > 0.0, dist, torch.full_like(dist, max_d))
-        min_dist = dist.min(dim=1).values  # (N,)
+        min_dist = dist.min(dim=1).values
 
-    # penalty only when too close
     delta = safe_dist - min_dist
-    x = delta / exp_scale
-    x = torch.clamp(x, min=0.0)
-
+    x = torch.clamp(delta / exp_scale, min=0.0)
     pen = torch.expm1(x).to(torch.float32)
 
     if cap > 0.0:
@@ -353,7 +334,7 @@ def penalty_lidar_threat(
 
 
 # -----------------------------------------------------------------------------
-# ③ energy penalty (v, w, a, alpha) with finite difference (fixed scaling)
+# ③ energy penalty
 # -----------------------------------------------------------------------------
 def penalty_energy(
     env: ManagerBasedRLEnv,
@@ -366,14 +347,6 @@ def penalty_energy(
     acc_weight: float = 0.2,
     max_penalty: float = 10.0,
 ) -> torch.Tensor:
-    """Energy / effort penalty.
-
-    Compared to your original version, the key change is making it *not saturate* at max_penalty
-    under normal flight by:
-      - using larger acc scales
-      - down-weighting acceleration penalties via `acc_weight`
-      - keeping a hard cap as a last resort
-    """
     lin_vel_scale = max(float(lin_vel_scale), 1e-6)
     ang_vel_scale = max(float(ang_vel_scale), 1e-6)
     lin_acc_scale = max(float(lin_acc_scale), 1e-6)
@@ -413,12 +386,8 @@ def penalty_energy(
             setattr(env, "_energy_prev_lin_vel_w", v.detach().clone())
             setattr(env, "_energy_prev_ang_vel_w", w.detach().clone())
         else:
-            dv = v - prev_v
-            dw = w - prev_w
-
-            # small safety clamp on delta-v per RL step (prevents rare spikes from dominating)
-            dv = torch.clamp(dv, min=-10.0 * dt, max=10.0 * dt)  # 10 m/s^2 equivalent
-            dw = torch.clamp(dw, min=-20.0 * dt, max=20.0 * dt)  # 20 rad/s^2 equivalent
+            dv = torch.clamp(v - prev_v, min=-10.0 * dt, max=10.0 * dt)
+            dw = torch.clamp(w - prev_w, min=-20.0 * dt, max=20.0 * dt)
 
             a = dv / dt
             alpha = dw / dt
@@ -437,16 +406,17 @@ def penalty_energy(
     if max_penalty > 0.0:
         pen = torch.clamp(pen, 0.0, max_penalty)
 
-    _tb_store_reward(env, "energy", pen.to(torch.float32))
+    pen = pen.to(torch.float32)
+    _tb_store_reward(env, "energy", pen)
     _tb_store_aux(env, "energy_lin_speed", v_norm)
     _tb_store_aux(env, "energy_ang_speed", w_norm)
     _tb_store_aux(env, "energy_lin_acc", a_norm)
     _tb_store_aux(env, "energy_ang_acc", alpha_norm)
-    return pen.to(torch.float32)
+    return pen
 
 
 # -----------------------------------------------------------------------------
-# ⑤ termination-related rewards / penalties (wrappers that output float)
+# ⑤ termination-related rewards / penalties
 # -----------------------------------------------------------------------------
 def reward_goal_reached(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, threshold: float = 1.0) -> torch.Tensor:
     out = termination_reached_goal(env, asset_cfg=asset_cfg, threshold=threshold).to(torch.float32)
@@ -462,7 +432,11 @@ def penalty_out_of_workspace(
     z_bounds: tuple[float, float] = (0.0, 10.0),
 ) -> torch.Tensor:
     out = termination_out_of_workspace(
-        env, asset_cfg=asset_cfg, x_bounds=x_bounds, y_bounds=y_bounds, z_bounds=z_bounds
+        env,
+        asset_cfg=asset_cfg,
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        z_bounds=z_bounds,
     ).to(torch.float32)
     _tb_store_reward(env, "oob_penalty", out)
     return out
@@ -485,17 +459,9 @@ def penalty_collision(
 
 
 # -----------------------------------------------------------------------------
-# action L2 penalty (use processed actions -> bounded & meaningful)
+# action L2 penalty
 # -----------------------------------------------------------------------------
 def reward_action_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Penalize action magnitude.
-
-    IMPORTANT: We use `processed_actions` (after scaling/clipping inside ActionTerm),
-    so the magnitude is in *physical command* units and is bounded.
-
-    This avoids the common failure mode where the policy outputs huge raw actions
-    but ActionTerm clamps them, making the environment insensitive while the raw L2 explodes.
-    """
     term = env.action_manager.get_term("root_twist")
 
     a = getattr(term, "processed_actions", None)
