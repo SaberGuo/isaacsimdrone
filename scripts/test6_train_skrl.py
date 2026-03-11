@@ -5,7 +5,6 @@ import copy
 import gc
 import inspect
 import os
-import time
 import traceback
 from collections import deque
 from datetime import datetime
@@ -34,19 +33,19 @@ parser.add_argument("--state_dim", type=int, default=19)
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
 
-parser.add_argument("--rollouts", type=int, default=64)
+parser.add_argument("--rollouts", type=int, default=256)
 parser.add_argument("--learning_epochs", type=int, default=4)
-parser.add_argument("--mini_batches", type=int, default=8)
-parser.add_argument("--learning_rate", type=float, default=1e-4)
-parser.add_argument("--_lambda", type=float, default=0.95)
-parser.add_argument("--discount_factor", type=float, default=0.99)
+parser.add_argument("--mini_batches", type=int, default=16)
+parser.add_argument("--learning_rate", type=float, default=3e-4)
+parser.add_argument("--_lambda", type=float, default=0.97)
+parser.add_argument("--discount_factor", type=float, default=0.995)
 
-parser.add_argument("--ratio_clip", type=float, default=0.2)
-parser.add_argument("--value_clip", type=float, default=0.2)
+parser.add_argument("--ratio_clip", type=float, default=0.15)
+parser.add_argument("--value_clip", type=float, default=0.15)
 parser.add_argument("--value_loss_scale", type=float, default=0.5)
 parser.add_argument("--grad_norm_clip", type=float, default=0.5)
-parser.add_argument("--entropy_coef", type=float, default=1e-3)
-parser.add_argument("--kl_threshold", type=float, default=0.02)
+parser.add_argument("--entropy_coef", type=float, default=5e-3)
+parser.add_argument("--kl_threshold", type=float, default=0.01)
 parser.add_argument("--clip_predicted_values", action="store_true")
 parser.add_argument("--no_clip_predicted_values", dest="clip_predicted_values", action="store_false")
 parser.set_defaults(clip_predicted_values=True)
@@ -281,7 +280,7 @@ def sanitize_states(states: torch.Tensor, state_dim: int, lidar_dim: int) -> tor
     state = torch.clamp(states[:, :state_dim], -1.0, 1.0)
     if lidar_dim <= 0:
         return state
-    lidar = torch.clamp(states[:, state_dim : state_dim + lidar_dim], 0.0, 1.0)
+    lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim], 0.0, 1.0)
     return torch.cat([state, lidar], dim=-1)
 
 
@@ -298,12 +297,7 @@ def scale_rewards(rewards: torch.Tensor, scale: float, clip: float) -> torch.Ten
 
 
 def infer_single_dim_from_box(space: Box, num_envs: int) -> int:
-    total = int(np.prod(space.shape))
-    if num_envs > 1 and total % num_envs == 0:
-        candidate = total // num_envs
-        if 0 < candidate != total:
-            return candidate
-    return total
+    return int(np.prod(space.shape))
 
 
 def get_state_lidar_dims(base_env: Any, obs_dim: int) -> tuple[int, int]:
@@ -409,6 +403,20 @@ def extract_log_dict(infos: Any) -> Dict[str, Any]:
         if isinstance(log, dict):
             return log
     return {}
+
+
+def extract_termination_ratio_dict(infos: Any) -> Dict[str, float]:
+    log_dict = extract_log_dict(infos)
+    if len(log_dict) == 0:
+        return {}
+
+    out: Dict[str, float] = {}
+    for key, value in log_dict.items():
+        if not key.startswith("Episode_Termination/"):
+            continue
+        name = key.split("/", 1)[1]
+        out[name] = to_float(value)
+    return out
 
 
 def get_env_step_dt(base_env: Any) -> float:
@@ -619,33 +627,51 @@ class RewardBreakdownAccumulator:
         self.scaled.flush(writer, "RewardScaled", step)
 
 
-class TerminationAccumulator:
+class InfoTerminationRatioAccumulator:
+    """Read termination ratios directly from infos['log']['Episode_Termination/...'].
+
+    Notes:
+      - No custom episodes_done / count / ratio reconstruction
+      - Only updates when at least one env is done at current step
+      - TensorBoard writes:
+          TerminationInfoRatio/<name>/mean
+          TerminationInfoRatio/<name>/latest
+    """
+
     def __init__(self) -> None:
         self.reset()
 
     def reset(self) -> None:
-        self.total_episodes = 0.0
-        self.term_counts: Dict[str, float] = {}
+        self.update_steps = 0
+        self.sum_ratios: Dict[str, float] = {}
+        self.last_ratios: Dict[str, float] = {}
 
-    def update(self, infos: Any, done_count: int) -> None:
-        self.total_episodes += float(done_count)
-        log_dict = extract_log_dict(infos)
-        if len(log_dict) == 0:
+    def update(self, infos: Any, has_done: bool) -> None:
+        if not bool(has_done):
             return
-        for key, value in log_dict.items():
-            if not key.startswith("Episode_Termination/"):
-                continue
-            name = key.split("/", 1)[1]
-            self.term_counts[name] = self.term_counts.get(name, 0.0) + to_float(value)
+
+        ratio_dict = extract_termination_ratio_dict(infos)
+        if len(ratio_dict) == 0:
+            return
+
+        self.update_steps += 1
+        for name, value in ratio_dict.items():
+            value_f = float(value)
+            self.sum_ratios[name] = self.sum_ratios.get(name, 0.0) + value_f
+            self.last_ratios[name] = value_f
 
     def flush(self, writer: SummaryWriter, step: int) -> None:
-        writer.add_scalar("Termination/episodes_done", self.total_episodes, step)
-        denom = max(self.total_episodes, 1.0)
-        for name in sorted(self.term_counts.keys()):
+        if self.update_steps <= 0:
+            return
+
+        writer.add_scalar("TerminationInfoRatio/update_steps", float(self.update_steps), step)
+
+        for name in sorted(self.sum_ratios.keys()):
             tag = sanitize_tb_tag(name)
-            count = float(self.term_counts[name])
-            writer.add_scalar(f"Termination/{tag}/count", count, step)
-            writer.add_scalar(f"Termination/{tag}/ratio", count / denom, step)
+            mean_ratio = self.sum_ratios[name] / float(self.update_steps)
+            latest_ratio = self.last_ratios.get(name, 0.0)
+            writer.add_scalar(f"TerminationInfoRatio/{tag}/mean", mean_ratio, step)
+            writer.add_scalar(f"TerminationInfoRatio/{tag}/latest", latest_ratio, step)
 
 
 class RollingHistogramLogger:
@@ -784,11 +810,11 @@ class StructuredFeatureExtractor(nn.Module):
         self.apply(init_hidden)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        state = self.state_net(self.state_ln(torch.clamp(obs[:, : self.state_dim], -1.0, 1.0)))
+        state = self.state_net(self.state_ln(torch.clamp(obs[:, :self.state_dim], -1.0, 1.0)))
         if self.lidar_dim <= 0:
             return self.fuse_net(state)
 
-        lidar = torch.clamp(obs[:, self.state_dim : self.state_dim + self.lidar_dim], 0.0, 1.0)
+        lidar = torch.clamp(obs[:, self.state_dim:self.state_dim + self.lidar_dim], 0.0, 1.0)
         lidar = self.lidar_net(self.lidar_ln(lidar * 2.0 - 1.0))
         return self.fuse_net(torch.cat([state, lidar], dim=-1))
 
@@ -987,7 +1013,7 @@ def main() -> None:
     print(f"[INFO] reward weights(effective per-step before total clip): {effective_per_step}", flush=True)
 
     reward_window = RewardBreakdownAccumulator()
-    termination_window = TerminationAccumulator()
+    termination_ratio_window = InfoTerminationRatioAccumulator()
     hist_logger = RollingHistogramLogger(
         obs_names=build_state_names(state_dim),
         action_names=build_action_names(act_dim),
@@ -1053,8 +1079,8 @@ def main() -> None:
             reward_window.update(raw_terms=raw_terms, weighted_terms=weighted_terms, scaled_terms=scaled_terms)
             clear_tb_caches(base_env)
 
-            done_count = int((terminated | truncated).sum().item())
-            termination_window.update(infos, done_count=done_count)
+            has_done = bool(torch.any(terminated | truncated).item())
+            termination_ratio_window.update(infos, has_done=has_done)
 
             record_infos = infos if args.keep_infos else {}
             with torch.no_grad():
@@ -1104,11 +1130,11 @@ def main() -> None:
 
             if should_log_scalars:
                 reward_window.flush(writer, global_step)
-                termination_window.flush(writer, global_step)
+                termination_ratio_window.flush(writer, global_step)
                 writer.flush()
 
                 reward_window.reset()
-                termination_window.reset()
+                termination_ratio_window.reset()
 
             if int(args.grad_hist_interval) > 0 and rollout_boundary:
                 update_idx = global_step // int(args.rollouts)
@@ -1129,6 +1155,7 @@ def main() -> None:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+            done_count = int((terminated | truncated).sum().item())
             pbar.set_description(
                 f"t={t} envR={rewards.mean().item():+.3f} trainR={train_rewards.mean().item():+.3f} done={done_count}"
             )

@@ -69,7 +69,7 @@ class Test6SceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = DRONE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     robot.spawn = DRONE_CFG.spawn.replace(
-        scale=(10, 10, 10),
+        scale=(1, 1, 1),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,
@@ -167,24 +167,24 @@ class Test6EventCfg:
 @configclass
 class Test6RewardsCfg:
     # goal shaping: keep progress as the dominant dense term, but weaken static "hover nicely" incentives
-    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=40.0, params={})
-    dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=1.0, params={})
-    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=5.0, params={})
+    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=20.0, params={})
+    dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=2.0, params={})
+    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=2.0, params={})
 
     # stabilization / regularization: make them true regularizers instead of main objectives
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.1, params={})
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.05, params={})
 
     # safety & effort
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-1.0, params={})
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-5.0, params={})
     energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.05, params={})
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.002)
 
     # terminal signals: raise them so they remain salient after IsaacLab multiplies by dt
-    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=1800.0, params={})
-    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-1800.0, params={})
-    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-1800.0, params={})
-    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-1500.0, params={})
+    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=6000.0, params={})
+    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-6000.0, params={})
+    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-6000.0, params={})
+    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-3000.0, params={})
 
 
 @configclass
@@ -222,7 +222,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         WORKSPACE_X = (-60.0, 60.0)
         WORKSPACE_Y = (-60.0, 60.0)
         WORKSPACE_Z = (1.0, 10.0)
-        GOAL_RADIUS = 2.0
+        GOAL_RADIUS = 2.5
 
         self.normalization.x_bounds = WORKSPACE_X
         self.normalization.y_bounds = WORKSPACE_Y
@@ -232,10 +232,10 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "mass": DRONE_MASS,
             "use_sim_total_mass": True,
             "prevent_negative_thrust": True,
-            "vel_scale": 5.0,
-            "vel_clip": 8.0,
-            "yaw_rate_scale": 3.14,
-            "yaw_rate_clip": 6.28,
+            "vel_scale": 3.0,
+            "vel_clip": 6.0,
+            "yaw_rate_scale": 1.56,
+            "yaw_rate_clip": 3.14,
             "thrust_sign": 1.0,
             "g": 9.81,
             "vel_gain": (3.0, 3.0, 4.0),
@@ -270,12 +270,12 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
 
         self.rewards.progress_to_goal.params = {
             "asset_cfg": SceneEntityCfg("robot"),
-            "speed_ref": 3.0,
+            "speed_ref": 4.0,
             "clip": 1.0,
         }
         self.rewards.dist_to_goal.params = {
             "asset_cfg": SceneEntityCfg("robot"),
-            "std": 10.0,
+            "std": 15.0,
         }
         self.rewards.height.params = {
             "asset_cfg": SceneEntityCfg("robot"),
@@ -297,7 +297,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.rewards.lidar_threat.params = {
             "lidar_name": "lidar",
             "safe_dist": None,
-            "safe_dist_ratio": 0.06,  # 0.06 * 50m = 3m
+            "safe_dist_ratio": 0.1,  # 0.06 * 50m = 3m
             "exp_scale": 1.0,
             "cap": 5.0,
             "use_grid": True,
