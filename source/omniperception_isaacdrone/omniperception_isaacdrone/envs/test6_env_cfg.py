@@ -185,9 +185,9 @@ class Test6RewardsCfg:
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.002)
 
     # terminal signals: raise them so they remain salient after IsaacLab multiplies by dt
-    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=6000.0, params={})
-    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-6000.0, params={})
-    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-6000.0, params={})
+    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=3000.0, params={})
+    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-3000.0, params={})
+    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-3000.0, params={})
     timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-3000.0, params={})
 
 
