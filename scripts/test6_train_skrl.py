@@ -969,7 +969,7 @@ def main() -> None:
     WallSpawner(
         x_bounds=(-60.0, 60.0),
         y_bounds=(-60.0, 60.0),
-        z_bounds=(1.0, 10.0),
+        z_bounds=(0.0, 10.0),
         wall_thickness=0.5,
         color=(0.7, 0.7, 0.2),
     ).spawn_walls()

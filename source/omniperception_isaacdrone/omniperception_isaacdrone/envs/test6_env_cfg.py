@@ -91,11 +91,15 @@ class Test6SceneCfg(InteractiveSceneCfg):
     )
 
     contact_sensor: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/body",
+        prim_path="{ENV_REGEX_NS}/Robot/.*",
         update_period=0.0,
         history_length=1,
         debug_vis=False,
-        filter_prim_paths_expr=[],
+        filter_prim_paths_expr=[
+            "/World/Obstacles/.*",
+            "/World/Wall/.*",
+            "/World/ground",
+        ],
     )
 
     dome_light = AssetBaseCfg(
@@ -221,7 +225,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
 
         WORKSPACE_X = (-60.0, 60.0)
         WORKSPACE_Y = (-60.0, 60.0)
-        WORKSPACE_Z = (1.0, 10.0)
+        WORKSPACE_Z = (0.0, 10.0)
         GOAL_RADIUS = 2.5
 
         self.normalization.x_bounds = WORKSPACE_X

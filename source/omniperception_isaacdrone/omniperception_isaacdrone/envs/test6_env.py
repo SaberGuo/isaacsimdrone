@@ -91,7 +91,7 @@ class WallSpawner:
         self,
         x_bounds: tuple = (-60.0, 60.0),
         y_bounds: tuple = (-60.0, 60.0),
-        z_bounds: tuple = (1.0, 10.0),
+        z_bounds: tuple = (0.0, 10.0),
         wall_thickness: float = 0.5,
         color: tuple = (0.7, 0.7, 0.2),
     ):
@@ -275,7 +275,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
                 return state_dim
         except Exception:
             pass
-        return 19
+        return 16
 
     def _infer_single_obs_dim(self, obs_space) -> int:
         if gym is None:
