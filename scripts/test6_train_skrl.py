@@ -29,7 +29,7 @@ parser.add_argument("--num_obstacles", type=int, default=50)
 parser.add_argument("--timesteps", type=int, default=2_000_000)
 parser.add_argument("--seed", type=int, default=42)
 
-parser.add_argument("--state_dim", type=int, default=19)
+parser.add_argument("--state_dim", type=int, default=16)
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
 
@@ -37,8 +37,8 @@ parser.add_argument("--rollouts", type=int, default=256)
 parser.add_argument("--learning_epochs", type=int, default=4)
 parser.add_argument("--mini_batches", type=int, default=16)
 parser.add_argument("--learning_rate", type=float, default=3e-4)
-parser.add_argument("--_lambda", type=float, default=0.97)
-parser.add_argument("--discount_factor", type=float, default=0.995)
+parser.add_argument("--_lambda", type=float, default=0.99)
+parser.add_argument("--discount_factor", type=float, default=0.999)
 
 parser.add_argument("--ratio_clip", type=float, default=0.15)
 parser.add_argument("--value_clip", type=float, default=0.15)
@@ -109,13 +109,10 @@ from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from omniperception_isaacdrone.envs.test6_env import ObstacleSpawner
+from omniperception_isaacdrone.envs.test6_env import ObstacleSpawner, WallSpawner
 
 
-STATE_OBS_NAMES_19 = [
-    "root_pos_x",
-    "root_pos_y",
-    "root_pos_z",
+STATE_OBS_NAMES_16 = [
     "root_quat_w",
     "root_quat_x",
     "root_quat_y",
@@ -133,6 +130,7 @@ STATE_OBS_NAMES_19 = [
     "goal_delta_y",
     "goal_delta_z",
 ]
+
 ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
 
 DEBUG_PRINT = True
@@ -928,8 +926,8 @@ class Value(DeterministicMixin, Model):
 
 
 def build_state_names(state_dim: int) -> List[str]:
-    if int(state_dim) == len(STATE_OBS_NAMES_19):
-        return list(STATE_OBS_NAMES_19)
+    if int(state_dim) == len(STATE_OBS_NAMES_16):
+        return list(STATE_OBS_NAMES_16)
     return [f"state_{i}" for i in range(int(state_dim))]
 
 
@@ -962,11 +960,29 @@ def main() -> None:
         torch.cuda.manual_seed_all(int(args.seed))
 
     print("[INFO] Spawning shared obstacles...", flush=True)
-    ObstacleSpawner(num_obstacles=int(args.num_obstacles), seed=int(args.seed)).spawn_obstacles()
+    ObstacleSpawner(
+        num_obstacles=int(args.num_obstacles),
+        seed=int(args.seed),
+    ).spawn_obstacles()
+
+    print("[INFO] Spawning workspace walls...", flush=True)
+    WallSpawner(
+        x_bounds=(-60.0, 60.0),
+        y_bounds=(-60.0, 60.0),
+        z_bounds=(1.0, 10.0),
+        wall_thickness=0.5,
+        color=(0.7, 0.7, 0.2),
+    ).spawn_walls()
 
     print("[INFO] Creating env...", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
-    base_env.scene.filter_collisions(global_prim_paths=["/World/ground", "/World/Obstacles"])
+    base_env.scene.filter_collisions(
+        global_prim_paths=[
+            "/World/ground",
+            "/World/Obstacles",
+            "/World/Wall",
+        ]
+    )
 
     space = getattr(base_env, "single_observation_space", None)
     policy_space = (

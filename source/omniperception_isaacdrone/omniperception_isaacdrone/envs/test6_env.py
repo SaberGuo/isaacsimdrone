@@ -78,6 +78,127 @@ class ObstacleSpawner:
         print("[INFO]: 共享障碍物生成完成（静态/kinematic）！")
 
 
+class WallSpawner:
+    """Spawn workspace boundary walls under /World/Wall.
+
+    Walls included:
+      - 4 side walls on x/y boundaries
+      - 1 ceiling wall on z upper boundary
+      - ground is still provided by /World/ground, so no bottom wall
+    """
+
+    def __init__(
+        self,
+        x_bounds: tuple = (-60.0, 60.0),
+        y_bounds: tuple = (-60.0, 60.0),
+        z_bounds: tuple = (1.0, 10.0),
+        wall_thickness: float = 0.5,
+        color: tuple = (0.7, 0.7, 0.2),
+    ):
+        self.x_bounds = x_bounds
+        self.y_bounds = y_bounds
+        self.z_bounds = z_bounds
+        self.wall_thickness = float(wall_thickness)
+        self.color = color
+
+    def _make_wall_cfg(self):
+        return sim_utils.CuboidCfg(
+            size=(1.0, 1.0, 1.0),  # placeholder; actual size passed at spawn-time
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=True,
+                disable_gravity=True,
+                kinematic_enabled=True,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=self.color),
+        )
+
+    def spawn_walls(self):
+        import isaacsim.core.utils.prims as prim_utils
+
+        prim_utils.create_prim("/World/Wall", "Xform")
+
+        x_min, x_max = float(self.x_bounds[0]), float(self.x_bounds[1])
+        y_min, y_max = float(self.y_bounds[0]), float(self.y_bounds[1])
+        z_min, z_max = float(self.z_bounds[0]), float(self.z_bounds[1])
+
+        t = self.wall_thickness
+
+        x_len = x_max - x_min
+        y_len = y_max - y_min
+        z_len = z_max - z_min
+
+        z_center = 0.5 * (z_min + z_max)
+        x_center = 0.5 * (x_min + x_max)
+        y_center = 0.5 * (y_min + y_max)
+
+        print(
+            f"\n[INFO]: 正在生成工作空间围墙 /World/Wall "
+            f"(x={self.x_bounds}, y={self.y_bounds}, z={self.z_bounds}, thickness={t})..."
+        )
+
+        # ------------------------------------------------------------------
+        # Four side walls
+        # Put wall centers OUTSIDE the workspace so the inner face aligns exactly
+        # with the workspace boundary.
+        # ------------------------------------------------------------------
+        walls = [
+            # left wall: inner face at x = x_min
+            dict(
+                name="Wall_XMin",
+                size=(t, y_len, z_len),
+                translation=(x_min - t / 2.0, y_center, z_center),
+            ),
+            # right wall: inner face at x = x_max
+            dict(
+                name="Wall_XMax",
+                size=(t, y_len, z_len),
+                translation=(x_max + t / 2.0, y_center, z_center),
+            ),
+            # bottom-y wall: inner face at y = y_min
+            dict(
+                name="Wall_YMin",
+                size=(x_len, t, z_len),
+                translation=(x_center, y_min - t / 2.0, z_center),
+            ),
+            # top-y wall: inner face at y = y_max
+            dict(
+                name="Wall_YMax",
+                size=(x_len, t, z_len),
+                translation=(x_center, y_max + t / 2.0, z_center),
+            ),
+            # ceiling: inner face at z = z_max
+            dict(
+                name="Wall_ZMax",
+                size=(x_len, y_len, t),
+                translation=(x_center, y_center, z_max + t / 2.0),
+            ),
+        ]
+
+        for wall in walls:
+            cfg_wall = sim_utils.CuboidCfg(
+                size=wall["size"],
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    rigid_body_enabled=True,
+                    disable_gravity=True,
+                    kinematic_enabled=True,
+                ),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=self.color),
+            )
+            wall_path = f"/World/Wall/{wall['name']}"
+            cfg_wall.func(
+                wall_path,
+                cfg_wall,
+                translation=wall["translation"],
+            )
+            print(
+                f"[INFO]: 已生成围墙 {wall['name']}: "
+                f"size={wall['size']}, translation={wall['translation']}"
+            )
+
+        print("[INFO]: 工作空间围墙生成完成！", flush=True)
+
 # =============================================================================
 # Env with goal buffer / energy cache / progress cache
 # =============================================================================
@@ -108,7 +229,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._progress_prev_goal_dist = torch.zeros((1,), dtype=torch.float32)
 
         # metadata used by the training script
-        self.policy_state_dim = 19
+        self.policy_state_dim = 16
         self.policy_lidar_dim = 0
         self._batched_observation_space = None
         self._batched_action_space = None
@@ -149,7 +270,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
     def _get_state_dim_from_cfg(self) -> int:
         try:
             norm_cfg = getattr(self.cfg, "normalization", None)
-            state_dim = int(getattr(norm_cfg, "state_dim", 19))
+            state_dim = int(getattr(norm_cfg, "state_dim", 16))
             if state_dim > 0:
                 return state_dim
         except Exception:
@@ -215,7 +336,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
 
         state_dim = self._get_state_dim_from_cfg()
         if state_dim <= 0 or state_dim > single_obs_dim:
-            state_dim = min(19, single_obs_dim)
+            state_dim = min(16, single_obs_dim)
 
         lidar_dim = max(single_obs_dim - state_dim, 0)
 

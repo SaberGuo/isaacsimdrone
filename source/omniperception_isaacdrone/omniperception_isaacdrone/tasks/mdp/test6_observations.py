@@ -205,16 +205,16 @@ def obs_goal_delta_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> to
 
 
 def obs_state_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Convenience: produce the 19D normalized state vector in the SAME order as your training script:
-      [root_pos(3), root_quat(4), root_lin_vel(3), root_ang_vel(3), projected_gravity(3), goal_delta(3)]
+    """Convenience: produce the 16D normalized state vector in the SAME order as the training script:
+      [root_quat(4), root_lin_vel(3), root_ang_vel(3), projected_gravity(3), goal_delta(3)]
     """
-    p = obs_root_pos_norm(env, asset_cfg)
     q = obs_root_quat_norm(env, asset_cfg)
     v = obs_root_lin_vel_norm(env, asset_cfg)
     w = obs_root_ang_vel_norm(env, asset_cfg)
     g = obs_projected_gravity_norm(env, asset_cfg)
     d = obs_goal_delta_norm(env, asset_cfg)
-    return torch.cat([p, q, v, w, g, d], dim=-1)  # (N,19)
+    return torch.cat([q, v, w, g, d], dim=-1)  # (N,16)
+
 
 
 # =============================================================================

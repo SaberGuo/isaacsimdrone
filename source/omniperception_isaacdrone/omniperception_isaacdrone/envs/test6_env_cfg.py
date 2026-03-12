@@ -44,7 +44,7 @@ class NormalizationCfg:
     ang_vel_max: float = 10.0
 
     quat_hemisphere: bool = True
-    state_dim: int = 19
+    state_dim: int = 16
 
 
 # -----------------------------------------------------------------------------
@@ -69,7 +69,8 @@ class Test6SceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = DRONE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     robot.spawn = DRONE_CFG.spawn.replace(
-        scale=(1, 1, 1),
+        # scale=(1, 1, 1),
+        scale=(20, 20, 10),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,
@@ -129,7 +130,6 @@ class Test6ActionsCfg:
 class Test6ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
-        root_pos = ObsTerm(func=my_mdp.obs_root_pos_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_quat = ObsTerm(func=my_mdp.obs_root_quat_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_lin_vel = ObsTerm(func=my_mdp.obs_root_lin_vel_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_ang_vel = ObsTerm(func=my_mdp.obs_root_ang_vel_norm, params={"asset_cfg": SceneEntityCfg("robot")})
