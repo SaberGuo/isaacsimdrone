@@ -69,8 +69,8 @@ class Test6SceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = DRONE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     robot.spawn = DRONE_CFG.spawn.replace(
-        # scale=(1, 1, 1),
-        scale=(20, 20, 10),
+        scale=(1, 1, 1),
+        # scale=(20, 20, 10),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,

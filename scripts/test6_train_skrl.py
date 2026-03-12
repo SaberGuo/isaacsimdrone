@@ -133,7 +133,7 @@ STATE_OBS_NAMES_16 = [
 
 ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
 
-DEBUG_PRINT = True
+DEBUG_PRINT = False
 
 
 def debug_print(msg: str) -> None:
