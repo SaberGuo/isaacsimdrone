@@ -130,6 +130,19 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._refresh_energy_prev_buffers(env_ids)
         self._refresh_progress_prev_dist(env_ids)
 
+
+        print("\n[MyDroneRLEnv] ===== Env Initialized =====", flush=True)
+        print(f"[MyDroneRLEnv] num_envs={self.num_envs}, device={self.device}", flush=True)
+        print(f"[MyDroneRLEnv] policy_state_dim={self.policy_state_dim}, policy_lidar_dim={self.policy_lidar_dim}", flush=True)
+        try:
+            print(f"[MyDroneRLEnv] step_dt={self.step_dt}", flush=True)
+        except Exception:
+            pass
+        try:
+            print(f"[MyDroneRLEnv] initial goal_pos_w[0]={self.goal_pos_w[0].detach().cpu().numpy()}", flush=True)
+        except Exception:
+            pass
+
     # ---------------------------------------------------------------------
     # gym spaces
     # ---------------------------------------------------------------------

@@ -135,6 +135,66 @@ STATE_OBS_NAMES_19 = [
 ]
 ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
 
+DEBUG_PRINT = True
+
+
+def debug_print(msg: str) -> None:
+    if DEBUG_PRINT:
+        print(msg, flush=True)
+
+
+def tensor_stats_str(name: str, x: torch.Tensor, max_items: int = 8) -> str:
+    if not isinstance(x, torch.Tensor):
+        return f"{name}: <non-tensor {type(x)}>"
+    y = x.detach()
+    if y.numel() == 0:
+        return f"{name}: shape={tuple(y.shape)} EMPTY"
+    y = torch.nan_to_num(y.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    flat = y.reshape(-1)
+    preview = flat[:max_items].cpu().numpy()
+    return (
+        f"{name}: shape={tuple(y.shape)}, dtype={y.dtype}, "
+        f"min={float(y.min().item()):+.4f}, max={float(y.max().item()):+.4f}, "
+        f"mean={float(y.mean().item()):+.4f}, std={float(y.std().item()):+.4f}, "
+        f"preview={np.array2string(preview, precision=3, separator=', ')}"
+    )
+
+
+def print_env0_transition(
+    step: int,
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    rewards: torch.Tensor,
+    terminated: torch.Tensor,
+    truncated: torch.Tensor,
+    next_states: torch.Tensor,
+    state_dim: int,
+    lidar_dim: int,
+) -> None:
+    env_id = 0
+    s0 = states[env_id]
+    ns0 = next_states[env_id]
+    a0 = actions[env_id]
+    r0 = rewards[env_id]
+
+    debug_print(f"\n[STEP {step}] ENV0 transition")
+    debug_print(f"  state[:{state_dim}] = {s0[:state_dim].detach().cpu().numpy()}")
+    if lidar_dim > 0:
+        lidar0 = s0[state_dim:state_dim + lidar_dim]
+        debug_print(
+            "  lidar stats: "
+            f"min={float(lidar0.min().item()):.4f}, "
+            f"max={float(lidar0.max().item()):.4f}, "
+            f"mean={float(lidar0.mean().item()):.4f}, "
+            f"nonzero_ratio={float((lidar0 > 1e-6).float().mean().item()):.4f}"
+        )
+    debug_print(f"  action = {a0.detach().cpu().numpy()}")
+    debug_print(f"  reward = {r0.detach().cpu().numpy()}")
+    debug_print(
+        f"  terminated={terminated[env_id].item()}, truncated={truncated[env_id].item()}"
+    )
+    debug_print(f"  next_state[:{state_dim}] = {ns0[:state_dim].detach().cpu().numpy()}")
+
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -942,6 +1002,29 @@ def main() -> None:
         flush=True,
     )
 
+
+    debug_print("\n[DEBUG] ===== Environment Summary =====")
+    debug_print(f"[DEBUG] num_envs = {num_envs}")
+    debug_print(f"[DEBUG] device = {device}")
+    debug_print(f"[DEBUG] step_dt = {step_dt}")
+    debug_print(f"[DEBUG] obs_dim = {obs_dim}, state_dim = {state_dim}, lidar_dim = {lidar_dim}, act_dim = {act_dim}")
+    debug_print(f"[DEBUG] base_env class = {type(base_env).__name__}")
+    debug_print(f"[DEBUG] wrapped env class = {type(env).__name__}")
+
+    try:
+        debug_print(f"[DEBUG] env_cfg.decimation = {base_env.cfg.decimation}")
+        debug_print(f"[DEBUG] env_cfg.sim.dt = {base_env.cfg.sim.dt}")
+        debug_print(f"[DEBUG] env_cfg.episode_length_s = {base_env.cfg.episode_length_s}")
+    except Exception as e:
+        debug_print(f"[DEBUG] failed to print env cfg summary: {e}")
+
+    try:
+        debug_print(f"[DEBUG] policy_state_dim(meta) = {getattr(base_env, 'policy_state_dim', None)}")
+        debug_print(f"[DEBUG] policy_lidar_dim(meta) = {getattr(base_env, 'policy_lidar_dim', None)}")
+    except Exception as e:
+        debug_print(f"[DEBUG] failed to print env meta dims: {e}")
+
+
     models = {
         "policy": Policy(obs_space, act_space, device, state_dim, lidar_dim, args.feat_dim),
         "value": Value(obs_space, act_space, device, state_dim, lidar_dim, args.feat_dim),
@@ -1005,6 +1088,34 @@ def main() -> None:
         lidar_dim=lidar_dim,
     )
 
+    debug_print("\n[DEBUG] ===== After Reset =====")
+    debug_print(tensor_stats_str("states", states))
+
+    try:
+        debug_print(f"[DEBUG] reset infos keys = {list(infos.keys()) if isinstance(infos, dict) else type(infos)}")
+    except Exception as e:
+        debug_print(f"[DEBUG] failed to print reset infos: {e}")
+
+    if num_envs > 0:
+        s0 = states[0]
+        debug_print(f"[DEBUG] env0 state_part = {s0[:state_dim].detach().cpu().numpy()}")
+        if lidar_dim > 0:
+            lidar0 = s0[state_dim:state_dim + lidar_dim]
+            debug_print(
+                f"[DEBUG] env0 lidar min={float(lidar0.min().item()):.4f}, "
+                f"max={float(lidar0.max().item()):.4f}, "
+                f"mean={float(lidar0.mean().item()):.4f}, "
+                f"nonzero_ratio={float((lidar0 > 1e-6).float().mean().item()):.4f}"
+            )
+
+    try:
+        if hasattr(base_env, "goal_pos_w"):
+            debug_print(f"[DEBUG] env0 goal_pos_w = {base_env.goal_pos_w[0].detach().cpu().numpy()}")
+    except Exception as e:
+        debug_print(f"[DEBUG] failed to print goal_pos_w: {e}")
+
+
+
     last_good_snapshot = snapshot_models(models)
 
     reward_weights = extract_reward_weights(base_env)
@@ -1045,7 +1156,18 @@ def main() -> None:
             rollout_boundary = (global_step % int(args.rollouts) == 0)
             if rollout_boundary:
                 last_good_snapshot = snapshot_models(models)
+                debug_print(f"\n[DEBUG][STEP {global_step}] ===== Rollout Boundary =====")
+                debug_print(f"[DEBUG] memory rollouts reached: {args.rollouts}")
+                try:
+                    for model_name, model in models.items():
+                        total_params = sum(p.numel() for p in model.parameters())
+                        finite_ok = all(torch.isfinite(p).all().item() for p in model.parameters())
+                        debug_print(f"[DEBUG] model={model_name}, total_params={total_params}, finite={finite_ok}")
+                except Exception as e:
+                    debug_print(f"[DEBUG] failed to inspect models at rollout boundary: {e}")
 
+
+            states_before_step = states.clone()
             next_obs, rewards, terminated, truncated, infos = env.step(actions)
 
             next_states = sanitize_states(
@@ -1076,11 +1198,64 @@ def main() -> None:
                 reward_scale=float(args.reward_scale),
                 reward_clip=float(args.reward_clip),
             )
+
+            if global_step <= 5 or global_step % 200 == 0:
+                try:
+                    if len(raw_terms) > 0:
+                        debug_print(f"\n[DEBUG][STEP {global_step}] reward terms (env0 mean view)")
+                        for name in sorted(raw_terms.keys()):
+                            rv = raw_terms[name]
+                            wv = weighted_terms.get(name, None)
+                            sv = scaled_terms.get(name, None)
+                            raw_mean = float(rv.mean().item()) if isinstance(rv, torch.Tensor) else 0.0
+                            weighted_mean = float(wv.mean().item()) if isinstance(wv, torch.Tensor) else 0.0
+                            scaled_mean = float(sv.mean().item()) if isinstance(sv, torch.Tensor) else 0.0
+                            debug_print(
+                                f"  {name:<20} raw={raw_mean:+.6f} weighted={weighted_mean:+.6f} scaled={scaled_mean:+.6f}"
+                            )
+                except Exception as e:
+                    debug_print(f"[DEBUG] failed to print reward terms: {e}")
+
+
             reward_window.update(raw_terms=raw_terms, weighted_terms=weighted_terms, scaled_terms=scaled_terms)
             clear_tb_caches(base_env)
 
             has_done = bool(torch.any(terminated | truncated).item())
             termination_ratio_window.update(infos, has_done=has_done)
+
+            if has_done:
+                done_mask = (terminated | truncated).squeeze(-1) if (terminated | truncated).dim() == 2 else (terminated | truncated)
+                done_ids = torch.nonzero(done_mask, as_tuple=False).squeeze(-1)
+
+                debug_print(f"\n[DEBUG][STEP {global_step}] done_count = {done_ids.numel()}")
+                debug_print(f"[DEBUG][STEP {global_step}] done_env_ids = {done_ids.detach().cpu().tolist()}")
+
+                term_ratio_dict = extract_termination_ratio_dict(infos)
+                if len(term_ratio_dict) > 0:
+                    debug_print(f"[DEBUG][STEP {global_step}] termination ratios from infos = {term_ratio_dict}")
+
+                try:
+                    for eid in done_ids[:4]:
+                        eid_int = int(eid.item())
+                        debug_print(
+                            f"[DEBUG][STEP {global_step}] env{eid_int}: "
+                            f"reward={float(rewards[eid_int].mean().item()):+.4f}, "
+                            f"terminated={bool(terminated[eid_int].any().item())}, "
+                            f"truncated={bool(truncated[eid_int].any().item())}"
+                        )
+                        debug_print(f"  state={states[eid_int, :state_dim].detach().cpu().numpy()}")
+                        if lidar_dim > 0:
+                            lidar_e = states[eid_int, state_dim:state_dim + lidar_dim]
+                            debug_print(
+                                f"  lidar(min/max/mean/nonzero)=("
+                                f"{float(lidar_e.min().item()):.4f}, "
+                                f"{float(lidar_e.max().item()):.4f}, "
+                                f"{float(lidar_e.mean().item()):.4f}, "
+                                f"{float((lidar_e > 1e-6).float().mean().item()):.4f})"
+                            )
+                except Exception as e:
+                    debug_print(f"[DEBUG] failed to print done env details: {e}")
+
 
             record_infos = infos if args.keep_infos else {}
             with torch.no_grad():
@@ -1159,7 +1334,22 @@ def main() -> None:
             pbar.set_description(
                 f"t={t} envR={rewards.mean().item():+.3f} trainR={train_rewards.mean().item():+.3f} done={done_count}"
             )
+            if global_step <= 5 or global_step % 200 == 0:
+                print_env0_transition(
+                    step=global_step,
+                    states=states_before_step,
+                    actions=actions,
+                    rewards=rewards,
+                    terminated=terminated,
+                    truncated=truncated,
+                    next_states=next_states,
+                    state_dim=state_dim,
+                    lidar_dim=lidar_dim,
+                )
+
             states = next_states
+
+
 
     except KeyboardInterrupt:
         print("\n[WARN] KeyboardInterrupt: stopping training early", flush=True)
