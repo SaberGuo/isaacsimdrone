@@ -967,8 +967,8 @@ def main() -> None:
 
     print("[INFO] Spawning workspace walls...", flush=True)
     WallSpawner(
-        x_bounds=(-60.0, 60.0),
-        y_bounds=(-60.0, 60.0),
+        x_bounds=(-80.0, 80.0),
+        y_bounds=(-80.0, 80.0),
         z_bounds=(0.0, 10.0),
         wall_thickness=0.5,
         color=(0.7, 0.7, 0.2),

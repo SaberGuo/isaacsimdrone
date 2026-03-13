@@ -34,8 +34,8 @@ from omniperception_isaacdrone.tasks import mdp as my_mdp
 # -----------------------------------------------------------------------------
 @configclass
 class NormalizationCfg:
-    x_bounds: tuple[float, float] = (-60.0, 60.0)
-    y_bounds: tuple[float, float] = (-60.0, 60.0)
+    x_bounds: tuple[float, float] = (-80.0, 80.0)
+    y_bounds: tuple[float, float] = (-80.0, 80.0)
     z_bounds: tuple[float, float] = (1.0, 10.0)
 
     diag_scale: float = 1.1
@@ -223,8 +223,8 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.viewer.eye = (60.0, 60.0, 40.0)
         self.viewer.lookat = (0.0, 0.0, 5.0)
 
-        WORKSPACE_X = (-60.0, 60.0)
-        WORKSPACE_Y = (-60.0, 60.0)
+        WORKSPACE_X = (-80.0, 80.0)
+        WORKSPACE_Y = (-80.0, 80.0)
         WORKSPACE_Z = (0.0, 10.0)
         GOAL_RADIUS = 2.5
 
@@ -236,8 +236,8 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "mass": DRONE_MASS,
             "use_sim_total_mass": True,
             "prevent_negative_thrust": True,
-            "vel_scale": 3.0,
-            "vel_clip": 6.0,
+            "vel_scale": 6.0,
+            "vel_clip": 9.0,
             "yaw_rate_scale": 1.56,
             "yaw_rate_clip": 3.14,
             "thrust_sign": 1.0,
