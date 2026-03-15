@@ -81,6 +81,8 @@ import torch.distributions as D
 import omniperception_isaacdrone.tasks.test6_registry as _test6_registry  # noqa: F401
 from gymnasium.spaces import Box
 from isaaclab_tasks.utils import parse_env_cfg
+import isaacsim.core.utils.prims as prim_utils
+from pxr import UsdGeom, Gf
 
 from omniperception_isaacdrone.envs.test6_env import ObstacleSpawner, WallSpawner
 
@@ -113,6 +115,33 @@ ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
+def scale_robot_visual_only(num_envs: int, visual_scale=(20.0, 20.0, 10.0)) -> None:
+    """Scale only the visual subtree of the drone, without touching physics/collision."""
+    stage = prim_utils.get_prim_at_path("/World").GetStage()
+    sx, sy, sz = map(float, visual_scale)
+
+    for i in range(int(num_envs)):
+        visual_path = f"/World/envs/env_{i}/Robot/body/body_visual"
+        prim = stage.GetPrimAtPath(visual_path)
+
+        if not prim.IsValid():
+            print(f"[WARN] visual prim not found: {visual_path}", flush=True)
+            continue
+
+        xform = UsdGeom.Xformable(prim)
+
+        # try to reuse existing scale op
+        scale_ops = [op for op in xform.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeScale]
+
+        if len(scale_ops) > 0:
+            scale_ops[0].Set(Gf.Vec3f(sx, sy, sz))
+        else:
+            xform.AddScaleOp().Set(Gf.Vec3f(sx, sy, sz))
+
+        print(f"[INFO] visual-only scale set on {visual_path}: {(sx, sy, sz)}", flush=True)
+
+
 def format_array_preview(x: np.ndarray, max_items: int = 16) -> str:
     x = np.asarray(x).reshape(-1)
     if x.size <= max_items:
@@ -514,6 +543,12 @@ def main() -> None:
 
     print("[INFO] Creating env...", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
+
+    scale_robot_visual_only(
+        num_envs=base_env.num_envs,
+        visual_scale=(20.0, 20.0, 10.0),
+    )
+
     base_env.scene.filter_collisions(
         global_prim_paths=[
             "/World/ground",
