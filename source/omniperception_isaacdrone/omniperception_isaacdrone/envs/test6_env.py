@@ -9,6 +9,9 @@ import isaaclab.envs.mdp as mdp
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
+
+from pxr import Gf, UsdGeom
+
 try:
     import gymnasium as gym
     from gymnasium.spaces import Box
@@ -228,6 +231,13 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._energy_prev_ang_vel_w = torch.zeros((1, 3), dtype=torch.float32)
         self._progress_prev_goal_dist = torch.zeros((1,), dtype=torch.float32)
 
+        # goal visualizer settings / cache
+        self._goal_vis_enabled = True
+        self._goal_vis_radius = 0.35
+        self._goal_vis_color = (1.0, 0.0, 0.0)   # red
+        self._goal_vis_opacity = 0.9
+        self._goal_vis_paths: list[str] = []
+
         # metadata used by the training script
         self.policy_state_dim = 16
         self.policy_lidar_dim = 0
@@ -245,6 +255,28 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._energy_prev_lin_vel_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
         self._energy_prev_ang_vel_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
         self._progress_prev_goal_dist = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float32)
+
+        # create goal visual prims first, then sample/update positions
+        if self._goal_vis_enabled:
+            self._create_goal_visualizers()
+
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        self._sample_goals(env_ids)
+        self._refresh_energy_prev_buffers(env_ids)
+        self._refresh_progress_prev_dist(env_ids)
+
+        print("\n[MyDroneRLEnv] ===== Env Initialized =====", flush=True)
+        print(f"[MyDroneRLEnv] num_envs={self.num_envs}, device={self.device}", flush=True)
+        print(f"[MyDroneRLEnv] policy_state_dim={self.policy_state_dim}, policy_lidar_dim={self.policy_lidar_dim}", flush=True)
+        try:
+            print(f"[MyDroneRLEnv] step_dt={self.step_dt}", flush=True)
+        except Exception:
+            pass
+        try:
+            print(f"[MyDroneRLEnv] initial goal_pos_w[0]={self.goal_pos_w[0].detach().cpu().numpy()}", flush=True)
+        except Exception:
+            pass
+
 
         env_ids = torch.arange(self.num_envs, device=self.device)
         self._sample_goals(env_ids)
@@ -363,6 +395,80 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
             flush=True,
         )
 
+
+    # ---------------------------------------------------------------------
+    # goal visualizers
+    # ---------------------------------------------------------------------
+    def _get_stage(self):
+        try:
+            return self.sim.stage
+        except Exception:
+            pass
+        try:
+            return self.scene.stage
+        except Exception:
+            pass
+        raise RuntimeError("Unable to access USD stage from environment")
+
+    def _goal_vis_path(self, env_index: int) -> str:
+        return f"/World/envs/env_{env_index}/GoalVis"
+
+    def _set_xform_translation(self, prim, translation: tuple[float, float, float]) -> None:
+        xform = UsdGeom.Xformable(prim)
+        translate_ops = [op for op in xform.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeTranslate]
+        if len(translate_ops) > 0:
+            translate_ops[0].Set(Gf.Vec3d(*translation))
+        else:
+            xform.AddTranslateOp().Set(Gf.Vec3d(*translation))
+
+    def _create_goal_visualizers(self) -> None:
+        stage = self._get_stage()
+        self._goal_vis_paths = []
+
+        for env_index in range(int(self.num_envs)):
+            goal_path = self._goal_vis_path(env_index)
+            sphere = UsdGeom.Sphere.Define(stage, goal_path)
+            sphere.CreateRadiusAttr(float(self._goal_vis_radius))
+
+            prim = sphere.GetPrim()
+
+            # set initial position
+            self._set_xform_translation(prim, (0.0, 0.0, -1000.0))
+
+            # display color / opacity (visual only)
+            sphere.CreateDisplayColorAttr([Gf.Vec3f(*self._goal_vis_color)])
+            sphere.CreateDisplayOpacityAttr([float(self._goal_vis_opacity)])
+
+            self._goal_vis_paths.append(goal_path)
+
+        print(f"[MyDroneRLEnv] Created {len(self._goal_vis_paths)} goal visualizers", flush=True)
+
+    def _update_goal_visualizers(self, env_ids: torch.Tensor | None = None) -> None:
+        if not self._goal_vis_enabled:
+            return
+        if len(self._goal_vis_paths) == 0:
+            return
+
+        stage = self._get_stage()
+
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+
+        env_ids_cpu = env_ids.detach().to("cpu").tolist()
+        goal_cpu = self.goal_pos_w.detach().to("cpu")
+
+        for env_id in env_ids_cpu:
+            if env_id < 0 or env_id >= len(self._goal_vis_paths):
+                continue
+
+            prim = stage.GetPrimAtPath(self._goal_vis_paths[env_id])
+            if not prim.IsValid():
+                continue
+
+            gx, gy, gz = goal_cpu[env_id].tolist()
+            self._set_xform_translation(prim, (float(gx), float(gy), float(gz)))
+
+
     # ---------------------------------------------------------------------
     # goal sampling / caches
     # ---------------------------------------------------------------------
@@ -379,6 +485,10 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self.goal_pos_w[env_ids, 0] = gx
         self.goal_pos_w[env_ids, 1] = gy
         self.goal_pos_w[env_ids, 2] = gz
+
+        # sync red goal spheres
+        self._update_goal_visualizers(env_ids)
+
 
     def _refresh_energy_prev_buffers(self, env_ids: torch.Tensor):
         try:
