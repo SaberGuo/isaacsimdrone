@@ -131,7 +131,6 @@ def scale_robot_visual_only(num_envs: int, visual_scale=(20.0, 20.0, 10.0)) -> N
 
         xform = UsdGeom.Xformable(prim)
 
-        # try to reuse existing scale op
         scale_ops = [op for op in xform.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeScale]
 
         if len(scale_ops) > 0:
@@ -480,7 +479,6 @@ def load_policy_checkpoint(policy: Policy, checkpoint_path: Path, device: torch.
     print(f"[INFO] Loading checkpoint: {checkpoint_path}", flush=True)
     payload = torch.load(checkpoint_path, map_location=device)
 
-    # 兼容你 train 脚本保存的 {"policy": ..., "value": ...}
     try:
         state_dict = extract_model_state_dict(payload, key_hint="policy")
     except Exception:
@@ -495,11 +493,16 @@ def load_policy_checkpoint(policy: Policy, checkpoint_path: Path, device: torch.
         print(f"[WARN] Unexpected keys: {unexpected}", flush=True)
 
 
-def maybe_print_goal(base_env: Any) -> None:
+def maybe_print_goal(base_env: Any, env_ids: list[int] | None = None) -> None:
     try:
-        if hasattr(base_env, "goal_pos_w"):
-            g = base_env.goal_pos_w[0].detach().cpu().numpy()
-            print(f"[INFO] goal_pos_w[0]={g}", flush=True)
+        if not hasattr(base_env, "goal_pos_w"):
+            return
+        goal = base_env.goal_pos_w.detach().cpu().numpy()
+        if env_ids is None:
+            env_ids = [0]
+        for eid in env_ids:
+            if 0 <= int(eid) < goal.shape[0]:
+                print(f"[INFO] goal_pos_w[{eid}]={goal[eid]}", flush=True)
     except Exception:
         pass
 
@@ -698,29 +701,38 @@ def main() -> None:
             if done_mask.any().item():
                 done_ids = torch.nonzero(done_mask, as_tuple=False).squeeze(-1)
                 done_ids_list = done_ids.detach().cpu().tolist()
+                if isinstance(done_ids_list, int):
+                    done_ids_list = [done_ids_list]
+
                 print(f"[PLAY] episode finished on env ids: {done_ids_list}", flush=True)
 
-                for eid in done_ids_list if isinstance(done_ids_list, list) else [done_ids_list]:
+                for eid in done_ids_list:
                     print(
                         f"[PLAY] env{eid} episode_reward={float(episode_reward[eid].item()):+.4f}",
                         flush=True,
                     )
                     episode_reward[eid] = 0.0
 
-                episode_idx += 1
-                maybe_print_goal(base_env)
+                episode_idx += len(done_ids_list)
 
                 if args.reset_on_done:
-                    obs, infos = env.reset()
-                    states = sanitize_states(
-                        ensure_obs_shape(extract_policy_obs(obs), num_envs, obs_dim),
+                    # ---------------------------------------------------------
+                    # Only reset done envs instead of resetting all envs
+                    # ---------------------------------------------------------
+                    reset_obs, reset_infos = env.reset(env_ids=done_ids)
+                    reset_states = sanitize_states(
+                        ensure_obs_shape(extract_policy_obs(reset_obs), num_envs, obs_dim),
                         state_dim=state_dim,
                         lidar_dim=lidar_dim,
                     )
+
+                    # only overwrite the states of done envs
+                    next_states[done_ids] = reset_states[done_ids]
+
+                    maybe_print_goal(base_env, env_ids=done_ids_list)
+
                     if args.show_obs_stats:
-                        print_obs_summary(states, state_dim=state_dim, lidar_dim=lidar_dim, prefix="[RESET]")
-                    step += 1
-                    continue
+                        print_obs_summary(next_states, state_dim=state_dim, lidar_dim=lidar_dim, prefix="[RESET_DONE]")
 
             states = next_states
             step += 1
