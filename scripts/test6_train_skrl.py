@@ -25,7 +25,12 @@ parser = argparse.ArgumentParser("Stable skrl PPO trainer for IsaacLab drone lid
 parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lidar-v0")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 parser.add_argument("--num_envs", type=int, default=32)
-parser.add_argument("--num_obstacles", type=int, default=50)
+parser.add_argument(
+    "--num_obstacles",
+    type=int,
+    default=100,
+    help="Maximum number of shared obstacles to spawn. The curriculum only activates a subset.",
+)
 parser.add_argument("--timesteps", type=int, default=2_000_000)
 parser.add_argument("--seed", type=int, default=42)
 
@@ -139,8 +144,17 @@ from pxr import UsdGeom, Gf
 import isaacsim.core.utils.prims as prim_utils
 
 
+def get_cfg_obstacle_curriculum_levels(env_cfg: Any) -> tuple[int, ...]:
+    curriculum_cfg = getattr(env_cfg, "obstacle_curriculum", None)
+    if curriculum_cfg is None:
+        return ()
+    try:
+        return tuple(int(v) for v in getattr(curriculum_cfg, "levels", ()))
+    except Exception:
+        return ()
+
+
 def scale_robot_visual_only(num_envs: int, visual_scale=(20.0, 20.0, 10.0)) -> None:
-    """Scale only the visual subtree of the drone, without touching physics/collision."""
     stage = prim_utils.get_prim_at_path("/World").GetStage()
     sx, sy, sz = map(float, visual_scale)
 
@@ -153,8 +167,6 @@ def scale_robot_visual_only(num_envs: int, visual_scale=(20.0, 20.0, 10.0)) -> N
             continue
 
         xform = UsdGeom.Xformable(prim)
-
-        # try to reuse existing scale op
         scale_ops = [op for op in xform.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeScale]
 
         if len(scale_ops) > 0:
@@ -223,9 +235,6 @@ def print_env0_transition(
     debug_print(f"  next_state[:{state_dim}] = {ns0[:state_dim].detach().cpu().numpy()}")
 
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
 def format_array_preview(x: np.ndarray, max_items: int = 16) -> str:
     x = np.asarray(x).reshape(-1)
     if x.size <= max_items:
@@ -425,8 +434,6 @@ def build_skrl_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[in
 
 
 class SkrlSpaceAdapter(gym.Wrapper):
-    """Expose skrl-friendly spaces/observations without mutating the base IsaacLab env."""
-
     def __init__(
         self,
         env: gym.Env,
@@ -492,7 +499,7 @@ def extract_log_dict(infos: Any) -> Dict[str, Any]:
     return {}
 
 
-def extract_termination_ratio_dict(infos: Any) -> Dict[str, float]:
+def extract_termination_count_dict(infos: Any) -> Dict[str, float]:
     log_dict = extract_log_dict(infos)
     if len(log_dict) == 0:
         return {}
@@ -503,6 +510,30 @@ def extract_termination_ratio_dict(infos: Any) -> Dict[str, float]:
             continue
         name = key.split("/", 1)[1]
         out[name] = to_float(value)
+    return out
+
+
+def extract_termination_ratio_dict(infos: Any, done_count: int) -> Dict[str, float]:
+    if int(done_count) <= 0:
+        return {}
+
+    count_dict = extract_termination_count_dict(infos)
+    if len(count_dict) == 0:
+        return {}
+
+    denom = max(float(done_count), 1.0)
+    return {name: float(value) / denom for name, value in count_dict.items()}
+
+
+def extract_prefixed_log_scalars(infos: Any, prefix: str) -> Dict[str, float]:
+    log_dict = extract_log_dict(infos)
+    if len(log_dict) == 0:
+        return {}
+
+    out: Dict[str, float] = {}
+    for key, value in log_dict.items():
+        if key.startswith(prefix):
+            out[key] = to_float(value)
     return out
 
 
@@ -715,16 +746,6 @@ class RewardBreakdownAccumulator:
 
 
 class InfoTerminationRatioAccumulator:
-    """Read termination ratios directly from infos['log']['Episode_Termination/...'].
-
-    Notes:
-      - No custom episodes_done / count / ratio reconstruction
-      - Only updates when at least one env is done at current step
-      - TensorBoard writes:
-          TerminationInfoRatio/<name>/mean
-          TerminationInfoRatio/<name>/latest
-    """
-
     def __init__(self) -> None:
         self.reset()
 
@@ -733,11 +754,11 @@ class InfoTerminationRatioAccumulator:
         self.sum_ratios: Dict[str, float] = {}
         self.last_ratios: Dict[str, float] = {}
 
-    def update(self, infos: Any, has_done: bool) -> None:
-        if not bool(has_done):
+    def update(self, infos: Any, done_count: int) -> None:
+        if int(done_count) <= 0:
             return
 
-        ratio_dict = extract_termination_ratio_dict(infos)
+        ratio_dict = extract_termination_ratio_dict(infos, done_count=done_count)
         if len(ratio_dict) == 0:
             return
 
@@ -859,9 +880,6 @@ def log_gradients(writer: SummaryWriter, models: dict[str, nn.Module], step: int
                         pass
 
 
-# -----------------------------------------------------------------------------
-# Models
-# -----------------------------------------------------------------------------
 class StructuredFeatureExtractor(nn.Module):
     def __init__(self, state_dim: int, lidar_dim: int, feat_dim: int = 256):
         super().__init__()
@@ -966,9 +984,6 @@ def build_action_names(act_dim: int) -> List[str]:
     return [f"action_{i}" for i in range(int(act_dim))]
 
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
 def main() -> None:
     print(f"[INFO] task={args.task}, num_envs={args.num_envs}, device={args.device}", flush=True)
 
@@ -978,6 +993,21 @@ def main() -> None:
         num_envs=args.num_envs,
         use_fabric=not args.disable_fabric,
     )
+
+    curriculum_levels = get_cfg_obstacle_curriculum_levels(env_cfg)
+    required_shared_obstacles = max(
+        int(args.num_obstacles),
+        max(curriculum_levels) if len(curriculum_levels) > 0 else 0,
+    )
+
+    print(f"[INFO] obstacle curriculum levels={curriculum_levels}", flush=True)
+    if required_shared_obstacles != int(args.num_obstacles):
+        print(
+            f"[INFO] Expanding shared obstacle pool from requested {args.num_obstacles} "
+            f"to {required_shared_obstacles} to satisfy curriculum levels.",
+            flush=True,
+        )
+
     try:
         setattr(env_cfg, "seed", int(args.seed))
     except Exception:
@@ -990,7 +1020,7 @@ def main() -> None:
 
     print("[INFO] Spawning shared obstacles...", flush=True)
     ObstacleSpawner(
-        num_obstacles=int(args.num_obstacles),
+        num_obstacles=int(required_shared_obstacles),
         seed=int(args.seed),
     ).spawn_obstacles()
 
@@ -1001,6 +1031,14 @@ def main() -> None:
         z_bounds=(0.0, 10.0),
         wall_thickness=0.5,
         color=(0.7, 0.7, 0.2),
+        wall_colors={
+        "Wall_XMin": (0.5, 1.0, 1.0),  
+        "Wall_XMax": (1.0, 1.0, 0.5),  
+        "Wall_YMin": (0.0, 1.0, 1.0),  
+        "Wall_YMax": (1.0, 1.0, 0.0),  
+        "Wall_ZMin": (1.0, 1.0, 1.0),  
+        "Wall_ZMax": (0.0, 0.0, 0.0),  
+    },
     ).spawn_walls()
 
     print("[INFO] Creating env...", flush=True)
@@ -1053,29 +1091,6 @@ def main() -> None:
         flush=True,
     )
 
-
-    debug_print("\n[DEBUG] ===== Environment Summary =====")
-    debug_print(f"[DEBUG] num_envs = {num_envs}")
-    debug_print(f"[DEBUG] device = {device}")
-    debug_print(f"[DEBUG] step_dt = {step_dt}")
-    debug_print(f"[DEBUG] obs_dim = {obs_dim}, state_dim = {state_dim}, lidar_dim = {lidar_dim}, act_dim = {act_dim}")
-    debug_print(f"[DEBUG] base_env class = {type(base_env).__name__}")
-    debug_print(f"[DEBUG] wrapped env class = {type(env).__name__}")
-
-    try:
-        debug_print(f"[DEBUG] env_cfg.decimation = {base_env.cfg.decimation}")
-        debug_print(f"[DEBUG] env_cfg.sim.dt = {base_env.cfg.sim.dt}")
-        debug_print(f"[DEBUG] env_cfg.episode_length_s = {base_env.cfg.episode_length_s}")
-    except Exception as e:
-        debug_print(f"[DEBUG] failed to print env cfg summary: {e}")
-
-    try:
-        debug_print(f"[DEBUG] policy_state_dim(meta) = {getattr(base_env, 'policy_state_dim', None)}")
-        debug_print(f"[DEBUG] policy_lidar_dim(meta) = {getattr(base_env, 'policy_lidar_dim', None)}")
-    except Exception as e:
-        debug_print(f"[DEBUG] failed to print env meta dims: {e}")
-
-
     models = {
         "policy": Policy(obs_space, act_space, device, state_dim, lidar_dim, args.feat_dim),
         "value": Value(obs_space, act_space, device, state_dim, lidar_dim, args.feat_dim),
@@ -1111,9 +1126,9 @@ def main() -> None:
     cfg["experiment"]["write_interval"] = int(args.tb_interval)
     cfg["experiment"]["checkpoint_interval"] = int(args.checkpoint_interval)
 
-    print(f"[INFO] Custom TensorBoard logdir: {tb_dir}", flush=True)
-
     writer = SummaryWriter(log_dir=str(tb_dir))
+    if len(curriculum_levels) > 0:
+        writer.add_text("run/obstacle_curriculum_levels", str(curriculum_levels), 0)
     writer.add_text("run/args", str(vars(args)), 0)
     writer.add_text("run/dims", f"obs={obs_dim}, state={state_dim}, lidar={lidar_dim}, act={act_dim}", 0)
     writer.add_text("run/step_dt", f"{step_dt:.8f}", 0)
@@ -1139,34 +1154,6 @@ def main() -> None:
         lidar_dim=lidar_dim,
     )
 
-    debug_print("\n[DEBUG] ===== After Reset =====")
-    debug_print(tensor_stats_str("states", states))
-
-    try:
-        debug_print(f"[DEBUG] reset infos keys = {list(infos.keys()) if isinstance(infos, dict) else type(infos)}")
-    except Exception as e:
-        debug_print(f"[DEBUG] failed to print reset infos: {e}")
-
-    if num_envs > 0:
-        s0 = states[0]
-        debug_print(f"[DEBUG] env0 state_part = {s0[:state_dim].detach().cpu().numpy()}")
-        if lidar_dim > 0:
-            lidar0 = s0[state_dim:state_dim + lidar_dim]
-            debug_print(
-                f"[DEBUG] env0 lidar min={float(lidar0.min().item()):.4f}, "
-                f"max={float(lidar0.max().item()):.4f}, "
-                f"mean={float(lidar0.mean().item()):.4f}, "
-                f"nonzero_ratio={float((lidar0 > 1e-6).float().mean().item()):.4f}"
-            )
-
-    try:
-        if hasattr(base_env, "goal_pos_w"):
-            debug_print(f"[DEBUG] env0 goal_pos_w = {base_env.goal_pos_w[0].detach().cpu().numpy()}")
-    except Exception as e:
-        debug_print(f"[DEBUG] failed to print goal_pos_w: {e}")
-
-
-
     last_good_snapshot = snapshot_models(models)
 
     reward_weights = extract_reward_weights(base_env)
@@ -1183,7 +1170,7 @@ def main() -> None:
         max_samples=int(args.dist_max_samples),
     )
 
-    print("[INFO] Starting training loop...", flush=True)
+    latest_curriculum_log: Dict[str, float] = {}
     pbar = tqdm(range(int(args.timesteps)), ncols=110)
 
     try:
@@ -1194,11 +1181,6 @@ def main() -> None:
             with torch.no_grad():
                 act_output = agent.act(states, timestep=t, timesteps=int(args.timesteps))
 
-            if args.debug_act and t == 0:
-                print(f"[DEBUG] type(agent.act output)={type(act_output)}", flush=True)
-                if isinstance(act_output, (tuple, list)):
-                    print(f"[DEBUG] len(act_output)={len(act_output)}; elem types={[type(x) for x in act_output]}", flush=True)
-
             actions = ensure_action_shape(extract_actions(act_output, act_dim), num_envs, act_dim).float()
             if not torch.isfinite(actions).all():
                 raise RuntimeError(f"Non-finite actions detected before env.step at t={t}")
@@ -1207,16 +1189,6 @@ def main() -> None:
             rollout_boundary = (global_step % int(args.rollouts) == 0)
             if rollout_boundary:
                 last_good_snapshot = snapshot_models(models)
-                debug_print(f"\n[DEBUG][STEP {global_step}] ===== Rollout Boundary =====")
-                debug_print(f"[DEBUG] memory rollouts reached: {args.rollouts}")
-                try:
-                    for model_name, model in models.items():
-                        total_params = sum(p.numel() for p in model.parameters())
-                        finite_ok = all(torch.isfinite(p).all().item() for p in model.parameters())
-                        debug_print(f"[DEBUG] model={model_name}, total_params={total_params}, finite={finite_ok}")
-                except Exception as e:
-                    debug_print(f"[DEBUG] failed to inspect models at rollout boundary: {e}")
-
 
             states_before_step = states.clone()
             next_obs, rewards, terminated, truncated, infos = env.step(actions)
@@ -1250,63 +1222,19 @@ def main() -> None:
                 reward_clip=float(args.reward_clip),
             )
 
-            if global_step <= 5 or global_step % 200 == 0:
-                try:
-                    if len(raw_terms) > 0:
-                        debug_print(f"\n[DEBUG][STEP {global_step}] reward terms (env0 mean view)")
-                        for name in sorted(raw_terms.keys()):
-                            rv = raw_terms[name]
-                            wv = weighted_terms.get(name, None)
-                            sv = scaled_terms.get(name, None)
-                            raw_mean = float(rv.mean().item()) if isinstance(rv, torch.Tensor) else 0.0
-                            weighted_mean = float(wv.mean().item()) if isinstance(wv, torch.Tensor) else 0.0
-                            scaled_mean = float(sv.mean().item()) if isinstance(sv, torch.Tensor) else 0.0
-                            debug_print(
-                                f"  {name:<20} raw={raw_mean:+.6f} weighted={weighted_mean:+.6f} scaled={scaled_mean:+.6f}"
-                            )
-                except Exception as e:
-                    debug_print(f"[DEBUG] failed to print reward terms: {e}")
-
-
             reward_window.update(raw_terms=raw_terms, weighted_terms=weighted_terms, scaled_terms=scaled_terms)
             clear_tb_caches(base_env)
 
-            has_done = bool(torch.any(terminated | truncated).item())
-            termination_ratio_window.update(infos, has_done=has_done)
+            done_mask_tensor = terminated | truncated
+            done_count = int(done_mask_tensor.sum().item())
+            has_done = done_count > 0
+
+            termination_ratio_window.update(infos, done_count=done_count)
 
             if has_done:
-                done_mask = (terminated | truncated).squeeze(-1) if (terminated | truncated).dim() == 2 else (terminated | truncated)
-                done_ids = torch.nonzero(done_mask, as_tuple=False).squeeze(-1)
-
-                debug_print(f"\n[DEBUG][STEP {global_step}] done_count = {done_ids.numel()}")
-                debug_print(f"[DEBUG][STEP {global_step}] done_env_ids = {done_ids.detach().cpu().tolist()}")
-
-                term_ratio_dict = extract_termination_ratio_dict(infos)
-                if len(term_ratio_dict) > 0:
-                    debug_print(f"[DEBUG][STEP {global_step}] termination ratios from infos = {term_ratio_dict}")
-
-                try:
-                    for eid in done_ids[:4]:
-                        eid_int = int(eid.item())
-                        debug_print(
-                            f"[DEBUG][STEP {global_step}] env{eid_int}: "
-                            f"reward={float(rewards[eid_int].mean().item()):+.4f}, "
-                            f"terminated={bool(terminated[eid_int].any().item())}, "
-                            f"truncated={bool(truncated[eid_int].any().item())}"
-                        )
-                        debug_print(f"  state={states[eid_int, :state_dim].detach().cpu().numpy()}")
-                        if lidar_dim > 0:
-                            lidar_e = states[eid_int, state_dim:state_dim + lidar_dim]
-                            debug_print(
-                                f"  lidar(min/max/mean/nonzero)=("
-                                f"{float(lidar_e.min().item()):.4f}, "
-                                f"{float(lidar_e.max().item()):.4f}, "
-                                f"{float(lidar_e.mean().item()):.4f}, "
-                                f"{float((lidar_e > 1e-6).float().mean().item()):.4f})"
-                            )
-                except Exception as e:
-                    debug_print(f"[DEBUG] failed to print done env details: {e}")
-
+                curriculum_log_dict = extract_prefixed_log_scalars(infos, "Curriculum/")
+                if len(curriculum_log_dict) > 0:
+                    latest_curriculum_log.update(curriculum_log_dict)
 
             record_infos = infos if args.keep_infos else {}
             with torch.no_grad():
@@ -1355,10 +1283,11 @@ def main() -> None:
                     writer.flush()
 
             if should_log_scalars:
+                for key, value in sorted(latest_curriculum_log.items()):
+                    writer.add_scalar(sanitize_tb_tag(key), value, global_step)
                 reward_window.flush(writer, global_step)
                 termination_ratio_window.flush(writer, global_step)
                 writer.flush()
-
                 reward_window.reset()
                 termination_ratio_window.reset()
 
@@ -1381,10 +1310,10 @@ def main() -> None:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-            done_count = int((terminated | truncated).sum().item())
             pbar.set_description(
                 f"t={t} envR={rewards.mean().item():+.3f} trainR={train_rewards.mean().item():+.3f} done={done_count}"
             )
+
             if global_step <= 5 or global_step % 200 == 0:
                 print_env0_transition(
                     step=global_step,
@@ -1399,8 +1328,6 @@ def main() -> None:
                 )
 
             states = next_states
-
-
 
     except KeyboardInterrupt:
         print("\n[WARN] KeyboardInterrupt: stopping training early", flush=True)

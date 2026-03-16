@@ -542,6 +542,14 @@ def main() -> None:
         z_bounds=(0.0, 10.0),
         wall_thickness=0.5,
         color=(0.7, 0.7, 0.2),
+        wall_colors={
+        "Wall_XMin": (0.5, 1.0, 1.0),  
+        "Wall_XMax": (1.0, 1.0, 0.5),  
+        "Wall_YMin": (0.0, 1.0, 1.0),  
+        "Wall_YMax": (1.0, 1.0, 0.0),  
+        "Wall_ZMin": (1.0, 1.0, 1.0),  
+        "Wall_ZMax": (0.0, 0.0, 0.0),  
+    },
     ).spawn_walls()
 
     print("[INFO] Creating env...", flush=True)

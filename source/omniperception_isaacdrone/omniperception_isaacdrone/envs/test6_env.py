@@ -1,15 +1,14 @@
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 import torch
 
-import isaaclab.sim as sim_utils
 import isaaclab.envs.mdp as mdp
-
+import isaaclab.sim as sim_utils
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
-
-
 from pxr import Gf, UsdGeom
 
 try:
@@ -21,31 +20,131 @@ except Exception:  # pragma: no cover
 
 
 # =============================================================================
+# USD / Xform helpers
+# =============================================================================
+def _get_stage():
+    import isaacsim.core.utils.prims as prim_utils
+
+    return prim_utils.get_prim_at_path("/World").GetStage()
+
+
+def _set_prim_translation(stage, prim_path: str, translation: tuple[float, float, float]) -> bool:
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return False
+
+    xform = UsdGeom.Xformable(prim)
+    translate_ops = [op for op in xform.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeTranslate]
+    if len(translate_ops) > 0:
+        translate_ops[0].Set(Gf.Vec3d(*translation))
+    else:
+        xform.AddTranslateOp().Set(Gf.Vec3d(*translation))
+    return True
+
+
+def _set_prim_visibility(stage, prim_path: str, visible: bool) -> bool:
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return False
+
+    imageable = UsdGeom.Imageable(prim)
+    if visible:
+        imageable.MakeVisible()
+    else:
+        imageable.MakeInvisible()
+    return True
+
+
+# =============================================================================
 # Shared obstacle spawning
 # =============================================================================
 class ObstacleSpawner:
+    """Spawn a fixed pool of shared obstacles and activate only a prefix of them."""
+
+    _spawned: bool = False
+    _prim_paths: list[str] = []
+    _active_translations: list[tuple[float, float, float]] = []
+    _parking_translations: list[tuple[float, float, float]] = []
+    _active_count: int = 0
+
     def __init__(
         self,
-        num_obstacles: int = 50,
+        num_obstacles: int = 100,
         x_range: tuple = (-33.0, 33.0),
         y_range: tuple = (-33.0, 33.0),
         xy_size_range: tuple = (0.5, 1.5),
         z_height: float = 10.0,
         seed: int = 42,
     ):
-        self.num_obstacles = num_obstacles
+        self.num_obstacles = int(num_obstacles)
         self.x_range = x_range
         self.y_range = y_range
         self.xy_size_range = xy_size_range
-        self.z_height = z_height
+        self.z_height = float(z_height)
+        self.seed = int(seed)
+
         if seed is not None:
             np.random.seed(seed)
+
+    @classmethod
+    def is_spawned(cls) -> bool:
+        return cls._spawned and len(cls._prim_paths) > 0
+
+    @classmethod
+    def total_count(cls) -> int:
+        return len(cls._prim_paths)
+
+    @classmethod
+    def get_active_count(cls) -> int:
+        return int(cls._active_count)
+
+    @classmethod
+    def set_active_count(cls, active_count: int) -> int:
+        if not cls.is_spawned():
+            print("[WARN]: ObstacleSpawner.set_active_count called before shared obstacles were spawned.", flush=True)
+            return 0
+
+        active_count = int(max(0, min(active_count, cls.total_count())))
+        if active_count == cls._active_count:
+            return cls._active_count
+
+        stage = _get_stage()
+        for i, prim_path in enumerate(cls._prim_paths):
+            translation = cls._active_translations[i] if i < active_count else cls._parking_translations[i]
+            _set_prim_translation(stage, prim_path, translation)
+            _set_prim_visibility(stage, prim_path, i < active_count)
+
+        cls._active_count = active_count
+        print(
+            f"[INFO]: Shared obstacle curriculum applied: active={cls._active_count}/{cls.total_count()}",
+            flush=True,
+        )
+        return cls._active_count
 
     def spawn_obstacles(self):
         import isaacsim.core.utils.prims as prim_utils
 
+        if ObstacleSpawner.is_spawned():
+            if self.num_obstacles <= ObstacleSpawner.total_count():
+                print(
+                    f"[INFO]: Reusing existing shared obstacle pool "
+                    f"({ObstacleSpawner.total_count()} obstacles already spawned).",
+                    flush=True,
+                )
+                return
+            raise RuntimeError(
+                "ObstacleSpawner was already initialized with fewer obstacles than requested. "
+                "Please restart Isaac Sim and spawn the maximum curriculum obstacle pool once."
+            )
+
         prim_utils.create_prim("/World/Obstacles", "Xform")
-        print(f"\n[INFO]: 正在生成 {self.num_obstacles} 个共享障碍物(静态/kinematic)...")
+
+        ObstacleSpawner._prim_paths = []
+        ObstacleSpawner._active_translations = []
+        ObstacleSpawner._parking_translations = []
+        ObstacleSpawner._active_count = self.num_obstacles
+
+        print(f"\n[INFO]: 正在生成 {self.num_obstacles} 个共享障碍物(静态/kinematic)...", flush=True)
         for i in range(self.num_obstacles):
             x_pos = np.random.uniform(*self.x_range)
             y_pos = np.random.uniform(*self.y_range)
@@ -75,19 +174,23 @@ class ObstacleSpawner:
             obstacle_path = f"/World/Obstacles/Obstacle_{i:04d}"
             cfg_obstacle.func(obstacle_path, cfg_obstacle, translation=(x_pos, y_pos, z_pos))
 
-            if (i + 1) % 10 == 0:
-                print(f"[INFO]: 已生成 {i + 1}/{self.num_obstacles} 个障碍物")
+            ObstacleSpawner._prim_paths.append(obstacle_path)
+            ObstacleSpawner._active_translations.append((float(x_pos), float(y_pos), float(z_pos)))
+            ObstacleSpawner._parking_translations.append((1000.0 + 5.0 * float(i), 1000.0, -1000.0))
 
-        print("[INFO]: 共享障碍物生成完成（静态/kinematic）！")
+            if (i + 1) % 10 == 0:
+                print(f"[INFO]: 已生成 {i + 1}/{self.num_obstacles} 个障碍物", flush=True)
+
+        ObstacleSpawner._spawned = True
+        print("[INFO]: 共享障碍物生成完成（静态/kinematic）！", flush=True)
 
 
 class WallSpawner:
     """Spawn workspace boundary walls under /World/Wall.
 
-    Walls included:
-      - 4 side walls on x/y boundaries
-      - 1 ceiling wall on z upper boundary
-      - ground is still provided by /World/ground, so no bottom wall
+    Supports either:
+      - one shared default color for all walls, or
+      - per-wall colors via wall_colors dict.
     """
 
     def __init__(
@@ -97,24 +200,30 @@ class WallSpawner:
         z_bounds: tuple = (0.0, 10.0),
         wall_thickness: float = 0.5,
         color: tuple = (0.7, 0.7, 0.2),
+        wall_colors: dict[str, tuple[float, float, float]] | None = None,
     ):
         self.x_bounds = x_bounds
         self.y_bounds = y_bounds
         self.z_bounds = z_bounds
         self.wall_thickness = float(wall_thickness)
         self.color = color
+        self.wall_colors = wall_colors or {}
 
-    def _make_wall_cfg(self):
-        return sim_utils.CuboidCfg(
-            size=(1.0, 1.0, 1.0),  # placeholder; actual size passed at spawn-time
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                rigid_body_enabled=True,
-                disable_gravity=True,
-                kinematic_enabled=True,
-            ),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=self.color),
-        )
+    def _get_wall_color(self, wall_name: str) -> tuple[float, float, float]:
+        """Return per-wall color if provided, else fallback to default color."""
+        color = self.wall_colors.get(wall_name, self.color)
+
+        if not isinstance(color, (tuple, list)) or len(color) != 3:
+            raise ValueError(
+                f"Invalid color for wall '{wall_name}': {color}. "
+                f"Expected tuple/list of 3 floats in [0, 1]."
+            )
+
+        r, g, b = float(color[0]), float(color[1]), float(color[2])
+        r = max(0.0, min(1.0, r))
+        g = max(0.0, min(1.0, g))
+        b = max(0.0, min(1.0, b))
+        return (r, g, b)
 
     def spawn_walls(self):
         import isaacsim.core.utils.prims as prim_utils
@@ -137,48 +246,48 @@ class WallSpawner:
 
         print(
             f"\n[INFO]: 正在生成工作空间围墙 /World/Wall "
-            f"(x={self.x_bounds}, y={self.y_bounds}, z={self.z_bounds}, thickness={t})..."
+            f"(x={self.x_bounds}, y={self.y_bounds}, z={self.z_bounds}, thickness={t})...",
+            flush=True,
         )
 
-        # ------------------------------------------------------------------
-        # Four side walls
-        # Put wall centers OUTSIDE the workspace so the inner face aligns exactly
-        # with the workspace boundary.
-        # ------------------------------------------------------------------
         walls = [
-            # left wall: inner face at x = x_min
             dict(
                 name="Wall_XMin",
                 size=(t, y_len, z_len),
-                translation=(x_min - t / 2.0, y_center, z_center),
+                translation=(x_min, y_center, z_center),
             ),
-            # right wall: inner face at x = x_max
             dict(
                 name="Wall_XMax",
                 size=(t, y_len, z_len),
-                translation=(x_max + t / 2.0, y_center, z_center),
+                translation=(x_max, y_center, z_center),
             ),
-            # bottom-y wall: inner face at y = y_min
             dict(
                 name="Wall_YMin",
                 size=(x_len, t, z_len),
-                translation=(x_center, y_min - t / 2.0, z_center),
+                translation=(x_center, y_min, z_center),
             ),
-            # top-y wall: inner face at y = y_max
             dict(
                 name="Wall_YMax",
                 size=(x_len, t, z_len),
-                translation=(x_center, y_max + t / 2.0, z_center),
+                translation=(x_center, y_max, z_center),
             ),
-            # ceiling: inner face at z = z_max
+            dict(
+                name="Wall_ZMin",
+                size=(x_len, y_len, t),
+                translation=(x_center, y_center, z_min),
+            )
+            ,
             dict(
                 name="Wall_ZMax",
                 size=(x_len, y_len, t),
-                translation=(x_center, y_center, z_max + t / 2.0),
+                translation=(x_center, y_center, z_max),
             ),
         ]
 
         for wall in walls:
+            wall_name = wall["name"]
+            wall_color = self._get_wall_color(wall_name)
+
             cfg_wall = sim_utils.CuboidCfg(
                 size=wall["size"],
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -187,33 +296,25 @@ class WallSpawner:
                     kinematic_enabled=True,
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(),
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=self.color),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=wall_color),
             )
-            wall_path = f"/World/Wall/{wall['name']}"
-            cfg_wall.func(
-                wall_path,
-                cfg_wall,
-                translation=wall["translation"],
-            )
+
+            wall_path = f"/World/Wall/{wall_name}"
+            cfg_wall.func(wall_path, cfg_wall, translation=wall["translation"])
+
             print(
-                f"[INFO]: 已生成围墙 {wall['name']}: "
-                f"size={wall['size']}, translation={wall['translation']}"
+                f"[INFO]: 已生成围墙 {wall_name}: "
+                f"size={wall['size']}, translation={wall['translation']}, color={wall_color}",
+                flush=True,
             )
 
         print("[INFO]: 工作空间围墙生成完成！", flush=True)
 
 # =============================================================================
-# Env with goal buffer / energy cache / progress cache
+# Env with goal buffer / energy cache / progress cache / obstacle curriculum
 # =============================================================================
 class MyDroneRLEnv(ManagerBasedRLEnv):
-    """
-    Custom env that adds:
-      - per-env goal buffer (goal_pos_w)
-      - per-env previous velocity buffers for energy penalty
-      - per-env previous goal distance buffer for progress reward
-      - semantic finite gym spaces for policy observation / action
-      - _reset_idx / reset_idx dual compatibility
-    """
+    """Custom env with goal buffers and shared-obstacle curriculum support."""
 
     def __init__(self, cfg=None, **kwargs):
         kwargs.pop("env_cfg_entry_point", None)
@@ -234,7 +335,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         # goal visualizer settings / cache
         self._goal_vis_enabled = True
         self._goal_vis_radius = 0.35
-        self._goal_vis_color = (1.0, 0.0, 0.0)   # red
+        self._goal_vis_color = (1.0, 0.0, 0.0)
         self._goal_vis_opacity = 0.9
         self._goal_vis_paths: list[str] = []
 
@@ -243,6 +344,25 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self.policy_lidar_dim = 0
         self._batched_observation_space = None
         self._batched_action_space = None
+
+        # obstacle curriculum state
+        self.curriculum_obstacle_levels: tuple[int, ...] = (0, 10, 20, 40, 60, 100)
+        self.curriculum_obstacle_level_idx: int = 0
+        self.curriculum_active_obstacles: int = 0
+        self.curriculum_success_threshold: float = 0.8
+        self.curriculum_promotion_count: int = 0
+        self.curriculum_last_promotion_step: int = -1
+        self.curriculum_last_promotion_ratio: float = 0.0
+
+        self.curriculum_last_batch_success_ratio: float = 0.0
+        self.curriculum_last_batch_success_count: int = 0
+        self.curriculum_last_batch_termination_count: int = 0
+
+        self.curriculum_decision_success_ratio: float = 0.0
+        self.curriculum_decision_window_size: int = 0
+        self.curriculum_recent_success_ratio: float = 0.0
+        self.curriculum_recent_termination_count: int = 0
+        self._curriculum_success_window = deque(maxlen=1)
 
         super().__init__(cfg=cfg)
 
@@ -256,7 +376,16 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._energy_prev_ang_vel_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
         self._progress_prev_goal_dist = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float32)
 
-        # create goal visual prims first, then sample/update positions
+        obstacle_curr_cfg = getattr(self.cfg, "obstacle_curriculum", None)
+        if obstacle_curr_cfg is not None:
+            self.configure_obstacle_curriculum(
+                levels=tuple(int(v) for v in getattr(obstacle_curr_cfg, "levels", self.curriculum_obstacle_levels)),
+                initial_level=int(getattr(obstacle_curr_cfg, "initial_level", 0)),
+                window_size=int(getattr(obstacle_curr_cfg, "window_size", 200)),
+                success_threshold=float(getattr(obstacle_curr_cfg, "success_threshold", 0.8)),
+                reset_history=True,
+            )
+
         if self._goal_vis_enabled:
             self._create_goal_visualizers()
 
@@ -267,7 +396,17 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
 
         print("\n[MyDroneRLEnv] ===== Env Initialized =====", flush=True)
         print(f"[MyDroneRLEnv] num_envs={self.num_envs}, device={self.device}", flush=True)
-        print(f"[MyDroneRLEnv] policy_state_dim={self.policy_state_dim}, policy_lidar_dim={self.policy_lidar_dim}", flush=True)
+        print(
+            f"[MyDroneRLEnv] policy_state_dim={self.policy_state_dim}, "
+            f"policy_lidar_dim={self.policy_lidar_dim}",
+            flush=True,
+        )
+        print(
+            f"[MyDroneRLEnv] obstacle curriculum levels={self.curriculum_obstacle_levels}, "
+            f"level_idx={self.curriculum_obstacle_level_idx}, "
+            f"active_obstacles={self.curriculum_active_obstacles}",
+            flush=True,
+        )
         try:
             print(f"[MyDroneRLEnv] step_dt={self.step_dt}", flush=True)
         except Exception:
@@ -277,24 +416,100 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         except Exception:
             pass
 
+    # ---------------------------------------------------------------------
+    # obstacle curriculum helpers
+    # ---------------------------------------------------------------------
+    def configure_obstacle_curriculum(
+        self,
+        levels: tuple[int, ...],
+        initial_level: int = 0,
+        window_size: int = 200,
+        success_threshold: float = 0.8,
+        reset_history: bool = False,
+    ) -> None:
+        levels = tuple(max(int(v), 0) for v in levels)
+        if len(levels) == 0:
+            levels = (0,)
 
-        env_ids = torch.arange(self.num_envs, device=self.device)
-        self._sample_goals(env_ids)
-        self._refresh_energy_prev_buffers(env_ids)
-        self._refresh_progress_prev_dist(env_ids)
+        self.curriculum_obstacle_levels = levels
+        self.curriculum_success_threshold = float(success_threshold)
 
+        history = getattr(self, "_curriculum_success_window", None)
+        old_values = list(history) if isinstance(history, deque) else []
+        window_size = max(int(window_size), 1)
+        self._curriculum_success_window = deque(old_values[-window_size:], maxlen=window_size)
+        if reset_history:
+            self._curriculum_success_window.clear()
+            self.curriculum_promotion_count = 0
+            self.curriculum_last_promotion_step = -1
+            self.curriculum_last_promotion_ratio = 0.0
+            self.curriculum_last_batch_success_ratio = 0.0
+            self.curriculum_last_batch_success_count = 0
+            self.curriculum_last_batch_termination_count = 0
+            self.curriculum_decision_success_ratio = 0.0
+            self.curriculum_decision_window_size = 0
+            self.curriculum_recent_success_ratio = 0.0
+            self.curriculum_recent_termination_count = 0
 
-        print("\n[MyDroneRLEnv] ===== Env Initialized =====", flush=True)
-        print(f"[MyDroneRLEnv] num_envs={self.num_envs}, device={self.device}", flush=True)
-        print(f"[MyDroneRLEnv] policy_state_dim={self.policy_state_dim}, policy_lidar_dim={self.policy_lidar_dim}", flush=True)
-        try:
-            print(f"[MyDroneRLEnv] step_dt={self.step_dt}", flush=True)
-        except Exception:
-            pass
-        try:
-            print(f"[MyDroneRLEnv] initial goal_pos_w[0]={self.goal_pos_w[0].detach().cpu().numpy()}", flush=True)
-        except Exception:
-            pass
+        initial_level = max(0, min(int(initial_level), len(levels) - 1))
+        self.set_obstacle_curriculum_level(initial_level, force=True)
+
+    def set_obstacle_curriculum_level(self, level_idx: int, force: bool = False) -> int:
+        if len(self.curriculum_obstacle_levels) == 0:
+            self.curriculum_obstacle_levels = (0,)
+
+        level_idx = max(0, min(int(level_idx), len(self.curriculum_obstacle_levels) - 1))
+        requested_obstacles = int(self.curriculum_obstacle_levels[level_idx])
+
+        if (not force) and (level_idx == self.curriculum_obstacle_level_idx):
+            return self.curriculum_active_obstacles
+
+        self.curriculum_obstacle_level_idx = level_idx
+        self.curriculum_active_obstacles = requested_obstacles
+
+        if not ObstacleSpawner.is_spawned():
+            print(
+                "[WARN][MyDroneRLEnv] Shared obstacles have not been spawned yet. "
+                "Curriculum state is cached and will take effect once obstacles exist.",
+                flush=True,
+            )
+            return self.curriculum_active_obstacles
+
+        available = ObstacleSpawner.total_count()
+        if requested_obstacles > available:
+            print(
+                f"[WARN][MyDroneRLEnv] Curriculum requested {requested_obstacles} obstacles but only "
+                f"{available} were spawned. Clamping to available pool size.",
+                flush=True,
+            )
+
+        self.curriculum_active_obstacles = ObstacleSpawner.set_active_count(requested_obstacles)
+        return self.curriculum_active_obstacles
+
+    def get_obstacle_curriculum_state(self) -> dict[str, float]:
+        history = getattr(self, "_curriculum_success_window", None)
+        if isinstance(history, deque):
+            rolling_count = len(history)
+            rolling_success = int(sum(history))
+        else:
+            rolling_count = 0
+            rolling_success = 0
+
+        rolling_ratio = float(rolling_success) / float(rolling_count) if rolling_count > 0 else 0.0
+
+        return {
+            "level_idx": float(self.curriculum_obstacle_level_idx),
+            "active_obstacles": float(self.curriculum_active_obstacles),
+            "last_batch_success_ratio": float(self.curriculum_last_batch_success_ratio),
+            "last_batch_success_count": float(self.curriculum_last_batch_success_count),
+            "last_batch_termination_count": float(self.curriculum_last_batch_termination_count),
+            "decision_success_ratio": float(self.curriculum_decision_success_ratio),
+            "decision_window_size": float(self.curriculum_decision_window_size),
+            "rolling_success_ratio": float(rolling_ratio),
+            "rolling_window_size": float(rolling_count),
+            "success_threshold": float(self.curriculum_success_threshold),
+            "promotion_count": float(self.curriculum_promotion_count),
+        }
 
     # ---------------------------------------------------------------------
     # gym spaces
@@ -395,7 +610,6 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
             flush=True,
         )
 
-
     # ---------------------------------------------------------------------
     # goal visualizers
     # ---------------------------------------------------------------------
@@ -413,14 +627,6 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
     def _goal_vis_path(self, env_index: int) -> str:
         return f"/World/envs/env_{env_index}/GoalVis"
 
-    def _set_xform_translation(self, prim, translation: tuple[float, float, float]) -> None:
-        xform = UsdGeom.Xformable(prim)
-        translate_ops = [op for op in xform.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeTranslate]
-        if len(translate_ops) > 0:
-            translate_ops[0].Set(Gf.Vec3d(*translation))
-        else:
-            xform.AddTranslateOp().Set(Gf.Vec3d(*translation))
-
     def _create_goal_visualizers(self) -> None:
         stage = self._get_stage()
         self._goal_vis_paths = []
@@ -431,11 +637,8 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
             sphere.CreateRadiusAttr(float(self._goal_vis_radius))
 
             prim = sphere.GetPrim()
+            _set_prim_translation(stage, prim.GetPath().pathString, (0.0, 0.0, -1000.0))
 
-            # set initial position
-            self._set_xform_translation(prim, (0.0, 0.0, -1000.0))
-
-            # display color / opacity (visual only)
             sphere.CreateDisplayColorAttr([Gf.Vec3f(*self._goal_vis_color)])
             sphere.CreateDisplayOpacityAttr([float(self._goal_vis_opacity)])
 
@@ -461,13 +664,8 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
             if env_id < 0 or env_id >= len(self._goal_vis_paths):
                 continue
 
-            prim = stage.GetPrimAtPath(self._goal_vis_paths[env_id])
-            if not prim.IsValid():
-                continue
-
             gx, gy, gz = goal_cpu[env_id].tolist()
-            self._set_xform_translation(prim, (float(gx), float(gy), float(gz)))
-
+            _set_prim_translation(stage, self._goal_vis_paths[env_id], (float(gx), float(gy), float(gz)))
 
     # ---------------------------------------------------------------------
     # goal sampling / caches
@@ -486,9 +684,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self.goal_pos_w[env_ids, 1] = gy
         self.goal_pos_w[env_ids, 2] = gz
 
-        # sync red goal spheres
         self._update_goal_visualizers(env_ids)
-
 
     def _refresh_energy_prev_buffers(self, env_ids: torch.Tensor):
         try:
@@ -536,7 +732,6 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._sample_goals(env_ids)
         out = self._call_parent_reset_idx(env_ids)
 
-        # refresh caches AFTER reset has written sim state
         self._refresh_energy_prev_buffers(env_ids)
         self._refresh_progress_prev_dist(env_ids)
 
@@ -548,6 +743,5 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
 
         return out
 
-    # compatibility shim for versions/workflows that still call reset_idx
     def reset_idx(self, env_ids: torch.Tensor | None = None):
         return self._reset_idx(env_ids)

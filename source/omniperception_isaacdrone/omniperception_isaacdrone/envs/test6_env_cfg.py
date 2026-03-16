@@ -7,6 +7,7 @@ from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import (
     ActionTermCfg,
+    CurriculumTermCfg as CurrTerm,
     EventTermCfg as EventTerm,
     ObservationGroupCfg as ObsGroup,
     ObservationTermCfg as ObsTerm,
@@ -47,6 +48,24 @@ class NormalizationCfg:
     state_dim: int = 16
 
 
+@configclass
+class ObstacleCurriculumSettingsCfg:
+    enabled: bool = True
+    levels: tuple[int, ...] = (0, 10, 20, 40, 60, 100)
+    initial_level: int = 0
+
+    # Promotion criterion: recent reached_goal ratio
+    success_term_name: str = "reached_goal"
+    success_threshold: float = 0.8
+
+    # Rolling window over recent terminated episodes
+    window_size: int = 200
+    min_samples: int = 100
+
+    # Avoid jumping multiple levels using stale statistics from an easier stage
+    clear_history_on_promotion: bool = True
+
+
 # -----------------------------------------------------------------------------
 # SceneCfg
 # -----------------------------------------------------------------------------
@@ -70,7 +89,6 @@ class Test6SceneCfg(InteractiveSceneCfg):
 
     robot.spawn = DRONE_CFG.spawn.replace(
         scale=(1, 1, 1),
-        # scale=(20, 20, 10),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,
@@ -120,7 +138,7 @@ class Test6SceneWithLidarCfg(Test6SceneCfg):
 
 
 # -----------------------------------------------------------------------------
-# Actions / Obs / Events / Rewards / Terminations
+# Actions / Obs / Events / Rewards / Terminations / Curriculum
 # -----------------------------------------------------------------------------
 @configclass
 class Test6ActionsCfg:
@@ -170,12 +188,12 @@ class Test6EventCfg:
 
 @configclass
 class Test6RewardsCfg:
-    # goal shaping: keep progress as the dominant dense term, but weaken static "hover nicely" incentives
+    # goal shaping
     progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=20.0, params={})
     dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=2.0, params={})
     vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=2.0, params={})
 
-    # stabilization / regularization: make them true regularizers instead of main objectives
+    # stabilization / regularization
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.1, params={})
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.05, params={})
 
@@ -184,7 +202,7 @@ class Test6RewardsCfg:
     energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.05, params={})
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.002)
 
-    # terminal signals: raise them so they remain salient after IsaacLab multiplies by dt
+    # terminal signals
     success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=3000.0, params={})
     collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-3000.0, params={})
     oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-3000.0, params={})
@@ -200,8 +218,17 @@ class Test6TerminationsCfg:
 
 
 @configclass
+class Test6CurriculumCfg:
+    obstacle_count = CurrTerm(
+        func=my_mdp.curriculum_obstacle_count_by_success,
+        params={},
+    )
+
+
+@configclass
 class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
     normalization: NormalizationCfg = NormalizationCfg()
+    obstacle_curriculum: ObstacleCurriculumSettingsCfg = ObstacleCurriculumSettingsCfg()
 
     scene: Test6SceneCfg = Test6SceneCfg(num_envs=1, env_spacing=0.0)
     observations: Test6ObservationsCfg = Test6ObservationsCfg()
@@ -209,6 +236,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
     events: Test6EventCfg = Test6EventCfg()
     rewards: Test6RewardsCfg = Test6RewardsCfg()
     terminations: Test6TerminationsCfg = Test6TerminationsCfg()
+    curriculum: Test6CurriculumCfg = Test6CurriculumCfg()
 
     def __post_init__(self):
         super().__post_init__()
@@ -301,7 +329,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.rewards.lidar_threat.params = {
             "lidar_name": "lidar",
             "safe_dist": None,
-            "safe_dist_ratio": 0.1,  # 0.06 * 50m = 3m
+            "safe_dist_ratio": 0.1,
             "exp_scale": 1.0,
             "cap": 5.0,
             "use_grid": True,
@@ -339,6 +367,22 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "sensor_cfg": SceneEntityCfg("contact_sensor"),
             "threshold": 1.0,
         }
+
+        if self.obstacle_curriculum.enabled:
+            self.curriculum.obstacle_count = CurrTerm(
+                func=my_mdp.curriculum_obstacle_count_by_success,
+                params={
+                    "levels": tuple(int(v) for v in self.obstacle_curriculum.levels),
+                    "initial_level": int(self.obstacle_curriculum.initial_level),
+                    "success_term_name": str(self.obstacle_curriculum.success_term_name),
+                    "success_threshold": float(self.obstacle_curriculum.success_threshold),
+                    "window_size": int(self.obstacle_curriculum.window_size),
+                    "min_samples": int(self.obstacle_curriculum.min_samples),
+                    "clear_history_on_promotion": bool(self.obstacle_curriculum.clear_history_on_promotion),
+                },
+            )
+        else:
+            self.curriculum.obstacle_count = None
 
 
 @configclass
