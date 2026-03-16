@@ -113,11 +113,11 @@ class Test6SceneCfg(InteractiveSceneCfg):
         update_period=0.0,
         history_length=1,
         debug_vis=False,
-        filter_prim_paths_expr=[
-            "/World/Obstacles/.*",
-            "/World/Wall/.*",
-            "/World/ground",
-        ],
+        # filter_prim_paths_expr=[
+        #     "/World/Obstacles/.*",
+        #     "/World/Wall/.*",
+        #     "/World/ground",
+        # ],
     )
 
     dome_light = AssetBaseCfg(
