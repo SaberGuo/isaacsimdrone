@@ -140,8 +140,9 @@ ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
 
 DEBUG_PRINT = False
 
-from pxr import UsdGeom, Gf
+from pxr import Usd, UsdGeom, UsdPhysics, Gf
 import isaacsim.core.utils.prims as prim_utils
+import isaacsim.core.utils.bounds as bounds_utils
 
 
 def get_cfg_obstacle_curriculum_levels(env_cfg: Any) -> tuple[int, ...]:
@@ -175,6 +176,304 @@ def scale_robot_visual_only(num_envs: int, visual_scale=(20.0, 20.0, 10.0)) -> N
             xform.AddScaleOp().Set(Gf.Vec3f(sx, sy, sz))
 
         print(f"[INFO] visual-only scale set on {visual_path}: {(sx, sy, sz)}", flush=True)
+
+
+def _format_vec3(v) -> str:
+    return f"({float(v[0]):.6f}, {float(v[1]):.6f}, {float(v[2]):.6f})"
+
+
+def _get_world_scale_from_prim(prim) -> np.ndarray:
+    """Read prim local-to-world transform and extract world scale."""
+    xform_cache = UsdGeom.XformCache()
+    world_m = xform_cache.GetLocalToWorldTransform(prim)
+
+    # Extract scale from matrix columns
+    # USD / Gf.Matrix4d uses upper-left 3x3 as rotation * scale
+    sx = Gf.Vec3d(world_m[0][0], world_m[0][1], world_m[0][2]).GetLength()
+    sy = Gf.Vec3d(world_m[1][0], world_m[1][1], world_m[1][2]).GetLength()
+    sz = Gf.Vec3d(world_m[2][0], world_m[2][1], world_m[2][2]).GetLength()
+
+    return np.array([float(sx), float(sy), float(sz)], dtype=np.float64)
+
+
+def _get_world_translation_from_prim(prim) -> np.ndarray:
+    """Read prim world translation."""
+    xform_cache = UsdGeom.XformCache()
+    world_m = xform_cache.GetLocalToWorldTransform(prim)
+    t = world_m.ExtractTranslation()
+    return np.array([float(t[0]), float(t[1]), float(t[2])], dtype=np.float64)
+
+
+def _read_collision_geom_world_size(prim) -> dict:
+    """
+    Return collider geometry info and final world dimensions without using AABB.
+    """
+    info = {
+        "geom_type": prim.GetTypeName(),
+        "authored": {},
+        "world": {},
+    }
+
+    world_scale = _get_world_scale_from_prim(prim)
+    world_translation = _get_world_translation_from_prim(prim)
+
+    info["world"]["scale_xyz"] = world_scale.tolist()
+    info["world"]["translation_xyz"] = world_translation.tolist()
+
+    # ------------------------------------------------------------------
+    # Cube
+    # ------------------------------------------------------------------
+    if prim.IsA(UsdGeom.Cube):
+        geom = UsdGeom.Cube(prim)
+        size_attr = geom.GetSizeAttr()
+        size = float(size_attr.Get()) if size_attr and size_attr.HasValue() else 1.0
+
+        world_size_xyz = size * world_scale
+
+        info["authored"]["size"] = size
+        info["world"]["size_xyz"] = world_size_xyz.tolist()
+        return info
+
+    # ------------------------------------------------------------------
+    # Sphere
+    # ------------------------------------------------------------------
+    if prim.IsA(UsdGeom.Sphere):
+        geom = UsdGeom.Sphere(prim)
+        radius_attr = geom.GetRadiusAttr()
+        radius = float(radius_attr.Get()) if radius_attr and radius_attr.HasValue() else 1.0
+
+        # sphere in world becomes ellipsoid if non-uniform scale exists
+        world_radius_xyz = radius * world_scale
+        world_diameter_xyz = 2.0 * world_radius_xyz
+
+        info["authored"]["radius"] = radius
+        info["world"]["radius_xyz"] = world_radius_xyz.tolist()
+        info["world"]["diameter_xyz"] = world_diameter_xyz.tolist()
+        return info
+
+    # ------------------------------------------------------------------
+    # Capsule
+    # ------------------------------------------------------------------
+    if prim.IsA(UsdGeom.Capsule):
+        geom = UsdGeom.Capsule(prim)
+        radius_attr = geom.GetRadiusAttr()
+        height_attr = geom.GetHeightAttr()
+        axis_attr = geom.GetAxisAttr()
+
+        radius = float(radius_attr.Get()) if radius_attr and radius_attr.HasValue() else 1.0
+        height = float(height_attr.Get()) if height_attr and height_attr.HasValue() else 1.0
+        axis = str(axis_attr.Get()) if axis_attr and axis_attr.HasValue() else "Z"
+
+        info["authored"]["radius"] = radius
+        info["authored"]["height"] = height
+        info["authored"]["axis"] = axis
+
+        # USD capsule total extent along axis = height + 2 * radius
+        if axis.upper() == "X":
+            world_size_xyz = np.array([
+                (height + 2.0 * radius) * world_scale[0],
+                (2.0 * radius) * world_scale[1],
+                (2.0 * radius) * world_scale[2],
+            ], dtype=np.float64)
+        elif axis.upper() == "Y":
+            world_size_xyz = np.array([
+                (2.0 * radius) * world_scale[0],
+                (height + 2.0 * radius) * world_scale[1],
+                (2.0 * radius) * world_scale[2],
+            ], dtype=np.float64)
+        else:
+            world_size_xyz = np.array([
+                (2.0 * radius) * world_scale[0],
+                (2.0 * radius) * world_scale[1],
+                (height + 2.0 * radius) * world_scale[2],
+            ], dtype=np.float64)
+
+        info["world"]["size_xyz"] = world_size_xyz.tolist()
+        return info
+
+    # ------------------------------------------------------------------
+    # Cylinder
+    # ------------------------------------------------------------------
+    if prim.IsA(UsdGeom.Cylinder):
+        geom = UsdGeom.Cylinder(prim)
+        radius_attr = geom.GetRadiusAttr()
+        height_attr = geom.GetHeightAttr()
+        axis_attr = geom.GetAxisAttr()
+
+        radius = float(radius_attr.Get()) if radius_attr and radius_attr.HasValue() else 1.0
+        height = float(height_attr.Get()) if height_attr and height_attr.HasValue() else 1.0
+        axis = str(axis_attr.Get()) if axis_attr and axis_attr.HasValue() else "Z"
+
+        info["authored"]["radius"] = radius
+        info["authored"]["height"] = height
+        info["authored"]["axis"] = axis
+
+        if axis.upper() == "X":
+            world_size_xyz = np.array([
+                height * world_scale[0],
+                (2.0 * radius) * world_scale[1],
+                (2.0 * radius) * world_scale[2],
+            ], dtype=np.float64)
+        elif axis.upper() == "Y":
+            world_size_xyz = np.array([
+                (2.0 * radius) * world_scale[0],
+                height * world_scale[1],
+                (2.0 * radius) * world_scale[2],
+            ], dtype=np.float64)
+        else:
+            world_size_xyz = np.array([
+                (2.0 * radius) * world_scale[0],
+                (2.0 * radius) * world_scale[1],
+                height * world_scale[2],
+            ], dtype=np.float64)
+
+        info["world"]["size_xyz"] = world_size_xyz.tolist()
+        return info
+
+    # ------------------------------------------------------------------
+    # Cone
+    # ------------------------------------------------------------------
+    if prim.IsA(UsdGeom.Cone):
+        geom = UsdGeom.Cone(prim)
+        radius_attr = geom.GetRadiusAttr()
+        height_attr = geom.GetHeightAttr()
+        axis_attr = geom.GetAxisAttr()
+
+        radius = float(radius_attr.Get()) if radius_attr and radius_attr.HasValue() else 1.0
+        height = float(height_attr.Get()) if height_attr and height_attr.HasValue() else 1.0
+        axis = str(axis_attr.Get()) if axis_attr and axis_attr.HasValue() else "Z"
+
+        info["authored"]["radius"] = radius
+        info["authored"]["height"] = height
+        info["authored"]["axis"] = axis
+
+        if axis.upper() == "X":
+            world_size_xyz = np.array([
+                height * world_scale[0],
+                (2.0 * radius) * world_scale[1],
+                (2.0 * radius) * world_scale[2],
+            ], dtype=np.float64)
+        elif axis.upper() == "Y":
+            world_size_xyz = np.array([
+                (2.0 * radius) * world_scale[0],
+                height * world_scale[1],
+                (2.0 * radius) * world_scale[2],
+            ], dtype=np.float64)
+        else:
+            world_size_xyz = np.array([
+                (2.0 * radius) * world_scale[0],
+                (2.0 * radius) * world_scale[1],
+                height * world_scale[2],
+            ], dtype=np.float64)
+
+        info["world"]["size_xyz"] = world_size_xyz.tolist()
+        return info
+
+    # ------------------------------------------------------------------
+    # Mesh
+    # ------------------------------------------------------------------
+    if prim.IsA(UsdGeom.Mesh):
+        geom = UsdGeom.Mesh(prim)
+        points_attr = geom.GetPointsAttr()
+
+        if points_attr and points_attr.HasValue():
+            pts = points_attr.Get()
+            if pts is not None and len(pts) > 0:
+                pts_np = np.array([[float(p[0]), float(p[1]), float(p[2])] for p in pts], dtype=np.float64)
+                pmin = pts_np.min(axis=0)
+                pmax = pts_np.max(axis=0)
+                local_size = pmax - pmin
+                world_size = local_size * world_scale
+
+                info["authored"]["mesh_local_aabb_min"] = pmin.tolist()
+                info["authored"]["mesh_local_aabb_max"] = pmax.tolist()
+                info["authored"]["mesh_local_size_xyz"] = local_size.tolist()
+                info["world"]["size_xyz"] = world_size.tolist()
+
+        try:
+            mesh_collision_api = UsdPhysics.MeshCollisionAPI(prim)
+            approx_attr = mesh_collision_api.GetApproximationAttr()
+            if approx_attr and approx_attr.HasValue():
+                info["authored"]["mesh_collision_approximation"] = str(approx_attr.Get())
+        except Exception:
+            pass
+
+        return info
+
+    return info
+
+
+def print_robot_collision_shapes(env_index: int = 0, robot_rel_path: str = "Robot") -> None:
+    """
+    Print robot collision prims and final world dimensions without using AABB.
+    """
+    stage = prim_utils.get_prim_at_path("/World").GetStage()
+    robot_root_path = f"/World/envs/env_{env_index}/{robot_rel_path}"
+    robot_root = stage.GetPrimAtPath(robot_root_path)
+
+    print(f"\n[COLLISION] ===== Robot collision inspection for env_{env_index} =====", flush=True)
+    print(f"[COLLISION] robot_root_path = {robot_root_path}", flush=True)
+
+    if not robot_root.IsValid():
+        print(f"[COLLISION][ERROR] Robot root prim not found: {robot_root_path}", flush=True)
+        return
+
+    collision_prims = []
+    for prim in Usd.PrimRange(robot_root):
+        if not prim.IsValid():
+            continue
+        if UsdPhysics.CollisionAPI(prim):
+            collision_prims.append(prim)
+
+    if len(collision_prims) == 0:
+        print("[COLLISION][WARN] No prim with UsdPhysics.CollisionAPI found under robot root.", flush=True)
+        return
+
+    print(f"[COLLISION] found {len(collision_prims)} collision prim(s)", flush=True)
+
+    combined_min = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
+    combined_max = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
+
+    for i, prim in enumerate(collision_prims):
+        prim_path = prim.GetPath().pathString
+        info = _read_collision_geom_world_size(prim)
+
+        print(f"\n[COLLISION] #{i}", flush=True)
+        print(f"[COLLISION] prim_path                 = {prim_path}", flush=True)
+        print(f"[COLLISION] prim_type                 = {info['geom_type']}", flush=True)
+
+        for k, v in info["authored"].items():
+            print(f"[COLLISION] authored.{k:<22} = {v}", flush=True)
+
+        for k, v in info["world"].items():
+            if isinstance(v, list) and len(v) == 3:
+                print(f"[COLLISION] world.{k:<25} = {_format_vec3(v)}", flush=True)
+            else:
+                print(f"[COLLISION] world.{k:<25} = {v}", flush=True)
+
+        # 对 Cube / Capsule / Cylinder / Cone / Mesh / Sphere 尝试构造一个近似 world box
+        world_t = np.array(info["world"].get("translation_xyz", [0.0, 0.0, 0.0]), dtype=np.float64)
+
+        if "size_xyz" in info["world"]:
+            size = np.array(info["world"]["size_xyz"], dtype=np.float64)
+        elif "diameter_xyz" in info["world"]:
+            size = np.array(info["world"]["diameter_xyz"], dtype=np.float64)
+        else:
+            size = None
+
+        if size is not None:
+            pmin = world_t - 0.5 * size
+            pmax = world_t + 0.5 * size
+            combined_min = np.minimum(combined_min, pmin)
+            combined_max = np.maximum(combined_max, pmax)
+
+    if np.isfinite(combined_min).all() and np.isfinite(combined_max).all():
+        combined_size = combined_max - combined_min
+        print("\n[COLLISION] approx combined world box", flush=True)
+        print(f"[COLLISION] approx_min_xyz            = {_format_vec3(combined_min)}", flush=True)
+        print(f"[COLLISION] approx_max_xyz            = {_format_vec3(combined_max)}", flush=True)
+        print(f"[COLLISION] approx_size_xyz           = {_format_vec3(combined_size)}", flush=True)
+
 
 
 def debug_print(msg: str) -> None:
@@ -1043,7 +1342,6 @@ def main() -> None:
 
     print("[INFO] Creating env...", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
-
     scale_robot_visual_only(
         num_envs=base_env.num_envs,
         visual_scale=(20.0, 20.0, 10.0),
@@ -1148,6 +1446,8 @@ def main() -> None:
     loss_mirror.bind(agent)
 
     raw_obs, infos = env.reset()
+    print_robot_collision_shapes(env_index=0, robot_rel_path="Robot")
+
     states = sanitize_states(
         ensure_obs_shape(extract_policy_obs(raw_obs), num_envs, obs_dim),
         state_dim=state_dim,
