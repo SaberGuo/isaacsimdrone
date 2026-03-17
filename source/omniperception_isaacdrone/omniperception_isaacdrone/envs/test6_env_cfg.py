@@ -241,10 +241,10 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.decimation = 1
+        self.decimation = 2
         max_steps = 1500
 
-        self.sim.dt = 1.0 / 60.0
+        self.sim.dt = 1.0 / 120.0
         self.sim.render_interval = self.decimation
         self.episode_length_s = float(max_steps) * float(self.sim.dt) * float(self.decimation)
 
