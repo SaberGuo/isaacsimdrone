@@ -41,8 +41,8 @@ class NormalizationCfg:
 
     diag_scale: float = 1.1
 
-    lin_vel_max: float = 5.0
-    ang_vel_max: float = 10.0
+    lin_vel_max: float = 6.0
+    ang_vel_max: float = 31.4
 
     quat_hemisphere: bool = True
     state_dim: int = 17
@@ -265,9 +265,9 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "use_sim_total_mass": True,
             "prevent_negative_thrust": True,
             "vel_scale": 6.0,
-            "vel_clip": 9.0,
-            "yaw_rate_scale": 1.56,
-            "yaw_rate_clip": 3.14,
+            "vel_clip": 8.0,
+            "yaw_rate_scale": 3.14,
+            "yaw_rate_clip": 6.28,
             "thrust_sign": 1.0,
             "g": 9.81,
             "vel_gain": (3.0, 3.0, 4.0),
