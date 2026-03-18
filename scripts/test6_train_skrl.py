@@ -34,7 +34,7 @@ parser.add_argument(
 parser.add_argument("--timesteps", type=int, default=2_000_000)
 parser.add_argument("--seed", type=int, default=42)
 
-parser.add_argument("--state_dim", type=int, default=19)
+parser.add_argument("--state_dim", type=int, default=17)
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
 
@@ -117,9 +117,7 @@ from tqdm import tqdm
 from omniperception_isaacdrone.envs.test6_env import ObstacleSpawner, WallSpawner
 
 
-STATE_OBS_NAMES_19 = [
-    "root_pos_x",
-    "root_pos_y",
+STATE_OBS_NAMES_17 = [
     "root_pos_z",
     "root_quat_w",
     "root_quat_x",
@@ -138,6 +136,7 @@ STATE_OBS_NAMES_19 = [
     "goal_delta_y",
     "goal_delta_z",
 ]
+
 
 ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
 
@@ -1275,8 +1274,8 @@ class Value(DeterministicMixin, Model):
 
 
 def build_state_names(state_dim: int) -> List[str]:
-    if int(state_dim) == len(STATE_OBS_NAMES_19):
-        return list(STATE_OBS_NAMES_19)
+    if int(state_dim) == len(STATE_OBS_NAMES_17):
+        return list(STATE_OBS_NAMES_17)
     return [f"state_{i}" for i in range(int(state_dim))]
 
 

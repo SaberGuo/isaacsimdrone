@@ -162,6 +162,19 @@ def obs_root_pos_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torc
 
     return _clamp_m11(out)
 
+def obs_root_pos_z_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Only keep normalized root z position in [-1, 1]. Shape: (N, 1)."""
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg).to(torch.float32)  # (N, 3)
+    _, _, zb = _get_workspace_bounds(env)
+
+    z = pos[:, 2:3]
+    z_min = float(zb[0])
+    z_max = float(zb[1])
+    denom = max(z_max - z_min, 1e-6)
+
+    out = 2.0 * (z - z_min) / denom - 1.0
+    return _clamp_m11(out)
+
 
 
 def obs_root_quat_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -215,15 +228,17 @@ def obs_goal_delta_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> to
 
 
 def obs_state_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Convenience: produce the 16D normalized state vector in the SAME order as the training script:
+    """Produce the 16D normalized state vector excluding root_pos_z:
       [root_quat(4), root_lin_vel(3), root_ang_vel(3), projected_gravity(3), goal_delta(3)]
     """
+
+    z = obs_root_pos_z_norm(env, asset_cfg)
     q = obs_root_quat_norm(env, asset_cfg)
     v = obs_root_lin_vel_norm(env, asset_cfg)
     w = obs_root_ang_vel_norm(env, asset_cfg)
     g = obs_projected_gravity_norm(env, asset_cfg)
     d = obs_goal_delta_norm(env, asset_cfg)
-    return torch.cat([q, v, w, g, d], dim=-1)  # (N,16)
+    return torch.cat([z, q, v, w, g, d], dim=-1)  # (N,17)
 
 
 
