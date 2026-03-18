@@ -24,7 +24,7 @@ parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--num_obstacles", type=int, default=50)
 parser.add_argument("--seed", type=int, default=42)
 
-parser.add_argument("--state_dim", type=int, default=16)
+parser.add_argument("--state_dim", type=int, default=19)
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
 

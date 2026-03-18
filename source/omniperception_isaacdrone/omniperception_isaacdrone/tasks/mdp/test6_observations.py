@@ -93,14 +93,6 @@ def _get_quat_hemisphere(env: ManagerBasedRLEnv) -> bool:
         return True
 
 
-def _diag_origin(xb: Tuple[float, float], yb: Tuple[float, float], zb: Tuple[float, float]) -> float:
-    """Diagonal radius from origin to the farthest corner."""
-    x_extent = max(abs(float(xb[0])), abs(float(xb[1])))
-    y_extent = max(abs(float(yb[0])), abs(float(yb[1])))
-    z_extent = max(abs(float(zb[0])), abs(float(zb[1])))
-    return math.sqrt(x_extent * x_extent + y_extent * y_extent + z_extent * z_extent)
-
-
 def _diag_full(xb: Tuple[float, float], yb: Tuple[float, float], zb: Tuple[float, float]) -> float:
     """Full diagonal length across the workspace bounding box."""
     dx = abs(float(xb[1]) - float(xb[0]))
@@ -142,16 +134,34 @@ def obs_goal_delta(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.T
 # =============================================================================
 # 2) normalized state terms (strict bounds)
 # =============================================================================
+
 def obs_root_pos_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Normalize root position (world) into [-1,1] using 1.1 * diag_origin(workspace)."""
-    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg).to(torch.float32)  # (N,3)
+    """Normalize root position (world) per-axis using workspace bounds into [-1,1].
+
+    For each axis:
+        x_norm = 2 * (x - x_min) / (x_max - x_min) - 1
+        y_norm = 2 * (y - y_min) / (y_max - y_min) - 1
+        z_norm = 2 * (z - z_min) / (z_max - z_min) - 1
+    """
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg).to(torch.float32)  # (N, 3)
     xb, yb, zb = _get_workspace_bounds(env)
 
-    diag = _diag_origin(xb, yb, zb)
-    denom = max(diag * _get_diag_scale(env), 1e-6)
+    mins = torch.tensor(
+        [float(xb[0]), float(yb[0]), float(zb[0])],
+        device=pos.device,
+        dtype=torch.float32,
+    )
+    maxs = torch.tensor(
+        [float(xb[1]), float(yb[1]), float(zb[1])],
+        device=pos.device,
+        dtype=torch.float32,
+    )
 
-    out = pos / float(denom)
+    denom = torch.clamp(maxs - mins, min=1e-6)
+    out = 2.0 * (pos - mins) / denom - 1.0
+
     return _clamp_m11(out)
+
 
 
 def obs_root_quat_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:

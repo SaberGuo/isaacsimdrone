@@ -37,7 +37,7 @@ from omniperception_isaacdrone.tasks import mdp as my_mdp
 class NormalizationCfg:
     x_bounds: tuple[float, float] = (-80.0, 80.0)
     y_bounds: tuple[float, float] = (-80.0, 80.0)
-    z_bounds: tuple[float, float] = (1.0, 10.0)
+    z_bounds: tuple[float, float] = (0.0, 10.0)
 
     diag_scale: float = 1.1
 
@@ -45,7 +45,7 @@ class NormalizationCfg:
     ang_vel_max: float = 10.0
 
     quat_hemisphere: bool = True
-    state_dim: int = 16
+    state_dim: int = 19
 
 
 @configclass
@@ -152,6 +152,7 @@ class Test6ActionsCfg:
 class Test6ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
+        root_pos = ObsTerm(func=my_mdp.obs_root_pos_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_quat = ObsTerm(func=my_mdp.obs_root_quat_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_lin_vel = ObsTerm(func=my_mdp.obs_root_lin_vel_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_ang_vel = ObsTerm(func=my_mdp.obs_root_ang_vel_norm, params={"asset_cfg": SceneEntityCfg("robot")})
@@ -198,15 +199,15 @@ class Test6RewardsCfg:
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.05, params={})
 
     # safety & effort
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-5.0, params={})
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-2000.0, params={})
     energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.05, params={})
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.002)
 
     # terminal signals
-    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=3000.0, params={})
-    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-3000.0, params={})
-    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-3000.0, params={})
-    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-3000.0, params={})
+    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=10000.0, params={})
+    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-12000.0, params={})
+    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-10000.0, params={})
+    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-10000.0, params={})
 
 
 @configclass
@@ -241,12 +242,11 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.decimation = 2
-        max_steps = 1500
-
-        self.sim.dt = 1.0 / 120.0
+        self.decimation = 1
+        self.sim.dt = 1.0 / 60.0
         self.sim.render_interval = self.decimation
-        self.episode_length_s = float(max_steps) * float(self.sim.dt) * float(self.decimation)
+        self.episode_length_s = 30.0
+        # max_steps = int(self.episode_length_s / (self.sim.dt * self.decimation))
 
         self.viewer.eye = (60.0, 60.0, 40.0)
         self.viewer.lookat = (0.0, 0.0, 5.0)

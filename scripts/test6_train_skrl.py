@@ -34,19 +34,19 @@ parser.add_argument(
 parser.add_argument("--timesteps", type=int, default=2_000_000)
 parser.add_argument("--seed", type=int, default=42)
 
-parser.add_argument("--state_dim", type=int, default=16)
+parser.add_argument("--state_dim", type=int, default=19)
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
 
-parser.add_argument("--rollouts", type=int, default=256)
+parser.add_argument("--rollouts", type=int, default=512)
 parser.add_argument("--learning_epochs", type=int, default=4)
 parser.add_argument("--mini_batches", type=int, default=16)
-parser.add_argument("--learning_rate", type=float, default=1e-4)
-parser.add_argument("--_lambda", type=float, default=0.95)
+parser.add_argument("--learning_rate", type=float, default=3e-4)
+parser.add_argument("--_lambda", type=float, default=0.97)
 parser.add_argument("--discount_factor", type=float, default=0.999)
 
-parser.add_argument("--ratio_clip", type=float, default=0.15)
-parser.add_argument("--value_clip", type=float, default=0.15)
+parser.add_argument("--ratio_clip", type=float, default=0.2)
+parser.add_argument("--value_clip", type=float, default=0.2)
 parser.add_argument("--value_loss_scale", type=float, default=0.5)
 parser.add_argument("--grad_norm_clip", type=float, default=0.5)
 parser.add_argument("--entropy_coef", type=float, default=5e-3)
@@ -117,7 +117,10 @@ from tqdm import tqdm
 from omniperception_isaacdrone.envs.test6_env import ObstacleSpawner, WallSpawner
 
 
-STATE_OBS_NAMES_16 = [
+STATE_OBS_NAMES_19 = [
+    "root_pos_x",
+    "root_pos_y",
+    "root_pos_z",
     "root_quat_w",
     "root_quat_x",
     "root_quat_y",
@@ -1272,8 +1275,8 @@ class Value(DeterministicMixin, Model):
 
 
 def build_state_names(state_dim: int) -> List[str]:
-    if int(state_dim) == len(STATE_OBS_NAMES_16):
-        return list(STATE_OBS_NAMES_16)
+    if int(state_dim) == len(STATE_OBS_NAMES_19):
+        return list(STATE_OBS_NAMES_19)
     return [f"state_{i}" for i in range(int(state_dim))]
 
 
