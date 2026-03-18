@@ -216,14 +216,29 @@ def obs_projected_gravity_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg
 
 
 def obs_goal_delta_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Normalize goal delta (goal - pos) into [-1,1] using 1.1 * diag_full(workspace)."""
-    delta = obs_goal_delta(env, asset_cfg=asset_cfg).to(torch.float32)  # (N,3)
+    """Normalize goal delta (goal - pos) per-axis into [-1, 1].
+
+    For each axis:
+        dx_norm = (goal_x - x) / (x_max - x_min)
+        dy_norm = (goal_y - y) / (y_max - y_min)
+        dz_norm = (goal_z - z) / (z_max - z_min)
+    """
+    delta = obs_goal_delta(env, asset_cfg=asset_cfg).to(torch.float32)  # (N, 3)
     xb, yb, zb = _get_workspace_bounds(env)
 
-    diag = _diag_full(xb, yb, zb)
-    denom = max(diag * _get_diag_scale(env), 1e-6)
+    axis_range = torch.tensor(
+        [
+            float(xb[1]) - float(xb[0]),
+            float(yb[1]) - float(yb[0]),
+            float(zb[1]) - float(zb[0]),
+        ],
+        device=delta.device,
+        dtype=torch.float32,
+    )
 
-    out = delta / float(denom)
+    axis_range = torch.clamp(axis_range, min=1e-6)
+    out = delta / axis_range
+
     return _clamp_m11(out)
 
 

@@ -195,7 +195,7 @@ class Test6RewardsCfg:
     vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=2.0, params={})
 
     # stabilization / regularization
-    height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.1, params={})
+    height = RewTerm(func=my_mdp.reward_height_tracking, weight=10.0, params={})
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.05, params={})
 
     # safety & effort

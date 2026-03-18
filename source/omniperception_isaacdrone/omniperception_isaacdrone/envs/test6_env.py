@@ -678,8 +678,9 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         n = env_ids.numel()
         gx = (torch.rand(n, device=self.device) * 2 - 1) * square_half_size
         gy = (torch.rand(n, device=self.device) * 2 - 1) * square_half_size
-        gz = torch.rand(n, device=self.device) * (goal_z_max - goal_z_min) + goal_z_min
-
+        # gz = torch.rand(n, device=self.device) * (goal_z_max - goal_z_min) + goal_z_min
+        gz = 5.0
+        
         self.goal_pos_w[env_ids, 0] = gx
         self.goal_pos_w[env_ids, 1] = gy
         self.goal_pos_w[env_ids, 2] = gz
