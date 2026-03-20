@@ -38,25 +38,25 @@ parser.add_argument("--state_dim", type=int, default=17)
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
 
-parser.add_argument("--rollouts", type=int, default=512)
-parser.add_argument("--learning_epochs", type=int, default=4)
-parser.add_argument("--mini_batches", type=int, default=16)
-parser.add_argument("--learning_rate", type=float, default=3e-4)
+parser.add_argument("--rollouts", type=int, default=256)
+parser.add_argument("--learning_epochs", type=int, default=8)
+parser.add_argument("--mini_batches", type=int, default=8)
+parser.add_argument("--learning_rate", type=float, default=1e-4)
 parser.add_argument("--_lambda", type=float, default=0.97)
-parser.add_argument("--discount_factor", type=float, default=0.999)
+parser.add_argument("--discount_factor", type=float, default=0.99)
 
 parser.add_argument("--ratio_clip", type=float, default=0.2)
 parser.add_argument("--value_clip", type=float, default=0.2)
 parser.add_argument("--value_loss_scale", type=float, default=0.5)
-parser.add_argument("--grad_norm_clip", type=float, default=0.5)
-parser.add_argument("--entropy_coef", type=float, default=5e-3)
+parser.add_argument("--grad_norm_clip", type=float, default=1.0)
+parser.add_argument("--entropy_coef", type=float, default=1e-2)
 parser.add_argument("--kl_threshold", type=float, default=0.01)
 parser.add_argument("--clip_predicted_values", action="store_true")
 parser.add_argument("--no_clip_predicted_values", dest="clip_predicted_values", action="store_false")
 parser.set_defaults(clip_predicted_values=True)
 
 parser.add_argument("--reward_scale", type=float, default=0.1)
-parser.add_argument("--reward_clip", type=float, default=500.0)
+parser.add_argument("--reward_clip", type=float, default=100.0)
 
 parser.add_argument("--tb_interval", type=int, default=500)
 parser.add_argument("--dist_interval", type=int, default=500)
@@ -1294,6 +1294,8 @@ def main() -> None:
         num_envs=args.num_envs,
         use_fabric=not args.disable_fabric,
     )
+    env_cfg.scene.replicate_physics = True
+    env_cfg.scene.filter_collisions = True
 
     curriculum_levels = get_cfg_obstacle_curriculum_levels(env_cfg)
     required_shared_obstacles = max(
@@ -1349,13 +1351,13 @@ def main() -> None:
         visual_scale=(20.0, 20.0, 10.0),
     )
 
-    base_env.scene.filter_collisions(
-        global_prim_paths=[
-            "/World/ground",
-            "/World/Obstacles",
-            "/World/Wall",
-        ]
-    )
+    # base_env.scene.filter_collisions(
+    #     global_prim_paths=[
+    #         "/World/ground",
+    #         "/World/Obstacles",
+    #         "/World/Wall",
+    #     ]
+    # )
 
     space = getattr(base_env, "single_observation_space", None)
     policy_space = (

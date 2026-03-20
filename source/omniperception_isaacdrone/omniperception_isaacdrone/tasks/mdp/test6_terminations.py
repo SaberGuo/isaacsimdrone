@@ -96,7 +96,21 @@ def termination_collision(
         f_norm = torch.norm(fm_sel, dim=-1)
         f_norm = torch.nan_to_num(f_norm, nan=0.0, posinf=0.0, neginf=0.0)
         max_force = f_norm.reshape(f_norm.shape[0], -1).max(dim=-1).values
-        return max_force > float(threshold)
+
+        collided = max_force > float(threshold)
+
+        collided_env_ids = torch.nonzero(collided, as_tuple=False).squeeze(-1)
+        if collided_env_ids.numel() > 0:
+            root_pos = mdp.root_pos_w(env, asset_cfg=SceneEntityCfg("robot"))
+            for env_id in collided_env_ids.tolist():
+                pos = root_pos[env_id]
+                print(
+                    f"[COLLISION] env={env_id} root_pos=({pos[0].item():.4f}, {pos[1].item():.4f}, {pos[2].item():.4f}) "
+                    f"max_force={max_force[env_id].item():.4f}",
+                    flush=True,
+                )
+
+        return collided
 
     # fallback: net forces
     nf_hist = getattr(data, "net_forces_w_history", None)
@@ -113,4 +127,18 @@ def termination_collision(
     nf_sel = nf[:, body_ids, :]
     f_norm = torch.norm(nf_sel, dim=-1)
     max_force = f_norm.reshape(f_norm.shape[0], -1).max(dim=-1).values
-    return max_force > float(threshold)
+
+    collided = max_force > float(threshold)
+
+    collided_env_ids = torch.nonzero(collided, as_tuple=False).squeeze(-1)
+    if collided_env_ids.numel() > 0:
+        root_pos = mdp.root_pos_w(env, asset_cfg=SceneEntityCfg("robot"))
+        for env_id in collided_env_ids.tolist():
+            pos = root_pos[env_id]
+            print(
+                f"[COLLISION] env={env_id} root_pos=({pos[0].item():.4f}, {pos[1].item():.4f}, {pos[2].item():.4f}) "
+                f"max_force={max_force[env_id].item():.4f}",
+                flush=True,
+            )
+
+    return collided

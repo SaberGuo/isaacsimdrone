@@ -145,7 +145,7 @@ class ObstacleSpawner:
         ObstacleSpawner._active_count = self.num_obstacles
 
         print(f"\n[INFO]: 正在生成 {self.num_obstacles} 个共享障碍物(静态/kinematic)...", flush=True)
-        for i in range(self.num_obstacles):
+        for i in range(0):
             x_pos = np.random.uniform(*self.x_range)
             y_pos = np.random.uniform(*self.y_range)
             z_pos = self.z_height / 2.0
@@ -340,7 +340,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._goal_vis_paths: list[str] = []
 
         # metadata used by the training script
-        self.policy_state_dim = 16
+        self.policy_state_dim = 17
         self.policy_lidar_dim = 0
         self._batched_observation_space = None
         self._batched_action_space = None

@@ -109,7 +109,7 @@ class Test6SceneCfg(InteractiveSceneCfg):
     )
 
     contact_sensor: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*",
+        prim_path="{ENV_REGEX_NS}/Robot/body",
         update_period=0.0,
         history_length=1,
         debug_vis=False,
@@ -189,25 +189,25 @@ class Test6EventCfg:
 
 @configclass
 class Test6RewardsCfg:
-    # goal shaping
-    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=20.0, params={})
-    dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=2.0, params={})
-    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=2.0, params={})
+    # ---- 密集导航奖励（主信号，per-step 量级 O(0.1~1)） ----
+    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=40.0, params={})
+    dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=5.0, params={})
+    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=8.0, params={})
 
-    # stabilization / regularization
-    height = RewTerm(func=my_mdp.reward_height_tracking, weight=10.0, params={})
+    # ---- 稳定性奖励 ----
+    height = RewTerm(func=my_mdp.reward_height_tracking, weight=8.0, params={})
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.05, params={})
 
-    # safety & effort
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-2000.0, params={})
-    energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.05, params={})
-    action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.002)
+    # ---- 安全惩罚 ----
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-200.0, params={})
+    energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.02, params={})
+    action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.005)
 
-    # terminal signals
-    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=10000.0, params={})
-    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-12000.0, params={})
-    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-10000.0, params={})
-    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-10000.0, params={})
+    # ---- 终端信号（与密集累计量级可比） ----
+    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=800.0, params={})
+    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-800.0, params={})
+    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-800.0, params={})
+    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-500.0, params={})
 
 
 @configclass
@@ -255,6 +255,8 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         WORKSPACE_Y = (-80.0, 80.0)
         WORKSPACE_Z = (0.0, 10.0)
         GOAL_RADIUS = 2.5
+
+
 
         self.normalization.x_bounds = WORKSPACE_X
         self.normalization.y_bounds = WORKSPACE_Y
@@ -307,7 +309,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         }
         self.rewards.dist_to_goal.params = {
             "asset_cfg": SceneEntityCfg("robot"),
-            "std": 15.0,
+            "std": 50.0,
         }
         self.rewards.height.params = {
             "asset_cfg": SceneEntityCfg("robot"),
@@ -316,7 +318,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         }
         self.rewards.stability.params = {
             "asset_cfg": SceneEntityCfg("robot"),
-            "lin_std": 2.0,
+            "lin_std": 4.0,
             "ang_std": 6.0,
         }
         self.rewards.vel_towards_goal.params = {
@@ -330,8 +332,8 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "lidar_name": "lidar",
             "safe_dist": None,
             "safe_dist_ratio": 0.1,
-            "exp_scale": 1.0,
-            "cap": 5.0,
+            "exp_scale": 2.0,
+            "cap": 3.0,
             "use_grid": True,
             "theta_min": 30.0,
             "theta_max": 90.0,
@@ -383,7 +385,8 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             )
         else:
             self.curriculum.obstacle_count = None
-
+        self.scene.replicate_physics = True
+        self.scene.filter_collisions = True
 
 @configclass
 class Test6DroneLidarEnvCfg(Test6DroneEnvCfg):
