@@ -19,6 +19,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, LidarSensorCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
+from isaaclab.assets import RigidObjectCfg
 
 from omniperception_isaacdrone.assets.robots.drone_cfg import DRONE_CFG, DRONE_MASS
 
@@ -113,11 +114,6 @@ class Test6SceneCfg(InteractiveSceneCfg):
         update_period=0.0,
         history_length=1,
         debug_vis=False,
-        # filter_prim_paths_expr=[
-        #     "/World/Obstacles/.*",
-        #     "/World/Wall/.*",
-        #     "/World/ground",
-        # ],
     )
 
     dome_light = AssetBaseCfg(
@@ -129,7 +125,13 @@ class Test6SceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.DistantLightCfg(intensity=3000.0, color=(0.9, 0.9, 0.9), angle=0.53),
         init_state=AssetBaseCfg.InitialStateCfg(rot=(0.738, 0.477, 0.477, 0.0)),
     )
-
+    obstacles: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/Obstacles/obj_.*",  # 修改为全局路径，即每个env共享碰撞
+        spawn=None,
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(1000.0, 1000.0, -1000.0)
+        )
+    )
 
 @configclass
 class Test6SceneWithLidarCfg(Test6SceneCfg):
@@ -159,7 +161,6 @@ class Test6ObservationsCfg:
         projected_gravity = ObsTerm(func=my_mdp.obs_projected_gravity_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         goal_delta = ObsTerm(func=my_mdp.obs_goal_delta_norm, params={"asset_cfg": SceneEntityCfg("robot")})
 
-        # 6 x 72 = 432
         lidar_grid = ObsTerm(
             func=my_mdp.obs_lidar_min_range_grid,
             params=dict(
@@ -184,8 +185,22 @@ class Test6ObservationsCfg:
 
 @configclass
 class Test6EventCfg:
-    reset_robot_base = EventTerm(func=my_mdp.reset_root_state_on_square_edge, mode="reset", params={})
-
+    reset_robot_base = EventTerm(func=my_mdp.reset_root_state_on_square_edge, mode="reset", params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "square_half_size": 35.0,
+        "z_range": (3.0, 7.0),
+    })
+    
+    randomize_obstacles = EventTerm(
+        func=my_mdp.randomize_obstacles_on_reset,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("obstacles"),
+            "x_range": (-33.0, 33.0),
+            "y_range": (-33.0, 33.0),
+            "z_height": 10.0,
+        }
+    )
 
 @configclass
 class Test6RewardsCfg:
@@ -221,9 +236,15 @@ class Test6TerminationsCfg:
 @configclass
 class Test6CurriculumCfg:
     obstacle_count = CurrTerm(
-        func=my_mdp.curriculum_obstacle_count_by_success,
-        params={},
+        func=my_mdp.update_obstacle_curriculum,
+        params={
+            "levels": (30, 10, 20, 40, 60, 100),
+            "success_term_name": "reached_goal",
+            "success_threshold": 0.8,
+            "window_size": 200,
+        }
     )
+
 
 
 @configclass
@@ -246,7 +267,6 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 1.0 / 60.0
         self.sim.render_interval = self.decimation
         self.episode_length_s = 30.0
-        # max_steps = int(self.episode_length_s / (self.sim.dt * self.decimation))
 
         self.viewer.eye = (60.0, 60.0, 40.0)
         self.viewer.lookat = (0.0, 0.0, 5.0)
@@ -255,8 +275,6 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         WORKSPACE_Y = (-80.0, 80.0)
         WORKSPACE_Z = (0.0, 10.0)
         GOAL_RADIUS = 2.5
-
-
 
         self.normalization.x_bounds = WORKSPACE_X
         self.normalization.y_bounds = WORKSPACE_Y
@@ -370,21 +388,6 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "threshold": 1.0,
         }
 
-        if self.obstacle_curriculum.enabled:
-            self.curriculum.obstacle_count = CurrTerm(
-                func=my_mdp.curriculum_obstacle_count_by_success,
-                params={
-                    "levels": tuple(int(v) for v in self.obstacle_curriculum.levels),
-                    "initial_level": int(self.obstacle_curriculum.initial_level),
-                    "success_term_name": str(self.obstacle_curriculum.success_term_name),
-                    "success_threshold": float(self.obstacle_curriculum.success_threshold),
-                    "window_size": int(self.obstacle_curriculum.window_size),
-                    "min_samples": int(self.obstacle_curriculum.min_samples),
-                    "clear_history_on_promotion": bool(self.obstacle_curriculum.clear_history_on_promotion),
-                },
-            )
-        else:
-            self.curriculum.obstacle_count = None
         self.scene.replicate_physics = True
         self.scene.filter_collisions = True
 

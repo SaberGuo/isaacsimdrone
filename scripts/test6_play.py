@@ -21,10 +21,10 @@ parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lida
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 
 parser.add_argument("--num_envs", type=int, default=1)
-parser.add_argument("--num_obstacles", type=int, default=50)
+parser.add_argument("--num_obstacles", type=int, default=100)  # 修改为默认 100，与训练脚本对齐
 parser.add_argument("--seed", type=int, default=42)
 
-parser.add_argument("--state_dim", type=int, default=19)
+parser.add_argument("--state_dim", type=int, default=17)       # 修改为默认 17 维，与训练脚本对齐
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
 
@@ -32,7 +32,7 @@ parser.add_argument(
     "--checkpoint",
     type=str,
     default="",
-    help="Checkpoint path. If empty, auto खोज/查找 the latest under logs/",
+    help="Checkpoint path. If empty, auto search the latest under logs/",
 )
 parser.add_argument(
     "--use_stochastic_policy",
@@ -84,29 +84,19 @@ from isaaclab_tasks.utils import parse_env_cfg
 import isaacsim.core.utils.prims as prim_utils
 from pxr import UsdGeom, Gf
 
-from omniperception_isaacdrone.envs.test6_env import ObstacleSpawner, WallSpawner
+# 替换旧的 ObstacleSpawner，使用统一的全局障碍物生成函数
+from omniperception_isaacdrone.envs.test6_env import WallSpawner, setup_global_obstacles
 
 
 # -----------------------------------------------------------------------------
 # Names
 # -----------------------------------------------------------------------------
-STATE_OBS_NAMES_16 = [
-    "root_quat_w",
-    "root_quat_x",
-    "root_quat_y",
-    "root_quat_z",
-    "root_lin_vel_x",
-    "root_lin_vel_y",
-    "root_lin_vel_z",
-    "root_ang_vel_x",
-    "root_ang_vel_y",
-    "root_ang_vel_z",
-    "projected_gravity_x",
-    "projected_gravity_y",
-    "projected_gravity_z",
-    "goal_delta_x",
-    "goal_delta_y",
-    "goal_delta_z",
+STATE_OBS_NAMES_17 = [
+    "root_pos_z", "root_quat_w", "root_quat_x", "root_quat_y", "root_quat_z",
+    "root_lin_vel_x", "root_lin_vel_y", "root_lin_vel_z",
+    "root_ang_vel_x", "root_ang_vel_y", "root_ang_vel_z",
+    "projected_gravity_x", "projected_gravity_y", "projected_gravity_z",
+    "goal_delta_x", "goal_delta_y", "goal_delta_z",
 ]
 
 ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
@@ -126,7 +116,6 @@ def scale_robot_visual_only(num_envs: int, visual_scale=(20.0, 20.0, 10.0)) -> N
         prim = stage.GetPrimAtPath(visual_path)
 
         if not prim.IsValid():
-            print(f"[WARN] visual prim not found: {visual_path}", flush=True)
             continue
 
         xform = UsdGeom.Xformable(prim)
@@ -137,8 +126,6 @@ def scale_robot_visual_only(num_envs: int, visual_scale=(20.0, 20.0, 10.0)) -> N
             scale_ops[0].Set(Gf.Vec3f(sx, sy, sz))
         else:
             xform.AddScaleOp().Set(Gf.Vec3f(sx, sy, sz))
-
-        print(f"[INFO] visual-only scale set on {visual_path}: {(sx, sy, sz)}", flush=True)
 
 
 def format_array_preview(x: np.ndarray, max_items: int = 16) -> str:
@@ -160,8 +147,6 @@ def print_space_bounds(name: str, space: gym.Space) -> None:
 
     if isinstance(space, gym.spaces.Box):
         print(f"[SPACE] {name}.shape={space.shape}, dtype={space.dtype}", flush=True)
-        print(f"[SPACE] {name}.low preview={format_array_preview(space.low)}", flush=True)
-        print(f"[SPACE] {name}.high preview={format_array_preview(space.high)}", flush=True)
         return
 
     print(f"[SPACE] {name} = {space}", flush=True)
@@ -408,8 +393,8 @@ class Policy(nn.Module):
 
 
 def build_state_names(state_dim: int) -> list[str]:
-    if int(state_dim) == len(STATE_OBS_NAMES_16):
-        return list(STATE_OBS_NAMES_16)
+    if int(state_dim) == len(STATE_OBS_NAMES_17):
+        return list(STATE_OBS_NAMES_17)
     return [f"state_{i}" for i in range(int(state_dim))]
 
 
@@ -529,11 +514,11 @@ def main() -> None:
     except Exception:
         pass
 
-    print("[INFO] Spawning shared obstacles...", flush=True)
-    ObstacleSpawner(
-        num_obstacles=int(args.num_obstacles),
-        seed=int(args.seed),
-    ).spawn_obstacles()
+    # ---------------------------------------------------------
+    # 强制使能碰撞和物理同步，与训练脚本对齐
+    # ---------------------------------------------------------
+    env_cfg.scene.replicate_physics = True
+    env_cfg.scene.filter_collisions = True
 
     print("[INFO] Spawning workspace walls...", flush=True)
     WallSpawner(
@@ -543,14 +528,20 @@ def main() -> None:
         wall_thickness=0.5,
         color=(0.7, 0.7, 0.2),
         wall_colors={
-        "Wall_XMin": (0.5, 1.0, 1.0),  
-        "Wall_XMax": (1.0, 1.0, 0.5),  
-        "Wall_YMin": (0.0, 1.0, 1.0),  
-        "Wall_YMax": (1.0, 1.0, 0.0),  
-        "Wall_ZMin": (1.0, 1.0, 1.0),  
-        "Wall_ZMax": (0.0, 0.0, 0.0),  
-    },
+            "Wall_XMin": (0.5, 1.0, 1.0),  
+            "Wall_XMax": (1.0, 1.0, 0.5),  
+            "Wall_YMin": (0.0, 1.0, 1.0),  
+            "Wall_YMax": (1.0, 1.0, 0.0),  
+            "Wall_ZMin": (1.0, 1.0, 1.0),  
+            "Wall_ZMax": (0.0, 0.0, 0.0),  
+        },
     ).spawn_walls()
+
+    # ---------------------------------------------------------
+    # 调用统一的全局障碍物生成器
+    # ---------------------------------------------------------
+    print("[INFO] Setting up global obstacles template...", flush=True)
+    setup_global_obstacles(int(args.num_obstacles))
 
     print("[INFO] Creating env...", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
@@ -558,14 +549,6 @@ def main() -> None:
     scale_robot_visual_only(
         num_envs=base_env.num_envs,
         visual_scale=(20.0, 20.0, 10.0),
-    )
-
-    base_env.scene.filter_collisions(
-        global_prim_paths=[
-            "/World/ground",
-            "/World/Obstacles",
-            "/World/Wall",
-        ]
     )
 
     space = getattr(base_env, "single_observation_space", None)
@@ -723,10 +706,10 @@ def main() -> None:
 
                 episode_idx += len(done_ids_list)
 
+                # IsaacLab 的 ManagerBasedRLEnv 通常在 done 的时候会自动返回重置后的 obs
+                # 这里我们仅对用户可能强制要求二次 reset 做个兜底。通常在 IsaacLab 里这段逻辑是不必要的
                 if args.reset_on_done:
-                    # ---------------------------------------------------------
-                    # Only reset done envs instead of resetting all envs
-                    # ---------------------------------------------------------
+                    # 避免对整个环境重复 reset，只刷新状态
                     reset_obs, reset_infos = env.reset(env_ids=done_ids)
                     reset_states = sanitize_states(
                         ensure_obs_shape(extract_policy_obs(reset_obs), num_envs, obs_dim),
@@ -734,7 +717,6 @@ def main() -> None:
                         lidar_dim=lidar_dim,
                     )
 
-                    # only overwrite the states of done envs
                     next_states[done_ids] = reset_states[done_ids]
 
                     maybe_print_goal(base_env, env_ids=done_ids_list)

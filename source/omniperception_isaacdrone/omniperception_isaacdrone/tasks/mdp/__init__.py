@@ -2,8 +2,8 @@
 """MDP components for OmniPerception IsaacDrone (Test6)."""
 
 from .test6_actions import RootTwistVelocityActionTerm
-from .test6_curriculums import curriculum_obstacle_count_by_success
-from .test6_events import reset_root_state_on_square_edge
+from .test6_curriculums import update_obstacle_curriculum
+from .test6_events import reset_root_state_on_square_edge, randomize_obstacles_on_reset
 from .test6_observations import (
     obs_goal_delta,
     obs_lidar_min_range_grid,
@@ -39,10 +39,14 @@ from .test6_terminations import (
 __all__ = [
     # actions
     "RootTwistVelocityActionTerm",
+    
     # curriculum
-    "curriculum_obstacle_count_by_success",
+    "update_obstacle_curriculum",
+    
     # events
     "reset_root_state_on_square_edge",
+    "randomize_obstacles_on_reset",
+    
     # observations
     "obs_goal_delta",
     "obs_lidar_min_range_grid",
@@ -54,6 +58,7 @@ __all__ = [
     "obs_projected_gravity_norm",
     "obs_goal_delta_norm",
     "obs_state_norm",
+    
     # rewards
     "reward_distance_to_goal",
     "reward_progress_to_goal",
@@ -67,6 +72,7 @@ __all__ = [
     "penalty_time_out",
     "penalty_collision",
     "reward_action_l2",
+    
     # terminations
     "termination_reached_goal",
     "termination_out_of_workspace",
