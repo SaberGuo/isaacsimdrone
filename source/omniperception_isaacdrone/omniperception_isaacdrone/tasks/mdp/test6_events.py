@@ -12,7 +12,7 @@ def reset_root_state_on_square_edge(
     square_half_size: float = 35.0,
     z_range: tuple = (3.0, 7.0),
 ):
-    """将无人机 root pose 随机初始化到 square 边界上，速度清零。"""
+    """将无人机 root pose 随机初始化到 square 边界上，并在其对角生成带扰动的 Goal。"""
     asset = env.scene[asset_cfg.name]
     num_resets = len(env_ids)
 
@@ -39,11 +39,32 @@ def reset_root_state_on_square_edge(
     orientations = torch.zeros((num_resets, 4), device=env.device)
     orientations[:, 0] = 1.0  # w
 
+    # 写入机器人位姿和速度
     root_states = torch.cat([positions, orientations], dim=1)
     asset.write_root_pose_to_sim(root_states, env_ids=env_ids)
 
     velocities = torch.zeros((num_resets, 6), device=env.device)
     asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
+
+    # ---------------------------------------------------------
+    # 新增：直接利用刚生成的无人机 position，将 Goal 设置在对面
+    # ---------------------------------------------------------
+    if hasattr(env.unwrapped, "goal_pos_w"):
+        # 基础坐标取反：(-x, -y)
+        target_x = -positions[:, 0]
+        target_y = -positions[:, 1]
+        
+        # 加上小范围的随机扰动 [-5.0, 5.0]
+        noise_x = (torch.rand_like(target_x) * 2.0 - 1.0) * 5.0
+        noise_y = (torch.rand_like(target_y) * 2.0 - 1.0) * 5.0
+        
+        env.unwrapped.goal_pos_w[env_ids, 0] = target_x + noise_x
+        env.unwrapped.goal_pos_w[env_ids, 1] = target_y + noise_y
+        env.unwrapped.goal_pos_w[env_ids, 2] = 5.0
+        
+        # 更新红色的 Goal 可视化小球
+        if hasattr(env.unwrapped, "_update_goal_visualizers"):
+            env.unwrapped._update_goal_visualizers(env_ids)
 
 
 def randomize_obstacles_on_reset(

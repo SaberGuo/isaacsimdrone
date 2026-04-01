@@ -52,12 +52,12 @@ class NormalizationCfg:
 @configclass
 class ObstacleCurriculumSettingsCfg:
     enabled: bool = True
-    levels: tuple[int, ...] = (0, 10, 20, 40, 60, 100)
+    levels: tuple[int, ...] = (0, 10, 15, 20, 30, 50)
     initial_level: int = 0
 
     # Promotion criterion: recent reached_goal ratio
     success_term_name: str = "reached_goal"
-    success_threshold: float = 0.8
+    success_threshold: float = 0.9
 
     # Rolling window over recent terminated episodes
     window_size: int = 200
@@ -214,7 +214,7 @@ class Test6RewardsCfg:
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.05, params={})
 
     # ---- 安全惩罚 ----
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-200.0, params={})
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-1000.0, params={})
     energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.02, params={})
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.005)
 
@@ -238,9 +238,9 @@ class Test6CurriculumCfg:
     obstacle_count = CurrTerm(
         func=my_mdp.update_obstacle_curriculum,
         params={
-            "levels": (30, 10, 20, 40, 60, 100),
+            "levels": (0, 10, 15, 20, 30, 50),
             "success_term_name": "reached_goal",
-            "success_threshold": 0.8,
+            "success_threshold": 0.9,
             "window_size": 200,
         }
     )
@@ -266,7 +266,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 1
         self.sim.dt = 1.0 / 60.0
         self.sim.render_interval = self.decimation
-        self.episode_length_s = 30.0
+        self.episode_length_s = 45.0
 
         self.viewer.eye = (60.0, 60.0, 40.0)
         self.viewer.lookat = (0.0, 0.0, 5.0)
@@ -349,9 +349,9 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.rewards.lidar_threat.params = {
             "lidar_name": "lidar",
             "safe_dist": None,
-            "safe_dist_ratio": 0.1,
+            "safe_dist_ratio": 0.16,
             "exp_scale": 2.0,
-            "cap": 3.0,
+            "cap": 20.0,
             "use_grid": True,
             "theta_min": 30.0,
             "theta_max": 90.0,
