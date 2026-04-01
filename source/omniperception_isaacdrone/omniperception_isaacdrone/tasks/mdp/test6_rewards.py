@@ -477,6 +477,9 @@ def reward_action_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
 # -----------------------------------------------------------------------------
 # ⑥ Safe Velocity Penalty (NavRL 风格)
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# ⑥ Safe Velocity Penalty (NavRL 风格)
+# -----------------------------------------------------------------------------
 def penalty_safe_vel(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -492,11 +495,13 @@ def penalty_safe_vel(
     max_vis_points: int | None = 12000,
 ) -> torch.Tensor:
     """
-    当进入危险范围时触发，计算当前最优的“安全速度(safe_vel)”，
-    并惩罚无人机当前速度与 safe_vel 之间的方向和大小差异。
+    当进入危险范围，且当前速度方向指向危险区域时触发。
+    计算当前最优的“安全速度(safe_vel)”，并惩罚实际速度与 safe_vel 之间的方向和大小差异。
+    如果当前行进方向已经安全，则不进行惩罚。
     """
     # 1. 获取当前速度与方向
-    v = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg)
+    # 【重要修正】必须使用机体坐标系(base_lin_vel)的速度，以对齐 LiDAR 的局部传感器坐标系
+    v = mdp.base_lin_vel(env, asset_cfg=asset_cfg)
     v_norm = _safe_norm(v)
     v_dir = v / (v_norm.unsqueeze(-1) + 1e-6)
 
@@ -519,21 +524,19 @@ def penalty_safe_vel(
     ) # shape: (N, num_bins)
 
     # 定义紧迫度阈值
-    # closeness = 1.0 - dist / max_d => dist = max_d * (1 - closeness)
     closeness_threshold = 1.0 - (float(safe_dist) / max_d)
     safe_closeness = 1.0 - ((float(safe_dist) + float(margin)) / max_d)
 
-    # 3. 触发条件：如果有网格点的紧迫度超过 closeness_threshold，说明进入了危险范围
+    # 3. 触发条件1：进入危险范围（有任意网格紧迫度超过阈值）
     max_closeness = grid.max(dim=1).values
     threat_mask = max_closeness > closeness_threshold
 
-    # 如果没有任何环境触发危险，直接返回 0
     if not threat_mask.any():
         out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
         _tb_store_reward(env, "safe_vel_penalty", out0)
         return out0
 
-    # 4. 动态构建/获取预计算的网格方向向量 (num_bins, 3)
+    # 4. 动态构建/获取预计算的网格方向向量 (num_bins, 3) 
     cache_key = f"_safe_vel_bins_{theta_min}_{theta_max}_{phi_min}_{phi_max}_{delta_theta}_{delta_phi}"
     bin_dirs = getattr(env, cache_key, None)
     if bin_dirs is None:
@@ -549,7 +552,7 @@ def penalty_safe_vel(
         rad_theta = torch.deg2rad(grid_theta.flatten())
         rad_phi = torch.deg2rad(grid_phi.flatten())
 
-        # 球坐标转笛卡尔坐标 (以 Z 为天顶轴)
+        # 球坐标转笛卡尔坐标 (机体坐标系下，Z向上)
         sin_t = torch.sin(rad_theta)
         bin_x = sin_t * torch.cos(rad_phi)
         bin_y = sin_t * torch.sin(rad_phi)
@@ -557,44 +560,57 @@ def penalty_safe_vel(
         bin_dirs = torch.stack([bin_x, bin_y, bin_z], dim=-1) # (num_bins, 3)
         setattr(env, cache_key, bin_dirs)
 
-    # 5. 在网格中寻找最接近当前速度方向的“安全方向”
-    # 筛选出安全的网格（带裕度）
-    valid_mask = grid <= safe_closeness # shape: (N, num_bins)
-
+    # 5. 【新增逻辑】判断当前行进方向是否安全
     # 计算当前速度方向与所有网格方向的余弦相似度
     cos_sim = torch.einsum('ni,ji->nj', v_dir, bin_dirs) # shape: (N, num_bins)
+    
+    # 找到与当前速度方向最接近的网格索引（无人机当前正朝着该网格飞）
+    current_heading_bin = torch.argmax(cos_sim, dim=1) # (N,)
+    
+    # 获取该方向上的网格紧迫度
+    current_heading_closeness = grid.gather(1, current_heading_bin.unsqueeze(1)).squeeze(1) # (N,)
+    
+    # 当前方向是否属于安全网格
+    is_heading_safe = current_heading_closeness <= safe_closeness
 
-    # 给不安全的网格打上极低的分数，确保选不到它们
+    # 最终触发条件：在危险范围内，且 当前行进方向不安全
+    active_mask = threat_mask & ~is_heading_safe
+
+    # 如果所有无人机要么没在危险区，要么虽然在危险区但已经往安全方向飞了，直接返回0
+    if not active_mask.any():
+        out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
+        _tb_store_reward(env, "safe_vel_penalty", out0)
+        return out0
+
+    # 6. 仅为不安全的无人机寻找最接近当前意图的“安全方向”
+    valid_mask = grid <= safe_closeness # shape: (N, num_bins)
+
+    # 给不安全的网格打上极低的分数 (-2.0)，确保 argmax 选不到它们
     scored_bins = torch.where(valid_mask, cos_sim, torch.full_like(cos_sim, -2.0))
 
-    # 取出每个环境中最优（最顺滑且安全）的网格索引
+    # 取出最优（最顺滑且安全）的网格索引
     best_scores, best_idx = torch.max(scored_bins, dim=1) # (N,)
 
-    # 如果 best_scores <= -1.5，说明所有网格全是不安全的（被障碍物死死包围）
+    # 如果 best_scores <= -1.5，说明周围360度全是障碍物死角（绝境）
     has_safe_bin = best_scores > -1.5
-
-    # 提取选出的安全方向
     chosen_safe_dirs = bin_dirs[best_idx] # (N, 3)
 
-    # 6. 计算最终的 safe_vel
-    # 如果有安全方向，我们希望它朝着那个方向以当前速度大小行驶
-    # 如果处于绝境（没有安全方向），最好的策略是减速或反向倒车，这里设定为原方向取反
+    # 7. 计算最终的 safe_vel 参数
+    # 如果有安全方向，朝着那个方向飞；如果处于绝境，减速或反向倒车 (-v_dir)
     safe_dir_final = torch.where(has_safe_bin.unsqueeze(-1), chosen_safe_dirs, -v_dir)
     safe_v_norm = torch.where(has_safe_bin, v_norm, torch.zeros_like(v_norm))
-    # safe_vel = safe_dir_final * safe_v_norm.unsqueeze(-1) # 实际惩罚计算可以直接拆解为方向和大小，无需组装
 
-    # 7. 计算奖励惩罚项
-    # 方向惩罚: 1.0 - 余弦相似度 (值域 [0, 2]，0表示方向完全一致)
+    # 8. 计算奖励惩罚项
+    # 方向差异惩罚: 1.0 - 余弦相似度 (值域 [0, 2])
     v_safe_cos = torch.sum(v_dir * safe_dir_final, dim=-1)
     dir_penalty = 1.0 - v_safe_cos
 
-    # 大小惩罚: |实际速度 - 安全速度| / 实际速度 (归一化，防止绝对值过大)
+    # 速度大小惩罚: |实际速度 - 安全速度| / 实际速度
     mag_penalty = torch.abs(v_norm - safe_v_norm) / (v_norm + 1e-6)
 
-    # 仅在触发危险的环境计算惩罚
-    penalty = (dir_penalty + mag_penalty) * threat_mask.float()
+    # 仅对满足 active_mask 的环境施加惩罚
+    penalty = (dir_penalty + mag_penalty) * active_mask.float()
 
     _tb_store_reward(env, "safe_vel_penalty", penalty)
-    _tb_store_aux(env, "safe_vel_trigger_ratio", threat_mask.float())
+    _tb_store_aux(env, "safe_vel_trigger_ratio", active_mask.float())
     return penalty
-
