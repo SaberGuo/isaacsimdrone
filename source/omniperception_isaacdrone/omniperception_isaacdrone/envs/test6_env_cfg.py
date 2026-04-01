@@ -215,6 +215,7 @@ class Test6RewardsCfg:
 
     # ---- 安全惩罚 ----
     lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-1000.0, params={})
+    safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-500.0, params={}) 
     energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.02, params={})
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.005)
 
@@ -361,6 +362,23 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "delta_phi": 5.0,
             "max_vis_points": 12000,
         }
+
+        # 配置 NavRL 的 Safe Velocity 参数
+        self.rewards.safe_vel_penalty.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
+            "lidar_name": "lidar",
+            "safe_dist": 6.0,          # 触发判定危险的距离 (假设 max_range为50, 6.0是个合理的提前避障距离)
+            "margin": 2.0,             # 安全方向的裕度 (筛出网格时要求距离大于 6.0+2.0=8.0)
+            # 保持与 observation 中 lidar grid 相同的视野参数
+            "theta_min": 30.0,
+            "theta_max": 90.0,
+            "phi_min": 0.0,
+            "phi_max": 360.0,
+            "delta_theta": 10.0,
+            "delta_phi": 5.0,
+            "max_vis_points": 12000,
+        }
+
 
         self.rewards.energy.params = {
             "asset_cfg": SceneEntityCfg("robot"),

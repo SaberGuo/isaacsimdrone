@@ -17,6 +17,7 @@ from .test6_observations import (
     obs_state_norm,
 )
 from .test6_rewards import (
+    penalty_safe_vel,
     penalty_collision,
     penalty_energy,
     penalty_lidar_threat,
@@ -60,6 +61,7 @@ __all__ = [
     "obs_state_norm",
     
     # rewards
+    "penalty_safe_vel",
     "reward_distance_to_goal",
     "reward_progress_to_goal",
     "reward_height_tracking",
