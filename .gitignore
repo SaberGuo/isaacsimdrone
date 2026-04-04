@@ -57,9 +57,12 @@ _build
 **/runs/*
 **/logs/*
 **/recordings/*
+**/logs_server/*
 
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
 
 # Teleop Recorded Dataset
 datasets
+
+

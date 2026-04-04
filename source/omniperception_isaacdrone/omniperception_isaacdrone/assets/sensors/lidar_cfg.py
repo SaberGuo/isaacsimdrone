@@ -27,7 +27,8 @@ LIDAR_CFG = LidarSensorCfg(
     # 关键：把你想让 LiDAR “看见”的物体路径写进来
     mesh_prim_paths=[
         "/World/ground",
-        "/World/Obstacles",      # 你的障碍物父节点
+        "/World/Obstacles", 
+        "/World/Wall",     # 你的障碍物父节点
     ],
 
     debug_vis=False,            # 想看射线就改 True（也可在脚本里动态改）

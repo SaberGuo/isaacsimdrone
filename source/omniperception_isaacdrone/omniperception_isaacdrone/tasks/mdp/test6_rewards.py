@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import torch
 
 import isaaclab.envs.mdp as mdp
@@ -11,10 +10,11 @@ from isaaclab.managers import SceneEntityCfg
 
 from .test6_observations import obs_lidar_min_range_grid
 from .test6_terminations import (
-    termination_reached_goal,
-    termination_out_of_workspace,
     termination_collision,
+    termination_out_of_workspace,
+    termination_reached_goal,
 )
+from .test6_dijkstra_utils import DijkstraNavigator, batched_dijkstra_reward
 
 
 # -----------------------------------------------------------------------------
@@ -76,7 +76,6 @@ def _get_goal_pos(env: ManagerBasedRLEnv, pos: torch.Tensor) -> torch.Tensor:
 
 
 def _get_step_dt(env: ManagerBasedRLEnv) -> float:
-    # IsaacLab usually provides env.step_dt; if not, fallback to sim.dt * decimation
     if hasattr(env, "step_dt"):
         try:
             return float(env.step_dt)
@@ -85,7 +84,6 @@ def _get_step_dt(env: ManagerBasedRLEnv) -> float:
     try:
         return float(env.cfg.sim.dt) * float(env.cfg.decimation)
     except Exception:
-        # last resort: assume 60Hz RL step
         return 1.0 / 60.0
 
 
@@ -95,7 +93,7 @@ def _get_lidar_max_distance(lidar) -> float:
             return float(lidar.cfg.max_distance)
     except Exception:
         pass
-    return 100.0
+    return 50.0
 
 
 # -----------------------------------------------------------------------------
@@ -103,25 +101,62 @@ def _get_lidar_max_distance(lidar) -> float:
 # -----------------------------------------------------------------------------
 def reward_distance_to_goal(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, std: float = 6.0) -> torch.Tensor:
     """Bounded goal proximity reward: exp(-0.5*(d/std)^2) in (0, 1]."""
-    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)  # (N,3)
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
     goal = _get_goal_pos(env, pos)
 
-    d = _safe_norm(goal - pos)  # (N,)
+    d = _safe_norm(goal - pos)
     std = max(float(std), 1e-6)
 
     r = d / std
     r2 = torch.clamp(r * r, 0.0, 400.0)
     out = torch.exp(-0.5 * r2)
 
-    # cache
     _tb_store_reward(env, "dist_to_goal", out)
     _tb_store_aux(env, "goal_distance", d)
-
     return out
 
 
 # -----------------------------------------------------------------------------
-# (keep) height tracking
+# dense progress reward (approach goal => positive, go away => negative)
+# -----------------------------------------------------------------------------
+def reward_progress_to_goal(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    speed_ref: float = 3.0,
+    clip: float = 1.0,
+) -> torch.Tensor:
+    """Dense shaping reward based on distance decrease to the goal.
+
+    delta_d = prev_dist - current_dist
+    towards_speed = delta_d / step_dt
+    out = clamp(towards_speed / speed_ref, -clip, clip)
+    """
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
+    goal = _get_goal_pos(env, pos)
+    d = _safe_norm(goal - pos)
+
+    prev = getattr(env, "_progress_prev_goal_dist", None)
+    if prev is None or (not isinstance(prev, torch.Tensor)) or prev.shape != d.shape:
+        setattr(env, "_progress_prev_goal_dist", d.detach().clone())
+        towards_speed = torch.zeros_like(d)
+        out = torch.zeros_like(d)
+    else:
+        dt = max(_get_step_dt(env), 1e-6)
+        delta = prev - d
+        towards_speed = delta / dt
+        denom = max(float(speed_ref), 1e-6)
+        out = torch.clamp(towards_speed / denom, min=-float(clip), max=float(clip))
+        env._progress_prev_goal_dist = d.detach().clone()
+
+    out = out.to(torch.float32)
+    _tb_store_reward(env, "progress_to_goal", out)
+    _tb_store_aux(env, "goal_progress_norm", out)
+    _tb_store_aux(env, "goal_progress_speed", towards_speed.to(torch.float32))
+    return out
+
+
+# -----------------------------------------------------------------------------
+# height tracking
 # -----------------------------------------------------------------------------
 def reward_height_tracking(
     env: ManagerBasedRLEnv,
@@ -137,12 +172,11 @@ def reward_height_tracking(
 
     _tb_store_reward(env, "height", out)
     _tb_store_aux(env, "height_error", dz)
-
     return out
 
 
 # -----------------------------------------------------------------------------
-# (keep) stability reward
+# stability reward
 # -----------------------------------------------------------------------------
 def reward_stability(
     env: ManagerBasedRLEnv,
@@ -166,7 +200,6 @@ def reward_stability(
     _tb_store_reward(env, "stability", out)
     _tb_store_aux(env, "lin_speed", _safe_norm(lin))
     _tb_store_aux(env, "ang_speed", _safe_norm(ang))
-
     return out
 
 
@@ -180,47 +213,58 @@ def reward_velocity_towards_goal(
     speed_ref: float = 3.0,
     use_relu: bool = True,
 ) -> torch.Tensor:
+    """Reward the velocity component projected onto the goal direction.
+
+    Compared with the old cos(theta) * speed-factor form, this version directly uses
+    the signed projected speed, so the magnitude is easier to interpret and matches
+    the physical meaning of "moving towards the goal" more closely.
+    """
     pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
     goal = _get_goal_pos(env, pos)
 
-    v = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg)  # (N,3)
-    speed = _safe_norm(v)  # (N,)
+    v = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg)
+    speed = _safe_norm(v)
 
     dir_vec = goal - pos
-    dir_unit = dir_vec / (_safe_norm(dir_vec).unsqueeze(-1) + 1e-6)
+    dir_norm = _safe_norm(dir_vec)
+    dir_unit = dir_vec / (dir_norm.unsqueeze(-1) + 1e-6)
 
-    cos = torch.sum(v * dir_unit, dim=-1) / (speed + 1e-6)
-    cos = torch.clamp(cos, -1.0, 1.0)
+    projected_speed = torch.sum(v * dir_unit, dim=-1)
+    cos = torch.clamp(projected_speed / (speed + 1e-6), -1.0, 1.0)
 
     if use_relu:
-        cos = torch.clamp(cos, min=0.0)
+        projected_speed = torch.clamp(projected_speed, min=0.0)
 
     min_speed = float(min_speed)
     if min_speed > 0.0:
-        cos = torch.where(speed >= min_speed, cos, torch.zeros_like(cos))
+        projected_speed = torch.where(speed >= min_speed, projected_speed, torch.zeros_like(projected_speed))
 
-    speed_ref = float(speed_ref)
-    if speed_ref > 1e-6:
-        speed_fac = torch.clamp(speed / speed_ref, 0.0, 1.0)
-        cos = cos * speed_fac
+    denom = max(float(speed_ref), 1e-6)
+    if use_relu:
+        out = torch.clamp(projected_speed / denom, 0.0, 1.0)
+    else:
+        out = torch.clamp(projected_speed / denom, -1.0, 1.0)
 
-    _tb_store_reward(env, "vel_towards_goal", cos)
+    out = out.to(torch.float32)
+    _tb_store_reward(env, "vel_towards_goal", out)
     _tb_store_aux(env, "speed", speed)
-
-    return cos
+    _tb_store_aux(env, "goal_direction_cos", cos)
+    _tb_store_aux(env, "towards_speed", projected_speed.to(torch.float32))
+    return out
 
 
 # -----------------------------------------------------------------------------
-# ② collision threat penalty from LiDAR (raw or grid)
+# ② LiDAR safety penalty
 # -----------------------------------------------------------------------------
 def penalty_lidar_threat(
     env: ManagerBasedRLEnv,
     lidar_name: str = "lidar",
-    threshold: float = 1.2,
-    exp_scale: float = 0.25,
+    safe_dist: float | None = None,
+    safe_dist_ratio: float = 0.1,
+    exp_scale: float = 1.0,
     cap: float = 5.0,
-    use_grid: bool = False,
-    # grid parameters (only used when use_grid=True)
+    use_grid: bool = True,
+    threshold: float | None = None,
     theta_min: float = 30.0,
     theta_max: float = 90.0,
     phi_min: float = 0.0,
@@ -229,7 +273,6 @@ def penalty_lidar_threat(
     delta_phi: float = 5.0,
     max_vis_points: int | None = None,
 ) -> torch.Tensor:
-    threshold = float(threshold)
     exp_scale = max(float(exp_scale), 1e-6)
     cap = float(cap)
 
@@ -244,19 +287,13 @@ def penalty_lidar_threat(
     env_ids = torch.arange(env.num_envs, device=env.device)
     max_d = _get_lidar_max_distance(lidar)
 
-    if not bool(use_grid):
-        dist = lidar.get_distances(env_ids)
-        if dist is None:
-            _tb_store_reward(env, "lidar_threat", out0)
-            return out0
-        if dist.dim() == 1:
-            dist = dist.unsqueeze(0)
-        dist = dist.to(dtype=torch.float32)
+    if safe_dist is None and threshold is not None:
+        safe_dist = float(threshold)
+    if safe_dist is None:
+        safe_dist = float(safe_dist_ratio) * float(max_d)
+    safe_dist = float(safe_dist)
 
-        dist = torch.where(torch.isfinite(dist), dist, torch.full_like(dist, max_d))
-        dist = torch.where(dist > 0.0, dist, torch.full_like(dist, max_d))
-        min_dist = dist.min(dim=1).values  # (N,)
-    else:
+    if bool(use_grid):
         grid = obs_lidar_min_range_grid(
             env,
             lidar_name=lidar_name,
@@ -266,49 +303,60 @@ def penalty_lidar_threat(
             phi_max=phi_max,
             delta_theta=delta_theta,
             delta_phi=delta_phi,
-            empty_value=max_d,
+            empty_value=0.0,
             max_vis_points=max_vis_points,
+            max_distance=max_d,
         )
-        min_dist = grid.min(dim=1).values
+        max_close = grid.max(dim=1).values
+        min_dist = float(max_d) * (1.0 - max_close)
+    else:
+        dist = lidar.get_distances(env_ids)
+        if dist is None:
+            _tb_store_reward(env, "lidar_threat", out0)
+            return out0
+        if dist.dim() == 1:
+            dist = dist.unsqueeze(0)
+        dist = dist.to(dtype=torch.float32)
+        dist = torch.where(torch.isfinite(dist), dist, torch.full_like(dist, max_d))
+        dist = torch.where(dist > 0.0, dist, torch.full_like(dist, max_d))
+        min_dist = dist.min(dim=1).values
 
-    x = (threshold - min_dist) / exp_scale
-    x = torch.clamp(x, min=0.0)
-
-    if cap > 0.0:
-        x_cap = math.log(cap + 1.0)
-        x = torch.clamp(x, max=x_cap)
-
+    delta = safe_dist - min_dist
+    x = torch.clamp(delta / exp_scale, min=0.0)
     pen = torch.expm1(x).to(torch.float32)
+
     if cap > 0.0:
         pen = torch.clamp(pen, 0.0, cap)
 
     _tb_store_reward(env, "lidar_threat", pen)
     _tb_store_aux(env, "lidar_min_dist", min_dist)
-
+    _tb_store_aux(env, "lidar_safe_dist", torch.full_like(min_dist, safe_dist))
     return pen
 
 
 # -----------------------------------------------------------------------------
-# ③ energy penalty (v, w, a, alpha) with finite difference
+# ③ energy penalty
 # -----------------------------------------------------------------------------
 def penalty_energy(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
-    lin_vel_scale: float = 5.0,
-    ang_vel_scale: float = 8.0,
-    lin_acc_scale: float = 15.0,
-    ang_acc_scale: float = 25.0,
+    lin_vel_scale: float = 6.0,
+    ang_vel_scale: float = 10.0,
+    lin_acc_scale: float = 50.0,
+    ang_acc_scale: float = 80.0,
     include_acc: bool = True,
+    acc_weight: float = 0.2,
     max_penalty: float = 10.0,
 ) -> torch.Tensor:
     lin_vel_scale = max(float(lin_vel_scale), 1e-6)
     ang_vel_scale = max(float(ang_vel_scale), 1e-6)
     lin_acc_scale = max(float(lin_acc_scale), 1e-6)
     ang_acc_scale = max(float(ang_acc_scale), 1e-6)
+    acc_weight = max(float(acc_weight), 0.0)
     max_penalty = float(max_penalty)
 
-    v = mdp.base_lin_vel(env, asset_cfg=asset_cfg)
-    w = mdp.base_ang_vel(env, asset_cfg=asset_cfg)
+    v = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg)
+    w = mdp.root_ang_vel_w(env, asset_cfg=asset_cfg)
 
     v_norm = _safe_norm(v)
     w_norm = _safe_norm(w)
@@ -339,8 +387,11 @@ def penalty_energy(
             setattr(env, "_energy_prev_lin_vel_w", v.detach().clone())
             setattr(env, "_energy_prev_ang_vel_w", w.detach().clone())
         else:
-            a = (v - prev_v) / dt
-            alpha = (w - prev_w) / dt
+            dv = torch.clamp(v - prev_v, min=-10.0 * dt, max=10.0 * dt)
+            dw = torch.clamp(w - prev_w, min=-20.0 * dt, max=20.0 * dt)
+
+            a = dv / dt
+            alpha = dw / dt
 
             a_norm = _safe_norm(a)
             alpha_norm = _safe_norm(alpha)
@@ -351,21 +402,22 @@ def penalty_energy(
             env._energy_prev_lin_vel_w = v.detach().clone()
             env._energy_prev_ang_vel_w = w.detach().clone()
 
-    pen = pv + pw + pa + palpha
+    pen = pv + pw + acc_weight * (pa + palpha)
+
     if max_penalty > 0.0:
         pen = torch.clamp(pen, 0.0, max_penalty)
 
-    _tb_store_reward(env, "energy", pen.to(torch.float32))
+    pen = pen.to(torch.float32)
+    _tb_store_reward(env, "energy", pen)
     _tb_store_aux(env, "energy_lin_speed", v_norm)
     _tb_store_aux(env, "energy_ang_speed", w_norm)
     _tb_store_aux(env, "energy_lin_acc", a_norm)
     _tb_store_aux(env, "energy_ang_acc", alpha_norm)
-
-    return pen.to(torch.float32)
+    return pen
 
 
 # -----------------------------------------------------------------------------
-# ⑤ termination-related rewards / penalties (wrappers that output float)
+# ⑤ termination-related rewards / penalties
 # -----------------------------------------------------------------------------
 def reward_goal_reached(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, threshold: float = 1.0) -> torch.Tensor:
     out = termination_reached_goal(env, asset_cfg=asset_cfg, threshold=threshold).to(torch.float32)
@@ -381,7 +433,11 @@ def penalty_out_of_workspace(
     z_bounds: tuple[float, float] = (0.0, 10.0),
 ) -> torch.Tensor:
     out = termination_out_of_workspace(
-        env, asset_cfg=asset_cfg, x_bounds=x_bounds, y_bounds=y_bounds, z_bounds=z_bounds
+        env,
+        asset_cfg=asset_cfg,
+        x_bounds=x_bounds,
+        y_bounds=y_bounds,
+        z_bounds=z_bounds,
     ).to(torch.float32)
     _tb_store_reward(env, "oob_penalty", out)
     return out
@@ -404,11 +460,238 @@ def penalty_collision(
 
 
 # -----------------------------------------------------------------------------
-# (keep) action L2 (already used as penalty via negative weight)
+# Action regularization
 # -----------------------------------------------------------------------------
 def reward_action_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """L2 penalty on raw actions to encourage smooth control."""
     term = env.action_manager.get_term("root_twist")
     a = term.raw_actions
-    out = torch.sum(a * a, dim=-1)
-    _tb_store_reward(env, "action_l2", out.to(torch.float32))
-    return out
+    return (a * a).sum(dim=-1)
+
+
+# -----------------------------------------------------------------------------
+# Dijkstra-based navigation reward (geodesic distance progress)
+# -----------------------------------------------------------------------------
+def reward_dijkstra_progress(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    grid_size: int = 160,
+    cell_size: float = 1.0,
+    update_interval: int = 5,
+    speed_ref: float = 4.0,
+    clip: float = 1.0,
+) -> torch.Tensor:
+    """Reward based on progress along Dijkstra-computed optimal path.
+
+    Uses geodesic distance (path around obstacles) instead of Euclidean distance.
+    This provides consistent reward signals when navigating around obstacles,
+    avoiding local optima where the drone gets "stuck" behind obstacles.
+
+    Args:
+        env: Environment instance.
+        asset_cfg: Asset configuration for the robot.
+        grid_size: Size of the occupancy grid (grid_size x grid_size).
+        cell_size: Size of each grid cell in meters.
+        update_interval: Recompute distance field every N steps.
+        speed_ref: Reference speed for reward normalization.
+        clip: Clip reward to [-clip, clip].
+
+    Returns:
+        (N,) tensor of rewards.
+    """
+    # Get current position
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
+
+    # Get goal position
+    goal = _get_goal_pos(env, pos)
+
+    # Validate goal shape
+    if goal.shape[0] != env.num_envs:
+        # If goal is singleton, broadcast it
+        if goal.shape[0] == 1:
+            goal = goal.expand(env.num_envs, -1)
+        else:
+            # Fallback: create zeros
+            goal = torch.zeros((env.num_envs, 3), device=env.device, dtype=pos.dtype)
+
+    # Initialize navigator if not exists
+    if getattr(env, "_dijkstra_navigator", None) is None:
+        # Get workspace bounds from config
+        x_bounds = (-80.0, 80.0)
+        y_bounds = (-80.0, 80.0)
+        try:
+            norm_cfg = getattr(env.cfg, "normalization", None)
+            if norm_cfg:
+                x_bounds = getattr(norm_cfg, "x_bounds", x_bounds)
+                y_bounds = getattr(norm_cfg, "y_bounds", y_bounds)
+        except Exception:
+            pass
+
+        env._dijkstra_navigator = DijkstraNavigator(
+            grid_size=grid_size,
+            cell_size=cell_size,
+            workspace_origin=(float(x_bounds[0]), float(y_bounds[0])),
+            max_distance=300.0,
+        )
+        env._dijkstra_distance_fields = None
+        env._dijkstra_prev_positions = pos.detach().clone()
+        env._dijkstra_prev_distances = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.float32
+        )
+        env._dijkstra_update_counter = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.int32
+        )
+
+    navigator: DijkstraNavigator = env._dijkstra_navigator
+
+    # Ensure all buffers are initialized (safety check)
+    if env._dijkstra_update_counter is None:
+        env._dijkstra_update_counter = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.int32
+        )
+    if env._dijkstra_prev_distances is None:
+        env._dijkstra_prev_distances = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.float32
+        )
+
+    # Check if we need to update distance fields
+    env_ids_to_update = []
+    for i in range(env.num_envs):
+        env._dijkstra_update_counter[i] += 1
+        if env._dijkstra_update_counter[i] >= update_interval:
+            env._dijkstra_update_counter[i] = 0
+            env_ids_to_update.append(i)
+
+    # Initialize distance fields if needed
+    if env._dijkstra_distance_fields is None:
+        env._dijkstra_distance_fields = torch.full(
+            (env.num_envs, grid_size, grid_size),
+            navigator.max_distance,
+            device=env.device,
+            dtype=torch.float32,
+        )
+        env_ids_to_update = list(range(env.num_envs))
+
+    # Update distance fields for selected environments
+    if env_ids_to_update:
+        # Get obstacle positions from scene
+        try:
+            with torch.no_grad():  # Reduce memory usage during Dijkstra computation
+                obstacles = env.scene["obstacles"]
+                obstacle_positions = obstacles.data.root_pos_w  # (max_obstacles, 3)
+
+                # Build occupancy grid once (shared across all environments)
+                # Cache it to avoid rebuilding every time
+                cache_key = "_dijkstra_occupancy_grid"
+
+                # Check if obstacles changed (compare with cached positions)
+                prev_positions = getattr(env, "_dijkstra_cached_obstacle_positions", None)
+                occupancy_grid = None
+                need_rebuild = False
+
+                if prev_positions is None:
+                    need_rebuild = True
+                elif prev_positions.shape != obstacle_positions.shape:
+                    need_rebuild = True
+                else:
+                    # Check if any positions changed (with small tolerance)
+                    need_rebuild = not torch.allclose(obstacle_positions, prev_positions, atol=1e-3)
+
+                if need_rebuild:
+                    # Rebuild occupancy grid
+                    occupancy_grid = navigator.build_occupancy_grid_from_obstacles(
+                        obstacle_positions, obstacle_size=1.5, device=env.device
+                    )
+                    setattr(env, cache_key, occupancy_grid)
+                    # Store reference (not clone) to save memory - obstacles rarely change
+                    setattr(env, "_dijkstra_cached_obstacle_positions", obstacle_positions.detach())
+                else:
+                    occupancy_grid = getattr(env, cache_key)
+
+            # Update distance fields for each environment (different goals)
+            # Ensure goal is properly broadcast before indexing
+            if goal.shape[0] == 1 and len(env_ids_to_update) > 1:
+                goal = goal.expand(env.num_envs, -1)
+
+            for idx in env_ids_to_update:
+                # Safety check: ensure index is valid
+                if idx >= goal.shape[0] or idx >= pos.shape[0]:
+                    continue
+
+                # Compute distance field from goal (fast GPU implementation)
+                try:
+                    distance_field = navigator.compute_distance_field(
+                        occupancy_grid, goal[idx]
+                    )
+                except Exception as field_e:
+                    # Skip this environment if distance field computation fails
+                    continue
+
+                env._dijkstra_distance_fields[idx] = distance_field
+
+                # Update previous distance for this environment
+                if idx < pos.shape[0]:
+                    env._dijkstra_prev_distances[idx] = navigator.get_geodesic_distance(
+                        pos[idx : idx + 1], distance_field
+                    )[0]
+
+        except Exception as e:
+            # Fallback: use Euclidean distance if Dijkstra fails
+            # Only warn once to avoid spam
+            if not getattr(env, "_dijkstra_warned", False):
+                import warnings
+                warnings.warn(f"Dijkstra distance field computation failed: {e}")
+                env._dijkstra_warned = True
+            pass
+
+    # Compute current geodesic distances
+    d_current = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+    if env._dijkstra_distance_fields is not None:
+        for i in range(env.num_envs):
+            d_current[i] = navigator.get_geodesic_distance(
+                pos[i : i + 1], env._dijkstra_distance_fields[i]
+            )[0]
+    else:
+        # Fallback: use Euclidean distance
+        # Ensure goal is broadcast to match pos shape
+        if goal.shape[0] == 1 and pos.shape[0] > 1:
+            goal = goal.expand(pos.shape[0], -1)
+        d_current = torch.norm(pos[:, :2] - goal[:, :2], dim=1)
+
+    # Get previous geodesic distances (use current if not initialized)
+    if env._dijkstra_prev_distances is not None:
+        d_prev = env._dijkstra_prev_distances.clone()
+    else:
+        d_prev = d_current.clone()
+
+    # Compute progress reward
+    dt = max(_get_step_dt(env), 1e-6)
+    delta = d_prev - d_current
+    towards_speed = delta / dt
+    denom = max(float(speed_ref), 1e-6)
+    reward = torch.clamp(towards_speed / denom, -float(clip), float(clip))
+
+    # Update previous distances for next step
+    env._dijkstra_prev_distances = d_current.detach().clone()
+    env._dijkstra_prev_positions = pos.detach().clone()
+
+    # Periodic cleanup to prevent memory leak (every 1000 steps)
+    step_counter = getattr(env, "_dijkstra_step_counter", 0)
+    step_counter += 1
+    if step_counter % 1000 == 0:
+        # Clear cached obstacle positions reference (will be recreated if needed)
+        if hasattr(env, "_dijkstra_cached_obstacle_positions"):
+            delattr(env, "_dijkstra_cached_obstacle_positions")
+        # Force garbage collection periodically
+        import gc
+        gc.collect()
+        step_counter = 0
+    env._dijkstra_step_counter = step_counter
+
+    # Store for TensorBoard
+    _tb_store_reward(env, "dijkstra_progress", reward)
+    _tb_store_aux(env, "geodesic_distance", d_current)
+    _tb_store_aux(env, "geodesic_progress_norm", delta / dt)
+
+    return reward.to(torch.float32)
+
