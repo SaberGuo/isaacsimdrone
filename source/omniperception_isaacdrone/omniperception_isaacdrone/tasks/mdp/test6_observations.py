@@ -276,7 +276,6 @@ def _get_lidar_ranges(lidar, default_min: float = 0.2, default_max: float = 50.0
 
 
 def _get_downsampled_pc_torch(env, lidar, env_ids: torch.Tensor, max_pts: int | None):
-    """Read lidar pointcloud (torch) and mask invalid points with NaN."""
     if lidar is None:
         return None, None
 
@@ -288,13 +287,16 @@ def _get_downsampled_pc_torch(env, lidar, env_ids: torch.Tensor, max_pts: int | 
         pc = pc.unsqueeze(0)
 
     E, P, _ = pc.shape
-    num_raw = torch.full((E,), P, device=pc.device, dtype=torch.int32)
 
+    # 将无效点替换为 nan（保留原始语义，在后续 valid mask 中过滤）
     finite_mask = torch.isfinite(pc).all(dim=-1)
-    pc = pc.clone()
-    pc[~finite_mask] = float("nan")
+    pc = pc.clone().to(dtype=torch.float32)
+    # 将NaN/Inf点先设为0，避免quat_apply_inverse产生NaN传播
+    # valid mask会在后续过滤这些点
+    pc[~finite_mask] = 0.0
 
-    return pc, num_raw
+    return pc, finite_mask  # 注意：现在返回 finite_mask 而非 num_raw
+
 
 
 def obs_lidar_min_range_grid(
@@ -309,15 +311,19 @@ def obs_lidar_min_range_grid(
     empty_value: float = 0.0,
     max_vis_points: int | None = None,
     max_distance: float | None = None,
+    exp_k: float = 0.12,
 ) -> torch.Tensor:
-    """Return flattened closeness grid in [0,1]. Strictly clamped to [0,1]."""
+    """Return flattened closeness grid in [0,1] using exponential encoding.
+    
+    修正：正确处理世界坐标系LiDAR点云，转换到机体坐标系后再做球坐标分格。
+    """
+    from isaaclab.utils.math import quat_apply_inverse
 
-    # bin counts
-    T = int((theta_max - theta_min) / delta_theta)
-    Pn = int((phi_max - phi_min) / delta_phi)
-    T = max(T, 1)
-    Pn = max(Pn, 1)
-    out_shape = (env.num_envs, T * Pn)
+    # ── bin counts ────────────────────────────────────────────────────────────
+    T = max(int((theta_max - theta_min) / delta_theta), 1)
+    Pn = max(int((phi_max - phi_min) / delta_phi), 1)
+    num_bins = T * Pn
+    out_shape = (env.num_envs, num_bins)
 
     if not hasattr(env, "scene"):
         return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
@@ -334,62 +340,81 @@ def obs_lidar_min_range_grid(
     min_r = float(min_r_cfg)
 
     env_ids = torch.arange(env.num_envs, device=env.device)
-    pc, _ = _get_downsampled_pc_torch(env, lidar, env_ids, max_pts=max_vis_points)
+    pc, finite_mask = _get_downsampled_pc_torch(env, lidar, env_ids, max_pts=max_vis_points)
     if pc is None:
         return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
 
-    x = pc[..., 0]
-    y = pc[..., 1]
-    z = pc[..., 2]
+    # ── 关键修正：世界坐标系 → 机体坐标系 ───────────────────────────────────
+    try:
+        robot = env.scene["robot"]
+        root_pos_w = robot.data.root_pos_w.to(dtype=torch.float32)   # (N, 3)
+        root_quat_w = robot.data.root_quat_w.to(dtype=torch.float32) # (N, 4) wxyz
+    except Exception:
+        return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
 
-    valid = torch.isfinite(x) & torch.isfinite(y) & torch.isfinite(z)
+    N, P, _ = pc.shape
 
-    r = torch.sqrt(x * x + y * y + z * z + 1e-12)
+    # 1. 减去无人机世界位置（以无人机为原点的相对坐标，仍在世界系方向）
+    pc_rel = pc.to(dtype=torch.float32) - root_pos_w.unsqueeze(1)  # (N, P, 3)
 
-    # reject near-zero / out-of-range points
+    # 2. 旋转到机体坐标系（用四元数逆旋转）
+    pc_flat = pc_rel.reshape(N * P, 3)
+    quat_expanded = root_quat_w.unsqueeze(1).expand(N, P, 4).reshape(N * P, 4)
+    pc_body_flat = quat_apply_inverse(quat_expanded, pc_flat)
+    pc_body = pc_body_flat.reshape(N, P, 3)  # (N, P, 3) 机体坐标系
+
+    # ── 球坐标转换（在机体坐标系中）────────────────────────────────────────
+    x = pc_body[..., 0]  # (N, P)
+    y = pc_body[..., 1]
+    z = pc_body[..., 2]
+
+    valid = finite_mask & torch.isfinite(x) & torch.isfinite(y) & torch.isfinite(z)
+    r = torch.sqrt(x * x + y * y + z * z + 1e-12)  # (N, P)
+
     valid = valid & (r > (min_r + 1e-3)) & (r <= (max_d + 1e-3))
 
     cos_theta = torch.clamp(z / r, -1.0, 1.0)
-    theta = torch.rad2deg(torch.acos(cos_theta))
+    theta = torch.rad2deg(torch.acos(cos_theta))    # (N, P) 从z轴正向量起
 
     phi = torch.rad2deg(torch.atan2(y, x))
-    phi = torch.remainder(phi, 360.0)
+    phi = torch.remainder(phi, 360.0)               # (N, P) → [0, 360)
 
     in_theta = (theta >= theta_min) & (theta < theta_max)
-    in_phi = (phi >= phi_min) & (phi < phi_max)
-    m = valid & in_theta & in_phi
+    in_phi   = (phi   >= phi_min)   & (phi   < phi_max)
+    m = valid & in_theta & in_phi                   # (N, P)
 
-    num_bins = T * Pn
-
+    # ── 向量化 scatter_reduce ────────────────────────────────────────────────
     min_dist = torch.full(
-        (env.num_envs, num_bins),
-        float("inf"),
+        out_shape,
+        fill_value=max_d,
         device=env.device,
         dtype=torch.float32,
     )
 
     if m.any():
         t_idx = torch.floor((theta - theta_min) / delta_theta).to(torch.long)
-        p_idx = torch.floor((phi - phi_min) / delta_phi).to(torch.long)
-
-        t_idx = torch.clamp(t_idx, 0, T - 1)
+        p_idx = torch.floor((phi   - phi_min)   / delta_phi  ).to(torch.long)
+        t_idx = torch.clamp(t_idx, 0, T  - 1)
         p_idx = torch.clamp(p_idx, 0, Pn - 1)
+        lin_idx = t_idx * Pn + p_idx               # (N, P)
 
-        lin_idx = t_idx * Pn + p_idx
+        r_for_scatter = r.to(torch.float32).clone()
+        r_for_scatter[~m] = max_d
 
-        for e in range(env.num_envs):
-            me = m[e]
-            if me.any():
-                idx_e = lin_idx[e, me]
-                r_e = r[e, me].to(torch.float32)
-                min_dist[e].scatter_reduce_(0, idx_e, r_e, reduce="amin", include_self=True)
+        min_dist.scatter_reduce_(
+            dim=1,
+            index=lin_idx,
+            src=r_for_scatter,
+            reduce="amin",
+            include_self=True,
+        )
 
-    max_d_t = torch.tensor(max_d, device=env.device, dtype=torch.float32)
-    min_dist = torch.where(torch.isfinite(min_dist), min_dist, max_d_t)
-    min_dist = torch.clamp(min_dist, 0.0, max_d_t)
-
-    closeness = 1.0 - torch.clamp(min_dist / max_d_t, 0.0, 1.0)
+    # ── 指数 closeness 编码 ───────────────────────────────────────────────────
+    k = float(exp_k)
+    min_dist = torch.clamp(min_dist, 0.0, max_d)
+    closeness = 1.0 - torch.exp(
+        torch.clamp(-k * (max_d - min_dist), max=0.0)
+    )
     closeness = closeness.to(torch.float32)
 
-    # strict clamp
     return _clamp_01(closeness)

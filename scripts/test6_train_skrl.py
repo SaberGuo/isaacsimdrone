@@ -56,7 +56,7 @@ parser.add_argument("--no_clip_predicted_values", dest="clip_predicted_values", 
 parser.set_defaults(clip_predicted_values=True)
 
 parser.add_argument("--reward_scale", type=float, default=0.1)
-parser.add_argument("--reward_clip", type=float, default=100.0)
+parser.add_argument("--reward_clip", type=float, default=500.0)
 
 parser.add_argument("--tb_interval", type=int, default=500)
 parser.add_argument("--dist_interval", type=int, default=500)
