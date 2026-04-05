@@ -85,6 +85,22 @@ parser.add_argument("--dijkstra_cell_size", type=float, default=2.0,
 parser.add_argument("--dijkstra_update_interval", type=int, default=10,
                     help="Recompute distance field every N steps")
 
+# APF (Artificial Potential Field) reward parameters
+parser.add_argument("--use_apf", action="store_true", default=False,
+                    help="Enable APF potential field reward shaping")
+parser.add_argument("--no_apf", dest="use_apf", action="store_false",
+                    help="Disable APF potential field reward shaping")
+parser.add_argument("--apf_att_weight", type=float, default=15.0,
+                    help="Weight for APF attractive reward (positive)")
+parser.add_argument("--apf_rep_weight", type=float, default=-150.0,
+                    help="Weight for APF repulsive penalty (negative)")
+parser.add_argument("--apf_d0", type=float, default=5.0,
+                    help="APF repulsive influence radius in meters")
+parser.add_argument("--apf_k_att", type=float, default=1.0,
+                    help="APF attractive gain k_att")
+parser.add_argument("--apf_k_rep", type=float, default=1.0,
+                    help="APF repulsive gain k_rep")
+
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -554,6 +570,19 @@ def main() -> None:
     else:
         print("[INFO] Dijkstra reward disabled")
         env_cfg.rewards.dijkstra_progress.weight = 0.0
+
+    # Configure APF potential field reward
+    if args.use_apf:
+        print(f"[INFO] APF reward enabled: att_weight={args.apf_att_weight}, "
+              f"rep_weight={args.apf_rep_weight}, d0={args.apf_d0}m, "
+              f"k_att={args.apf_k_att}, k_rep={args.apf_k_rep}")
+        env_cfg.rewards.apf_attractive.weight = args.apf_att_weight
+        env_cfg.rewards.apf_attractive.params["k_att"] = args.apf_k_att
+        env_cfg.rewards.apf_repulsive.weight = args.apf_rep_weight
+        env_cfg.rewards.apf_repulsive.params["d0"] = args.apf_d0
+        env_cfg.rewards.apf_repulsive.params["k_rep"] = args.apf_k_rep
+    else:
+        print("[INFO] APF reward disabled")
 
     try:
         setattr(env_cfg, "seed", int(args.seed))

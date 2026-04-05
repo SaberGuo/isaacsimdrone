@@ -695,3 +695,119 @@ def reward_dijkstra_progress(
 
     return reward.to(torch.float32)
 
+
+# -----------------------------------------------------------------------------
+# APF — Attractive Potential Field reward
+# -----------------------------------------------------------------------------
+def reward_apf_attractive(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    k_att: float = 1.0,
+    speed_ref: float = 4.0,
+    clip: float = 1.0,
+) -> torch.Tensor:
+    """APF attractive potential shaping reward.
+
+    U_att = 0.5 * k_att * d_goal²
+    R = -(U_att(t) - U_att(t-1)) / dt / speed_ref
+      = k_att * d_prev * (d_prev - d_curr) / dt / speed_ref
+
+    Differs from reward_progress_to_goal in that the gradient is weighted by
+    distance: the drone is pulled more strongly when it is far from the goal,
+    providing a natural curriculum-like attractive force.
+    """
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
+    goal = _get_goal_pos(env, pos)
+    d = _safe_norm(goal - pos)
+
+    prev = getattr(env, "_apf_prev_goal_dist", None)
+    if prev is None or not isinstance(prev, torch.Tensor) or prev.shape != d.shape:
+        setattr(env, "_apf_prev_goal_dist", d.detach().clone())
+        out = torch.zeros_like(d)
+    else:
+        dt = max(_get_step_dt(env), 1e-6)
+        delta_d = prev - d  # positive when approaching
+        # APF gradient: d(0.5*k*d²)/dt = k * d * (d_prev - d_curr) / dt
+        raw = float(k_att) * prev * delta_d / dt
+        denom = max(float(speed_ref), 1e-6)
+        out = torch.clamp(raw / denom, min=-float(clip), max=float(clip))
+        env._apf_prev_goal_dist = d.detach().clone()
+
+    out = out.to(torch.float32)
+    _tb_store_reward(env, "apf_attractive", out)
+    _tb_store_aux(env, "apf_goal_dist", d)
+    return out
+
+
+# -----------------------------------------------------------------------------
+# APF — Repulsive Potential Field penalty
+# -----------------------------------------------------------------------------
+def penalty_apf_repulsive(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    d0: float = 5.0,
+    k_rep: float = 1.0,
+    use_2d: bool = True,
+    cap: float = 5.0,
+) -> torch.Tensor:
+    """APF repulsive potential penalty from discrete obstacle positions.
+
+    For each active obstacle i with distance d_i < d0:
+        U_rep_i = 0.5 * k_rep * (1/d_i - 1/d0)²
+    Penalty = sum_i(U_rep_i)  [positive; apply negative weight in cfg]
+
+    Obstacles parked at (1000, 1000, -1000) (inactive) are filtered out.
+    XY-only distance is used because obstacles are 10 m-tall pillars.
+    """
+    out0 = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    try:
+        obstacles = env.scene["obstacles"]
+        obs_pos = obstacles.data.root_pos_w  # (N_obs, 3)
+    except Exception:
+        _tb_store_reward(env, "apf_repulsive", out0)
+        return out0
+
+    # Filter inactive obstacles (parked far away, x > 500)
+    active_mask = obs_pos[:, 0].abs() < 500.0
+    obs_pos_active = obs_pos[active_mask]  # (N_active, 3)
+
+    if obs_pos_active.shape[0] == 0:
+        _tb_store_reward(env, "apf_repulsive", out0)
+        return out0
+
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)  # (N_envs, 3)
+
+    # Compute distances: (N_envs, N_active)
+    if use_2d:
+        # XY plane only; obstacles are tall pillars
+        dx = pos[:, 0:1] - obs_pos_active[:, 0].unsqueeze(0)  # (N_envs, N_active)
+        dy = pos[:, 1:2] - obs_pos_active[:, 1].unsqueeze(0)
+        dist = torch.sqrt(dx * dx + dy * dy + 1e-6)
+    else:
+        diff = pos.unsqueeze(1) - obs_pos_active.unsqueeze(0)  # (N_envs, N_active, 3)
+        dist = torch.sqrt((diff * diff).sum(dim=-1) + 1e-6)  # (N_envs, N_active)
+
+    d0_t = float(d0)
+    k_rep_t = float(k_rep)
+    d_min_clip = 0.1  # avoid singularity
+
+    # Clamp distances from below
+    dist_safe = torch.clamp(dist, min=d_min_clip)
+
+    # Repulsive potential: 0.5 * k * (1/d - 1/d0)^2 when d < d0, else 0
+    in_range = dist_safe < d0_t  # (N_envs, N_active)
+    inv_d = 1.0 / dist_safe
+    inv_d0 = 1.0 / d0_t
+    u_rep_i = 0.5 * k_rep_t * ((inv_d - inv_d0) ** 2)  # (N_envs, N_active)
+    u_rep_i = torch.where(in_range, u_rep_i, torch.zeros_like(u_rep_i))
+
+    penalty = u_rep_i.sum(dim=1)  # (N_envs,)
+    if cap > 0.0:
+        penalty = torch.clamp(penalty, 0.0, float(cap))
+
+    penalty = penalty.to(torch.float32)
+    _tb_store_reward(env, "apf_repulsive", penalty)
+    _tb_store_aux(env, "apf_min_obs_dist", dist.min(dim=1).values)
+    return penalty
+

@@ -17,12 +17,14 @@ from .test6_observations import (
     obs_state_norm,
 )
 from .test6_rewards import (
+    penalty_apf_repulsive,
     penalty_collision,
     penalty_energy,
     penalty_lidar_threat,
     penalty_out_of_workspace,
     penalty_time_out,
     reward_action_l2,
+    reward_apf_attractive,
     reward_dijkstra_progress,
     reward_distance_to_goal,
     reward_goal_reached,
@@ -67,6 +69,8 @@ __all__ = [
     "reward_stability",
     "reward_velocity_towards_goal",
     "reward_dijkstra_progress",
+    "reward_apf_attractive",
+    "penalty_apf_repulsive",
     "penalty_lidar_threat",
     "penalty_energy",
     "reward_goal_reached",

@@ -210,6 +210,10 @@ class Test6RewardsCfg:
     vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=8.0, params={})
     dijkstra_progress = RewTerm(func=my_mdp.reward_dijkstra_progress, weight=20.0, params={})
 
+    # ---- APF 人工势场奖励（叠加在已有奖励之上，默认关闭） ----
+    apf_attractive = RewTerm(func=my_mdp.reward_apf_attractive, weight=0.0, params={})
+    apf_repulsive = RewTerm(func=my_mdp.penalty_apf_repulsive, weight=0.0, params={})
+
     # ---- 稳定性奖励 ----
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=8.0, params={})
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.05, params={})
