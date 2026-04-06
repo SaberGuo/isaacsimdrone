@@ -33,7 +33,6 @@ def _tb_store_reward(env: ManagerBasedRLEnv, name: str, value: torch.Tensor):
         d = _tb_get_dict(env, "_tb_reward_terms")
         if isinstance(value, torch.Tensor):
             d[name] = value.detach()
-            
     except Exception:
         pass
 
