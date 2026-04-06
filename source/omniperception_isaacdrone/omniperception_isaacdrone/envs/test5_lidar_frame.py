@@ -16,18 +16,25 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
 import matplotlib.font_manager as fm
-# 方案1：使用系统中文字体
-plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'Noto Sans CJK SC', 
-                                    'DejaVu Sans', 'SimHei', 'Arial Unicode MS']
-plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+
+# 中文字体
+plt.rcParams["font.sans-serif"] = [
+    "WenQuanYi Micro Hei",
+    "Noto Sans CJK SC",
+    "DejaVu Sans",
+    "SimHei",
+    "Arial Unicode MS",
+]
+plt.rcParams["axes.unicode_minus"] = False
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="ManagerBasedRLEnv Drone (single-file) + minimal training")
+    parser = argparse.ArgumentParser(description="ManagerBasedRLEnv Drone (single-file) + lidar frame diagnosis")
 
     # env basics
     parser.add_argument("--num_envs", type=int, default=4, help="环境数量")
+    parser.add_argument("--env_spacing", type=float, default=20.0, help="环境之间的 spacing；用于 local/global world 诊断")
     parser.add_argument("--num_obstacles", type=int, default=50, help="障碍物数量（共享）")
     parser.add_argument("--max_steps", type=int, default=2000, help="非训练模式下最多仿真步数")
 
@@ -47,13 +54,8 @@ def parse_args():
     parser.add_argument("--min_height", type=float, default=0.25, help="低于该高度判定坠地/终止")
     parser.add_argument("--world_bound", type=float, default=40.0, help="飞出该边界判定终止（|x| or |y|）")
 
-    # action scaling / hover bias
-    parser.add_argument("--action_scale", type=float, default=1.0, help="动作缩放（关节 effort）")
-    parser.add_argument("--hover_effort_bias", type=float, default=0.0,
-                        help="对 4 个电机 effort 增加一个常量偏置（用于更容易起飞/悬停，视资产而定）")
-
     # optional lidar debug
-    parser.add_argument("--enable_lidar", action="store_true", help="启用 LiDAR（在本文件里挂最小 CFG）")
+    parser.add_argument("--enable_lidar", action="store_true", help="启用 LiDAR")
     parser.add_argument("--lidar_print_every", type=int, default=50)
     parser.add_argument("--lidar_max_vis_points", type=int, default=10000)
     parser.add_argument("--lidar_save_every", type=int, default=50)
@@ -68,37 +70,38 @@ def parse_args():
     parser.add_argument("--lidar_phi_max", type=float, default=360.0)
     parser.add_argument("--lidar_delta_theta", type=float, default=1.0)
     parser.add_argument("--lidar_delta_phi", type=float, default=5.0)
-    parser.add_argument("--lidar_empty_value", type=float, default=0.0, help="无点命中时 bin 的填充值（0 或 max_range）")
+    parser.add_argument("--lidar_empty_value", type=float, default=0.0, help="无点命中时 bin 的填充值")
 
-    # ── 新增：坐标系诊断模式 ──────────────────────────────────────────────────
+    # 旋转诊断：body-like vs world-like
     parser.add_argument(
         "--diagnose_lidar_frame",
         action="store_true",
         help=(
-            "启用 LiDAR 坐标系诊断：\n"
-            "  阶段1 无人机保持初始朝向，记录障碍物方位角分布；\n"
-            "  阶段2 无人机旋转 90° 偏航，再次记录方位角分布；\n"
-            "  若两次分布一致 → 世界系；若偏移 ~90° → 机体系。\n"
-            "  结果保存为 PNG 到 --lidar_save_dir。\n"
-            "  需要同时指定 --enable_lidar。"
+            "启用 LiDAR 坐标系诊断。\n"
+            "第一部分：旋转诊断，判断 body-like vs world-like；\n"
+            "第二部分：平移/多环境诊断，进一步区分 global world vs local world。"
         ),
     )
-    parser.add_argument(
-        "--diagnose_phase1_steps", type=int, default=30,
-        help="诊断阶段1（初始朝向稳定）持续步数",
-    )
-    parser.add_argument(
-        "--diagnose_rotate_steps", type=int, default=60,
-        help="诊断旋转阶段（施加偏航角速度）持续步数",
-    )
-    parser.add_argument(
-        "--diagnose_phase2_steps", type=int, default=30,
-        help="诊断阶段2（旋转完成后稳定）持续步数",
-    )
-    parser.add_argument(
-        "--diagnose_yaw_rate", type=float, default=math.pi / 2.0,
-        help="诊断旋转阶段的偏航角速度 (rad/s)，默认 π/2",
-    )
+    parser.add_argument("--diagnose_phase1_steps", type=int, default=40, help="旋转诊断阶段1稳定步数")
+    parser.add_argument("--diagnose_rotate_steps", type=int, default=80, help="旋转阶段步数")
+    parser.add_argument("--diagnose_phase2_steps", type=int, default=40, help="旋转诊断阶段2稳定步数")
+    parser.add_argument("--diagnose_yaw_rate", type=float, default=math.pi / 2.0, help="诊断偏航角速度 (rad/s)")
+    parser.add_argument("--diagnose_collect_every", type=int, default=2, help="每隔多少步采样一次点云")
+    parser.add_argument("--diagnose_min_xy_radius", type=float, default=0.2, help="计算 phi 时最小 XY 半径")
+    parser.add_argument("--diagnose_hist_bin_deg", type=float, default=5.0, help="方位角直方图分辨率（度）")
+
+    # 新增：local world vs global world 专用诊断参数
+    parser.add_argument("--diagnose_scope_settle_steps", type=int, default=20, help="scope 诊断前设置位姿后的稳定步数")
+    parser.add_argument("--diagnose_scope_marker_x", type=float, default=12.0, help="诊断 marker 的全局 X")
+    parser.add_argument("--diagnose_scope_marker_y", type=float, default=6.0, help="诊断 marker 的全局 Y")
+    parser.add_argument("--diagnose_scope_marker_z", type=float, default=5.0, help="诊断 marker 的全局 Z")
+    parser.add_argument("--diagnose_scope_marker_sx", type=float, default=2.0, help="诊断 marker 的尺寸 X")
+    parser.add_argument("--diagnose_scope_marker_sy", type=float, default=2.0, help="诊断 marker 的尺寸 Y")
+    parser.add_argument("--diagnose_scope_marker_sz", type=float, default=8.0, help="诊断 marker 的尺寸 Z")
+    parser.add_argument("--diagnose_scope_local_pose_x", type=float, default=0.0, help="scope 诊断时无人机 local pose x")
+    parser.add_argument("--diagnose_scope_local_pose_y", type=float, default=0.0, help="scope 诊断时无人机 local pose y")
+    parser.add_argument("--diagnose_scope_local_pose_z", type=float, default=5.0, help="scope 诊断时无人机 local pose z")
+    parser.add_argument("--diagnose_scope_aabb_margin", type=float, default=1.5, help="marker 点云筛选 AABB 裕度")
 
     # training flags
     parser.add_argument("--train", action="store_true", help="开启最小训练流程（A2C风格）")
@@ -112,10 +115,8 @@ def parse_args():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--log_every", type=int, default=20)
 
-    # Isaac Lab app args（必须在这里加）
     from isaaclab.app import AppLauncher
     AppLauncher.add_app_launcher_args(parser)
-
     return parser.parse_args()
 
 
@@ -152,28 +153,34 @@ def save_pointcloud_png(points_np, save_path, title=None, s=1):
     return True
 
 
+def save_xy_scatter_png(points_np, save_path, title=None, s=2):
+    if points_np is None or len(points_np) == 0:
+        return False
+    fig, ax = plt.subplots(figsize=(6, 6), dpi=180)
+    ax.scatter(points_np[:, 0], points_np[:, 1], s=s, alpha=0.4)
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(save_path)
+    plt.close(fig)
+    return True
+
+
 # =============================================================================
-# 新增：LiDAR 坐标系诊断工具函数
+# LiDAR 诊断工具
 # =============================================================================
+def _circular_diff_deg(a: float, b: float) -> float:
+    diff = (a - b) % 360.0
+    if diff > 180.0:
+        diff -= 360.0
+    return diff
 
-def _compute_phi_distribution(pc_np):
-    """
-    计算点云在 XY 平面上的方位角分布（phi），用于坐标系诊断。
 
-    参数
-    ----
-    pc_np : np.ndarray, shape (N, 3)
-        点云坐标（相对传感器原点）
-
-    返回
-    ----
-    phi_deg : np.ndarray, shape (M,)
-        有效点的方位角（度），范围 [0, 360)
-    phi_mean : float
-        加权平均方位角（circular mean，度）
-    phi_std : float
-        方位角圆形标准差估计（度）
-    """
+def _compute_phi_distribution(pc_np, min_xy_radius: float = 0.2):
     import numpy as np
 
     if pc_np is None or len(pc_np) == 0:
@@ -182,39 +189,66 @@ def _compute_phi_distribution(pc_np):
     x = pc_np[:, 0]
     y = pc_np[:, 1]
 
-    # 只保留 XY 平面有效点（r_xy > 0.1m，排除正上/正下方的点）
     r_xy = np.sqrt(x ** 2 + y ** 2)
-    mask = r_xy > 0.1
+    mask = r_xy > float(min_xy_radius)
     if mask.sum() == 0:
         return None, float("nan"), float("nan")
 
     x = x[mask]
     y = y[mask]
 
-    phi_rad = np.arctan2(y, x)                    # [-π, π]
-    phi_deg = np.degrees(phi_rad) % 360.0         # [0, 360)
+    phi_rad = np.arctan2(y, x)
+    phi_deg = np.degrees(phi_rad) % 360.0
 
-    # Circular mean：避免 0°/360° 边界问题
     sin_mean = np.mean(np.sin(phi_rad))
     cos_mean = np.mean(np.cos(phi_rad))
     circular_mean_deg = math.degrees(math.atan2(sin_mean, cos_mean)) % 360.0
 
-    # Circular std 估计：R̄ = sqrt(sin_mean²+cos_mean²)，std ≈ sqrt(-2*ln(R̄))
-    R_bar = math.sqrt(sin_mean ** 2 + cos_mean ** 2)
-    R_bar = min(R_bar, 1.0 - 1e-9)
-    circular_std_deg = math.degrees(math.sqrt(-2.0 * math.log(R_bar + 1e-9)))
+    r_bar = math.sqrt(sin_mean ** 2 + cos_mean ** 2)
+    r_bar = min(r_bar, 1.0 - 1e-9)
+    circular_std_deg = math.degrees(math.sqrt(max(-2.0 * math.log(r_bar + 1e-9), 0.0)))
 
     return phi_deg, circular_mean_deg, circular_std_deg
 
 
-def _circular_diff_deg(a: float, b: float) -> float:
-    """
-    计算两个角度（度）之间的有向差 a - b，结果在 (-180, 180]。
-    """
-    diff = (a - b) % 360.0
-    if diff > 180.0:
-        diff -= 360.0
-    return diff
+def _hist_from_phi(phi_deg, bin_deg: float = 5.0):
+    import numpy as np
+
+    if phi_deg is None or len(phi_deg) == 0:
+        bins = max(int(round(360.0 / bin_deg)), 1)
+        return np.zeros((bins,), dtype=np.float64)
+
+    edges = np.arange(0.0, 360.0 + bin_deg, bin_deg)
+    hist, _ = np.histogram(phi_deg, bins=edges)
+    hist = hist.astype(np.float64)
+    if hist.sum() > 0:
+        hist /= hist.sum()
+    return hist
+
+
+def _best_circular_shift_deg(hist_ref, hist_query, bin_deg: float = 5.0):
+    import numpy as np
+
+    if hist_ref is None or hist_query is None or len(hist_ref) != len(hist_query):
+        return float("nan"), float("nan")
+
+    n = len(hist_ref)
+    best_shift = 0
+    best_score = -1e18
+
+    ref = hist_ref - hist_ref.mean()
+    q = hist_query - hist_query.mean()
+
+    for s in range(n):
+        rolled = np.roll(q, s)
+        score = float(np.dot(ref, rolled))
+        if score > best_score:
+            best_score = score
+            best_shift = s
+
+    shift_deg = best_shift * bin_deg
+    shift_deg = ((shift_deg + 180.0) % 360.0) - 180.0
+    return shift_deg, best_score
 
 
 def save_phi_histogram_png(
@@ -226,26 +260,11 @@ def save_phi_histogram_png(
     mean1: float = None,
     mean2: float = None,
     conclusion: str = "",
+    bin_deg: float = 5.0,
 ):
-    """
-    将两阶段的方位角直方图保存为 PNG，用于人工核查。
-
-    参数
-    ----
-    phi1_deg, phi2_deg : np.ndarray
-        两阶段的方位角数组（度）
-    save_path : str
-        输出文件路径
-    label1, label2 : str
-        图例标签
-    mean1, mean2 : float
-        两阶段圆形均值（度），用于标注竖线
-    conclusion : str
-        诊断结论文字，显示在标题
-    """
     import numpy as np
 
-    bins = np.linspace(0, 360, 73)   # 5° 一格，共 72 格
+    bins = np.arange(0.0, 360.0 + bin_deg, bin_deg)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=150)
     fig.suptitle(f"LiDAR 坐标系诊断\n{conclusion}", fontsize=12, y=1.02)
@@ -259,8 +278,7 @@ def save_phi_histogram_png(
         if data is not None and len(data) > 0:
             ax.hist(data, bins=bins, color=color, alpha=0.75, edgecolor="white", linewidth=0.4)
             if mean is not None and math.isfinite(mean):
-                ax.axvline(mean, color="black", linewidth=2.0, linestyle="--",
-                           label=f"circular mean={mean:.1f}°")
+                ax.axvline(mean, color="black", linewidth=2.0, linestyle="--", label=f"circular mean={mean:.1f}°")
                 ax.legend(fontsize=9)
         else:
             ax.text(0.5, 0.5, "无数据", ha="center", va="center", transform=ax.transAxes)
@@ -279,12 +297,6 @@ def save_phi_histogram_png(
 
 
 def _get_downsampled_pc_torch(env, lidar, env_ids: torch.Tensor, max_pts: int | None):
-    """
-    Torch版：读取 pointcloud，做与 _get_downsampled_pc_np 同等的格式规整与过滤（不转numpy）。
-    返回:
-      pc: (E, P, 3) torch tensor on env.device
-      num_raw: (E,) 每个env原始点数（int tensor）
-    """
     if lidar is None:
         return None, None
 
@@ -295,37 +307,36 @@ def _get_downsampled_pc_torch(env, lidar, env_ids: torch.Tensor, max_pts: int | 
     if pc.dim() == 2:
         pc = pc.unsqueeze(0)
 
-    E, P, _ = pc.shape
-    num_raw = torch.full((E,), P, device=pc.device, dtype=torch.int32)
+    e, p, _ = pc.shape
+    num_raw = torch.full((e,), p, device=pc.device, dtype=torch.int32)
 
     finite_mask = torch.isfinite(pc).all(dim=-1)
     pc = pc.clone()
     pc[~finite_mask] = float("nan")
 
+    if max_pts is not None and max_pts > 0 and p > max_pts:
+        idx = torch.randperm(p, device=pc.device)[:max_pts]
+        pc = pc[:, idx, :]
     return pc, num_raw
 
 
-def _get_downsampled_pc_np(env, lidar, env0_ids: torch.Tensor, max_pts: int):
-    """
-    保持你当前逻辑语义：
-    - get_pointcloud
-    - 处理 (1,N,3)/(N,3)
-    - (可选)下采样（你现在注释掉）
-    - 转 numpy
-    - 过滤 NaN/Inf
-    """
+def _get_downsampled_pc_np(env, lidar, env_ids: torch.Tensor, max_pts: int):
     if lidar is None:
         return None, 0
     try:
-        pc_t, num_raw_t = _get_downsampled_pc_torch(env, lidar, env0_ids, max_pts=max_pts)
+        pc_t, num_raw_t = _get_downsampled_pc_torch(env, lidar, env_ids, max_pts=max_pts)
         if pc_t is None:
+            return None, 0
+
+        if pc_t.shape[0] != 1:
             return None, 0
 
         pc0 = pc_t[0]
         num_raw = int(num_raw_t[0].item()) if num_raw_t is not None else int(pc0.shape[0])
 
-        points_np = pc0.detach().cpu().numpy()
         import numpy as np
+
+        points_np = pc0.detach().cpu().numpy()
         points_np = points_np[np.isfinite(points_np).all(axis=1)]
         if points_np.shape[0] == 0:
             return None, num_raw
@@ -334,98 +345,121 @@ def _get_downsampled_pc_np(env, lidar, env0_ids: torch.Tensor, max_pts: int):
         return None, 0
 
 
-# =============================================================================
-# 核心诊断函数
-# =============================================================================
+def _get_env_origins_np(env):
+    origins = getattr(env.scene, "env_origins", None)
+    if origins is None:
+        return None
+    return origins.detach().cpu().numpy()
 
-def run_lidar_frame_diagnosis(
+
+def _extract_points_in_aabb(points_np, center_xyz, half_size_xyz):
+    import numpy as np
+
+    if points_np is None or len(points_np) == 0:
+        return None
+
+    center_xyz = np.asarray(center_xyz, dtype=np.float64)
+    half_size_xyz = np.asarray(half_size_xyz, dtype=np.float64)
+
+    lo = center_xyz - half_size_xyz
+    hi = center_xyz + half_size_xyz
+    mask = np.all((points_np >= lo) & (points_np <= hi), axis=1)
+    pts = points_np[mask]
+    if len(pts) == 0:
+        return None
+    return pts
+
+
+def _centroid_or_nan(points_np):
+    import numpy as np
+
+    if points_np is None or len(points_np) == 0:
+        return np.array([np.nan, np.nan, np.nan], dtype=np.float64)
+    return points_np.mean(axis=0)
+
+
+def spawn_scope_diagnostic_marker(
+    marker_path: str,
+    marker_center_xyz: tuple[float, float, float],
+    marker_size_xyz: tuple[float, float, float],
+):
+    import isaacsim.core.utils.prims as prim_utils
+    import isaaclab.sim as sim_utils
+
+    if prim_utils.is_prim_path_valid(marker_path):
+        return
+
+    parent = str(Path(marker_path).parent).replace("\\", "/")
+    if not prim_utils.is_prim_path_valid(parent):
+        prim_utils.create_prim(parent, "Xform")
+
+    cfg = sim_utils.CuboidCfg(
+        size=marker_size_xyz,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            rigid_body_enabled=True,
+            disable_gravity=True,
+            kinematic_enabled=True,
+        ),
+        collision_props=sim_utils.CollisionPropertiesCfg(),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.1, 0.1)),
+    )
+    cfg.func(marker_path, cfg, translation=marker_center_xyz)
+    print(f"[DIAGNOSE] 已创建 scope 诊断 marker: {marker_path}, center={marker_center_xyz}, size={marker_size_xyz}")
+
+
+def set_same_local_pose_for_envs(env, robot_asset, env_ids: torch.Tensor, local_xyz=(0.0, 0.0, 5.0), yaw_deg=0.0):
+    origins = env.scene.env_origins[env_ids]
+    local_xyz_t = torch.tensor(local_xyz, device=env.device, dtype=torch.float32).unsqueeze(0).repeat(len(env_ids), 1)
+    pos_w = origins + local_xyz_t
+
+    yaw = math.radians(float(yaw_deg))
+    qw = math.cos(yaw * 0.5)
+    qz = math.sin(yaw * 0.5)
+    quat = torch.tensor([qw, 0.0, 0.0, qz], device=env.device, dtype=torch.float32).unsqueeze(0).repeat(len(env_ids), 1)
+
+    root_pose = torch.cat([pos_w, quat], dim=1)
+    root_vel = torch.zeros((len(env_ids), 6), device=env.device, dtype=torch.float32)
+
+    robot_asset.write_root_pose_to_sim(root_pose, env_ids=env_ids)
+    robot_asset.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
+
+
+def run_rotation_frame_diagnosis(
     env,
     lidar,
     robot_asset,
     save_dir: Path,
-    phase1_steps: int = 30,
-    rotate_steps: int = 60,
-    phase2_steps: int = 30,
+    phase1_steps: int = 40,
+    rotate_steps: int = 80,
+    phase2_steps: int = 40,
     yaw_rate_rad: float = math.pi / 2.0,
     max_pts: int = 10000,
+    collect_every: int = 2,
+    min_xy_radius: float = 0.2,
+    hist_bin_deg: float = 5.0,
 ):
-    """
-    通过控制无人机偏航旋转，判断 LiDAR 点云是世界坐标系还是机体坐标系。
-
-    原理
-    ----
-    - 世界坐标系（pointcloud_in_world_frame=True）：
-        点云方向由世界系固定 XY 轴决定，机体旋转不影响点云 phi 分布。
-        → 旋转前后，相同障碍物的 phi 值不变，圆形均值差 ≈ 0°。
-
-    - 机体坐标系（pointcloud_in_world_frame=False）：
-        点云方向随机体朝向旋转，偏航 Δyaw 后，所有点的 phi 值
-        整体偏移约 -Δyaw（点云随机体转动）。
-        → 圆形均值差 ≈ -Δyaw（或 +Δyaw，取决于旋转方向约定）。
-
-    实验设计
-    --------
-    阶段0 (phase1_steps)：零动作，无人机悬停，记录初始偏航角 yaw0。
-    阶段1 (rotate_steps)：施加纯偏航角速度，旋转约 Δyaw = yaw_rate * dt * rotate_steps。
-    阶段2 (phase2_steps)：零动作，悬停，记录旋转后偏航角 yaw1，采集点云。
-
-    判断标准
-    --------
-    实际偏航变化量 Δyaw_actual（由四元数计算）
-    点云方位角圆形均值变化量 Δphi
-
-    若 |Δphi| < 20°  → 世界坐标系（点云不随机体转）
-    若 ||Δphi| - |Δyaw_actual|| < 30°  → 机体坐标系（点云随机体转）
-    否则 → 不确定（可能场景障碍物分布偏置、传感器延迟等原因）
-
-    参数
-    ----
-    env           : ManagerBasedRLEnv 实例
-    lidar         : LidarSensor 实例
-    robot_asset   : 无人机 Articulation 实例
-    save_dir      : Path，诊断图像保存目录
-    phase1_steps  : 阶段0 稳定步数
-    rotate_steps  : 旋转步数
-    phase2_steps  : 阶段2 稳定步数
-    yaw_rate_rad  : 旋转阶段偏航角速度 (rad/s)
-    max_pts       : 点云最大采样点数
-
-    返回
-    ----
-    result : dict，包含：
-        "frame"      : "world" | "body" | "unknown"
-        "delta_phi"  : float，点云方位角均值变化量（度）
-        "delta_yaw"  : float，实际偏航变化量（度）
-        "phi_mean1"  : float，阶段0 方位角均值（度）
-        "phi_mean2"  : float，阶段2 方位角均值（度）
-        "conclusion" : str，诊断结论文字
-    """
     import numpy as np
 
-    print("\n" + "=" * 70)
-    print("[DIAGNOSE] 开始 LiDAR 坐标系诊断")
-    print(f"  阶段0（稳定）: {phase1_steps} 步")
-    print(f"  旋转阶段:     {rotate_steps} 步，偏航速度={math.degrees(yaw_rate_rad):.1f}°/s")
-    print(f"  阶段2（稳定）: {phase2_steps} 步")
-    print("=" * 70)
+    print("\n" + "=" * 72)
+    print("[DIAGNOSE-ROT] 开始 LiDAR 旋转诊断（body-like vs world-like）")
+    print(f"  阶段1稳定步数: {phase1_steps}")
+    print(f"  旋转阶段步数: {rotate_steps}")
+    print(f"  阶段2稳定步数: {phase2_steps}")
+    print(f"  偏航角速度: {math.degrees(yaw_rate_rad):.1f}°/s")
+    print("=" * 72)
 
     env0_ids = torch.tensor([0], device=env.device)
 
-    # ── 辅助：从四元数提取偏航角（世界系，弧度）──────────────────────────────
     def _get_yaw_rad(asset) -> float:
-        """从 root_quat_w (wxyz) 提取偏航角（弧度）"""
         try:
-            q = asset.data.root_quat_w[0].detach().cpu()   # (4,) wxyz
+            q = asset.data.root_quat_w[0].detach().cpu()
             w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
-            # yaw = atan2(2*(w*z + x*y), 1 - 2*(y²+z²))
             yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
             return yaw
         except Exception:
             return 0.0
 
-    # ── 辅助：构建动作张量 ────────────────────────────────────────────────────
-    def _make_action(lin_vel=(0., 0., 0.), ang_vel=(0., 0., 0.)):
-        """构建 (num_envs, 6) 的动作张量（世界系，直接写 root velocity）"""
+    def _make_action(lin_vel=(0.0, 0.0, 0.0), ang_vel=(0.0, 0.0, 0.0)):
         a = torch.zeros(env.num_envs, 6, device=env.device)
         a[:, 0] = lin_vel[0]
         a[:, 1] = lin_vel[1]
@@ -435,221 +469,360 @@ def run_lidar_frame_diagnosis(
         a[:, 5] = ang_vel[2]
         return a
 
-    # ── 辅助：采集点云并计算 phi 分布 ────────────────────────────────────────
-    def _collect_phi(n_steps: int, action_fn):
-        """
-        运行 n_steps 步，每步执行 action_fn() 返回的动作，
-        最后一步采集点云，计算 phi 分布。
-        返回 (phi_deg_array, phi_mean, phi_std, yaw_rad_after)
-        """
-        phi_deg = None
-        phi_mean = float("nan")
-        phi_std = float("nan")
+    def _run_steps_and_collect(n_steps: int, action_fn, phase_name: str):
+        phi_all = []
+        sample_points = None
+        yaw_last = _get_yaw_rad(robot_asset)
 
-        for step_i in range(n_steps):
-            action = action_fn()
+        for i in range(n_steps):
+            action = action_fn(i)
             with torch.inference_mode():
                 env.step(action)
 
-        # 采集最后一步的点云（退出 inference_mode 后才能操作 numpy）
-        yaw_after = _get_yaw_rad(robot_asset)
-        points_np, _ = _get_downsampled_pc_np(env, lidar, env0_ids, max_pts=max_pts)
+            yaw_last = _get_yaw_rad(robot_asset)
 
-        if points_np is not None and len(points_np) > 0:
-            phi_deg, phi_mean, phi_std = _compute_phi_distribution(points_np)
-            print(f"    点云有效点数: {len(points_np)}，"
-                  f"phi 均值: {phi_mean:.1f}°，phi std: {phi_std:.1f}°，"
-                  f"偏航: {math.degrees(yaw_after):.1f}°")
-        else:
-            print("    [WARN] 未获取到有效点云！")
+            if ((i + 1) % max(int(collect_every), 1)) == 0:
+                points_np, _ = _get_downsampled_pc_np(env, lidar, env0_ids, max_pts=max_pts)
+                if points_np is not None and len(points_np) > 0:
+                    phi_deg, _, _ = _compute_phi_distribution(points_np, min_xy_radius=min_xy_radius)
+                    if phi_deg is not None and len(phi_deg) > 0:
+                        phi_all.append(phi_deg)
+                        if sample_points is None:
+                            sample_points = points_np.copy()
 
-        return phi_deg, phi_mean, phi_std, yaw_after
+        if len(phi_all) > 0:
+            phi_cat = np.concatenate(phi_all, axis=0)
+            phi_rad = np.deg2rad(phi_cat)
+            sin_mean = np.mean(np.sin(phi_rad))
+            cos_mean = np.mean(np.cos(phi_rad))
+            phi_mean = math.degrees(math.atan2(sin_mean, cos_mean)) % 360.0
+            r_bar = math.sqrt(sin_mean ** 2 + cos_mean ** 2)
+            r_bar = min(r_bar, 1.0 - 1e-9)
+            phi_std = math.degrees(math.sqrt(max(-2.0 * math.log(r_bar + 1e-9), 0.0)))
+            print(f"[DIAGNOSE-ROT] {phase_name}: 累计有效点 {len(phi_cat)}, phi_mean={phi_mean:.2f}°, phi_std={phi_std:.2f}°, yaw={math.degrees(yaw_last):.2f}°")
+            return phi_cat, phi_mean, phi_std, yaw_last, sample_points
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 阶段0：保持零动作，悬停，记录初始偏航 & 点云 phi 分布
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    print("\n[DIAGNOSE] 阶段0：悬停稳定，采集初始方位角分布...")
-    phi1_deg, phi_mean1, phi_std1, yaw0 = _collect_phi(
+        print(f"[DIAGNOSE-ROT] {phase_name}: 未获取到有效点云")
+        return None, float("nan"), float("nan"), yaw_last, sample_points
+
+    print("\n[DIAGNOSE-ROT] 阶段1：悬停稳定并累计采样点云...")
+    phi1_deg, phi_mean1, phi_std1, yaw0, pc1 = _run_steps_and_collect(
         n_steps=phase1_steps,
-        action_fn=lambda: _make_action(),   # 零动作
+        action_fn=lambda i: _make_action(),
+        phase_name="阶段1",
     )
-    print(f"  初始偏航 yaw0 = {math.degrees(yaw0):.2f}°")
-    print(f"  初始点云 phi_mean1 = {phi_mean1:.2f}°，phi_std1 = {phi_std1:.2f}°")
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 旋转阶段：施加纯偏航角速度（世界系 wz）
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    print(f"\n[DIAGNOSE] 旋转阶段：施加偏航速度 {math.degrees(yaw_rate_rad):.1f}°/s，共 {rotate_steps} 步...")
-
-    # 注意：RootTwistVelocityActionTerm.apply_actions() 调用
-    # write_root_velocity_to_sim，其 ang_vel 是世界系下的角速度
-    # wz > 0 → 绕世界 Z+ 轴逆时针旋转（右手系）
+    print(f"\n[DIAGNOSE-ROT] 旋转阶段：施加偏航角速度...")
     for step_i in range(rotate_steps):
-        action = _make_action(ang_vel=(0., 0., yaw_rate_rad))
         with torch.inference_mode():
-            env.step(action)
+            env.step(_make_action(ang_vel=(0.0, 0.0, yaw_rate_rad)))
         if (step_i + 1) % 20 == 0:
             yaw_cur = _get_yaw_rad(robot_asset)
-            print(f"    旋转步 {step_i+1}/{rotate_steps}，当前偏航: {math.degrees(yaw_cur):.1f}°")
+            print(f"    旋转步 {step_i + 1}/{rotate_steps}, 当前偏航={math.degrees(yaw_cur):.1f}°")
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 阶段2：停止旋转，悬停稳定，采集旋转后点云 phi 分布
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    print(f"\n[DIAGNOSE] 阶段2：停止旋转，悬停稳定，采集旋转后方位角分布...")
-    phi2_deg, phi_mean2, phi_std2, yaw1 = _collect_phi(
+    print("\n[DIAGNOSE-ROT] 阶段2：旋转后悬停稳定并累计采样点云...")
+    phi2_deg, phi_mean2, phi_std2, yaw1, pc2 = _run_steps_and_collect(
         n_steps=phase2_steps,
-        action_fn=lambda: _make_action(),   # 零动作
+        action_fn=lambda i: _make_action(),
+        phase_name="阶段2",
     )
-    print(f"  旋转后偏航 yaw1 = {math.degrees(yaw1):.2f}°")
-    print(f"  旋转后点云 phi_mean2 = {phi_mean2:.2f}°，phi_std2 = {phi_std2:.2f}°")
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 判断逻辑
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    # 实际偏航变化量（度，有向）
-    delta_yaw_rad = _circular_diff_deg(math.degrees(yaw1), math.degrees(yaw0))
-    delta_yaw_deg = delta_yaw_rad   # 已经是度
-    # 实际计算：circular diff of yaw angles
     delta_yaw_deg = _circular_diff_deg(math.degrees(yaw1), math.degrees(yaw0))
-
-    # 点云方位角均值变化量（度，有向）
     if math.isfinite(phi_mean1) and math.isfinite(phi_mean2):
         delta_phi_deg = _circular_diff_deg(phi_mean2, phi_mean1)
     else:
         delta_phi_deg = float("nan")
 
-    print("\n" + "─" * 60)
-    print(f"[DIAGNOSE] 偏航变化量:    Δyaw  = {delta_yaw_deg:+.1f}°")
-    print(f"[DIAGNOSE] phi均值变化量: Δphi  = {delta_phi_deg:+.1f}°")
-    print("─" * 60)
+    hist1 = _hist_from_phi(phi1_deg, bin_deg=hist_bin_deg)
+    hist2 = _hist_from_phi(phi2_deg, bin_deg=hist_bin_deg)
+    shift_0_deg, _ = _best_circular_shift_deg(hist1, hist2, bin_deg=hist_bin_deg)
 
-    # 判断阈值
-    WORLD_THRESHOLD = 20.0    # |Δphi| < 20° → 认为是世界系（点云不随机体转）
-    BODY_MATCH_TOL  = 35.0    # ||Δphi| - |Δyaw|| < 35° → 认为是机体系
+    abs_shift = abs(shift_0_deg)
+    abs_yaw = abs(delta_yaw_deg)
+
+    print("\n" + "-" * 60)
+    print(f"[DIAGNOSE-ROT] Δyaw = {delta_yaw_deg:+.2f}°")
+    print(f"[DIAGNOSE-ROT] Δphi(mean) = {delta_phi_deg:+.2f}°")
+    print(f"[DIAGNOSE-ROT] 直方图最优循环移位 = {shift_0_deg:+.2f}°")
+    print("-" * 60)
+
+    WORLD_THRESHOLD = 20.0
+    BODY_MATCH_TOL = 35.0
 
     frame = "unknown"
     conclusion = ""
 
-    if math.isnan(delta_phi_deg):
+    if phi1_deg is None or phi2_deg is None:
         frame = "unknown"
-        conclusion = (
-            "诊断失败：无法获取有效点云（障碍物可能不在 LiDAR FOV 内）。\n"
-            "请检查障碍物位置或调整 LiDAR 参数。"
-        )
-    elif abs(delta_phi_deg) < WORLD_THRESHOLD:
-        frame = "world"
-        conclusion = (
-            f"✅ 世界坐标系 (World Frame)\n"
-            f"无人机偏航 {delta_yaw_deg:+.1f}°，点云 phi 均值仅变化 {delta_phi_deg:+.1f}°（< {WORLD_THRESHOLD}°阈值）。\n"
-            f"点云方向固定于世界系，不随机体旋转。\n"
-            f"get_pointcloud() 返回世界坐标系下的相对向量。"
-        )
-    elif abs(abs(delta_phi_deg) - abs(delta_yaw_deg)) < BODY_MATCH_TOL:
-        frame = "body"
-        conclusion = (
-            f"⚠️  机体坐标系 (Body Frame)\n"
-            f"无人机偏航 {delta_yaw_deg:+.1f}°，点云 phi 均值变化 {delta_phi_deg:+.1f}°（接近偏航量）。\n"
-            f"点云方向随机体旋转，说明是机体坐标系。\n"
-            f"get_pointcloud() 返回机体坐标系下的相对向量。\n"
-            f"需要将速度转换为机体系，或将点云转换为世界系，才能正确计算 bin 方向。"
-        )
+        conclusion = "诊断失败：未采集到足够有效的 LiDAR 点云。"
     else:
-        frame = "unknown"
-        conclusion = (
-            f"❓ 不确定\n"
-            f"无人机偏航 {delta_yaw_deg:+.1f}°，点云 phi 均值变化 {delta_phi_deg:+.1f}°。\n"
-            f"变化量既不接近 0（世界系）也不接近偏航量（机体系）。\n"
-            f"可能原因：障碍物稀疏/分布不均匀、传感器延迟、episode 中途 reset 等。\n"
-            f"建议增加 --num_obstacles、延长各阶段步数后重试。"
+        is_world_like = (abs(delta_phi_deg) < WORLD_THRESHOLD) or (abs(shift_0_deg) < WORLD_THRESHOLD)
+        is_body_like = (
+            abs(abs(delta_phi_deg) - abs_yaw) < BODY_MATCH_TOL
+            or abs(abs_shift - abs_yaw) < BODY_MATCH_TOL
         )
 
-    print(f"\n[DIAGNOSE] 判断结果: {frame.upper()}")
-    print(f"[DIAGNOSE] {conclusion}")
-    print("=" * 70)
+        if is_world_like and not is_body_like:
+            frame = "world_like"
+            conclusion = (
+                f"✅ 旋转诊断结果：world-like\n"
+                f"Δyaw={delta_yaw_deg:+.1f}°, Δphi={delta_phi_deg:+.1f}°, hist_shift={shift_0_deg:+.1f}°。"
+            )
+        elif is_body_like and not is_world_like:
+            frame = "body_like"
+            conclusion = (
+                f"⚠️ 旋转诊断结果：body-like\n"
+                f"Δyaw={delta_yaw_deg:+.1f}°, Δphi={delta_phi_deg:+.1f}°, hist_shift={shift_0_deg:+.1f}°。"
+            )
+        else:
+            frame = "unknown"
+            conclusion = (
+                f"❓ 旋转诊断不唯一\n"
+                f"Δyaw={delta_yaw_deg:+.1f}°, Δphi={delta_phi_deg:+.1f}°, hist_shift={shift_0_deg:+.1f}°。"
+            )
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 保存诊断图像
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print(f"\n[DIAGNOSE-ROT] 判断结果: {frame.upper()}")
+    print(f"[DIAGNOSE-ROT] {conclusion}")
+    print("=" * 72)
+
     save_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1) 方位角直方图对比图
-    hist_path = save_dir / "lidar_frame_diagnosis_phi_histogram.png"
+    hist_path = save_dir / "lidar_rotation_diagnosis_phi_histogram.png"
     save_phi_histogram_png(
         phi1_deg=phi1_deg,
         phi2_deg=phi2_deg,
         save_path=str(hist_path),
-        label1=f"阶段0（初始偏航 {math.degrees(yaw0):.1f}°）",
-        label2=f"阶段2（旋转后偏航 {math.degrees(yaw1):.1f}°）",
+        label1=f"阶段1（yaw={math.degrees(yaw0):.1f}°）",
+        label2=f"阶段2（yaw={math.degrees(yaw1):.1f}°）",
         mean1=phi_mean1,
         mean2=phi_mean2,
         conclusion=conclusion.replace("\n", " | "),
+        bin_deg=hist_bin_deg,
     )
 
-    # 2) 点云 XY 俯视图对比（用于直观查看点云是否随机体转动）
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6), dpi=150)
-    fig.suptitle(f"LiDAR 点云 XY 俯视图对比\n{conclusion.split(chr(10))[0]}", fontsize=11)
+    if pc1 is not None:
+        save_pointcloud_png(pc1, str(save_dir / "lidar_rotation_phase1_pointcloud.png"), title="rotation phase1", s=2)
+    if pc2 is not None:
+        save_pointcloud_png(pc2, str(save_dir / "lidar_rotation_phase2_pointcloud.png"), title="rotation phase2", s=2)
 
-    for ax, phi_data, label, yaw_deg in [
-        (axes[0], phi1_deg, f"阶段0（偏航={math.degrees(yaw0):.1f}°）", math.degrees(yaw0)),
-        (axes[1], phi2_deg, f"阶段2（偏航={math.degrees(yaw1):.1f}°）", math.degrees(yaw1)),
-    ]:
-        ax.set_title(label, fontsize=10)
-        ax.set_xlabel("X (m)")
-        ax.set_ylabel("Y (m)")
-        ax.set_aspect("equal")
-        ax.grid(True, alpha=0.3)
-        ax.axhline(0, color="gray", lw=0.8)
-        ax.axvline(0, color="gray", lw=0.8)
-
-        # 绘制机体朝向箭头（单位：3m 长）
-        arrow_len = 3.0
-        yaw_r = math.radians(yaw_deg)
-        ax.annotate(
-            "", xy=(arrow_len * math.cos(yaw_r), arrow_len * math.sin(yaw_r)),
-            xytext=(0, 0),
-            arrowprops=dict(arrowstyle="->", color="red", lw=2.0),
-        )
-        ax.text(
-            arrow_len * math.cos(yaw_r) * 1.1,
-            arrow_len * math.sin(yaw_r) * 1.1,
-            "机头",
-            color="red", fontsize=9,
-        )
-
-    # 重新采集点云用于俯视图（此时已在阶段2之后）
-    # 用已有的 phi 数据反推 XY 点（仅用于可视化，半径假设均匀）
-    # 实际上我们直接用 phi 数组画极坐标散点
-    for ax, phi_data in [(axes[0], phi1_deg), (axes[1], phi2_deg)]:
-        if phi_data is not None and len(phi_data) > 0:
-            phi_r = np.radians(phi_data)
-            # 用 r=1 的单位圆散点（只关心方向，不关心距离）
-            ax.scatter(
-                np.cos(phi_r), np.sin(phi_r),
-                s=0.5, alpha=0.3, color="steelblue",
-            )
-            ax.set_xlim(-1.5, 1.5)
-            ax.set_ylim(-1.5, 1.5)
-
-    xy_path = save_dir / "lidar_frame_diagnosis_xy_view.png"
-    fig.tight_layout()
-    fig.savefig(str(xy_path), bbox_inches="tight")
-    plt.close(fig)
-    print(f"[DIAGNOSE] XY 俯视图已保存: {xy_path}")
-
-    result = {
+    return {
         "frame": frame,
         "delta_phi": delta_phi_deg,
         "delta_yaw": delta_yaw_deg,
         "phi_mean1": phi_mean1,
         "phi_mean2": phi_mean2,
+        "hist_shift_deg": shift_0_deg,
         "conclusion": conclusion,
     }
-    return result
+
+
+def run_world_scope_diagnosis(
+    env,
+    lidar,
+    robot_asset,
+    save_dir: Path,
+    marker_center_xyz=(12.0, 6.0, 5.0),
+    marker_size_xyz=(2.0, 2.0, 8.0),
+    local_pose_xyz=(0.0, 0.0, 5.0),
+    settle_steps: int = 20,
+    max_pts: int = 10000,
+    aabb_margin: float = 1.5,
+):
+    """
+    彻底区分：global world vs local world
+
+    实验设计：
+    - 要求至少 2 个 env，且 env_spacing > 0，使 env_origins 不同
+    - 在 /World 中放一个固定全局位置的 marker
+    - 将 env_0 与 env_1 的机器人放到相同 local pose
+    - 分别读取 env_0 / env_1 的点云
+    - 比较 marker 点云在两份点云中的坐标落点
+
+    判别：
+    - global world:
+        env_1 中 marker 坐标 ≈ marker_global
+    - local world:
+        env_1 中 marker 坐标 ≈ marker_global - env_origin_1
+    """
+    import numpy as np
+
+    print("\n" + "=" * 72)
+    print("[DIAGNOSE-SCOPE] 开始 global world vs local world 诊断")
+    print("=" * 72)
+
+    if env.num_envs < 2:
+        return {
+            "scope_frame": "unknown",
+            "conclusion": "❌ 至少需要 2 个 env 才能区分 global world 与 local world。",
+        }
+
+    origins = _get_env_origins_np(env)
+    if origins is None:
+        return {
+            "scope_frame": "unknown",
+            "conclusion": "❌ 无法读取 scene.env_origins。",
+        }
+
+    origin0 = origins[0]
+    origin1 = origins[1]
+    delta_origin = origin1 - origin0
+
+    print(f"[DIAGNOSE-SCOPE] env_0 origin = {origin0}")
+    print(f"[DIAGNOSE-SCOPE] env_1 origin = {origin1}")
+    print(f"[DIAGNOSE-SCOPE] Δorigin = {delta_origin}")
+
+    marker_path = "/World/FrameScopeDiagnostic/Marker"
+    spawn_scope_diagnostic_marker(
+        marker_path=marker_path,
+        marker_center_xyz=marker_center_xyz,
+        marker_size_xyz=marker_size_xyz,
+    )
+
+    env_ids = torch.tensor([0, 1], device=env.device, dtype=torch.long)
+    set_same_local_pose_for_envs(
+        env=env,
+        robot_asset=robot_asset,
+        env_ids=env_ids,
+        local_xyz=local_pose_xyz,
+        yaw_deg=0.0,
+    )
+
+    # 稳定一会儿，让传感器刷新
+    zero_action = torch.zeros(env.num_envs, 6, device=env.device)
+    for _ in range(max(int(settle_steps), 1)):
+        with torch.inference_mode():
+            env.step(zero_action)
+
+    pc0_np, _ = _get_downsampled_pc_np(env, lidar, torch.tensor([0], device=env.device), max_pts=max_pts)
+    pc1_np, _ = _get_downsampled_pc_np(env, lidar, torch.tensor([1], device=env.device), max_pts=max_pts)
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    if pc0_np is not None:
+        save_xy_scatter_png(pc0_np, str(save_dir / "scope_env0_xy.png"), title="scope env0 XY", s=1)
+    if pc1_np is not None:
+        save_xy_scatter_png(pc1_np, str(save_dir / "scope_env1_xy.png"), title="scope env1 XY", s=1)
+
+    half = (
+        0.5 * marker_size_xyz[0] + float(aabb_margin),
+        0.5 * marker_size_xyz[1] + float(aabb_margin),
+        0.5 * marker_size_xyz[2] + float(aabb_margin),
+    )
+
+    # 假设 1: 点云在 global world
+    expected0_global = np.asarray(marker_center_xyz, dtype=np.float64)
+    expected1_global = np.asarray(marker_center_xyz, dtype=np.float64)
+
+    # 假设 2: 点云在 local world（env-local world）
+    expected0_local = np.asarray(marker_center_xyz, dtype=np.float64) - origin0
+    expected1_local = np.asarray(marker_center_xyz, dtype=np.float64) - origin1
+
+    # 从各自点云中提取与 marker 匹配的点
+    pts0_global = _extract_points_in_aabb(pc0_np, expected0_global, half)
+    pts1_global = _extract_points_in_aabb(pc1_np, expected1_global, half)
+
+    pts0_local = _extract_points_in_aabb(pc0_np, expected0_local, half)
+    pts1_local = _extract_points_in_aabb(pc1_np, expected1_local, half)
+
+    c0g = _centroid_or_nan(pts0_global)
+    c1g = _centroid_or_nan(pts1_global)
+    c0l = _centroid_or_nan(pts0_local)
+    c1l = _centroid_or_nan(pts1_local)
+
+    def _residual(c, ref):
+        if np.any(~np.isfinite(c)):
+            return float("inf")
+        return float(np.linalg.norm(c - np.asarray(ref, dtype=np.float64)))
+
+    # env0 两个假设通常可能都接近，因为 origin0 常是 [0,0,0]，关键看 env1
+    r1_global = _residual(c1g, expected1_global)
+    r1_local = _residual(c1l, expected1_local)
+
+    n1_global = 0 if pts1_global is None else len(pts1_global)
+    n1_local = 0 if pts1_local is None else len(pts1_local)
+
+    print("\n[DIAGNOSE-SCOPE] env_1 marker 匹配统计：")
+    print(f"  global 假设: hits={n1_global}, centroid={c1g}, residual={r1_global:.3f}")
+    print(f"  local  假设: hits={n1_local}, centroid={c1l}, residual={r1_local:.3f}")
+
+    scope_frame = "unknown"
+    conclusion = ""
+
+    # 判据：优先比较 hits 与 residual
+    # global world: env1 在 global 窗口里应有明显 marker 点，且 residual 小
+    # local world : env1 在 local 窗口里应有明显 marker 点，且 residual 小
+    hit_thr = 15
+    res_thr = 1.5
+
+    global_ok = (n1_global >= hit_thr) and (r1_global < res_thr)
+    local_ok = (n1_local >= hit_thr) and (r1_local < res_thr)
+
+    if global_ok and not local_ok:
+        scope_frame = "global_world"
+        conclusion = (
+            "✅ 结论：LiDAR 点云是全局 world 坐标。\n"
+            f"env_1 中 marker 出现在全局位置附近：hits={n1_global}, residual={r1_global:.3f}。"
+        )
+    elif local_ok and not global_ok:
+        scope_frame = "local_world"
+        conclusion = (
+            "✅ 结论：LiDAR 点云是 env-local world 坐标。\n"
+            f"env_1 中 marker 出现在 marker_global - env_origin_1 附近：hits={n1_local}, residual={r1_local:.3f}。"
+        )
+    elif global_ok and local_ok:
+        if r1_global + 0.2 < r1_local:
+            scope_frame = "global_world"
+            conclusion = (
+                "✅ 结论：更偏向全局 world 坐标。\n"
+                f"global residual={r1_global:.3f} 明显优于 local residual={r1_local:.3f}。"
+            )
+        elif r1_local + 0.2 < r1_global:
+            scope_frame = "local_world"
+            conclusion = (
+                "✅ 结论：更偏向 local world 坐标。\n"
+                f"local residual={r1_local:.3f} 明显优于 global residual={r1_global:.3f}。"
+            )
+        else:
+            scope_frame = "unknown"
+            conclusion = (
+                "❓ global/local 两种假设都能部分解释当前结果，残差接近，无法唯一判别。\n"
+                "建议增大 env_spacing，或调整 marker 位置到更孤立的位置后重试。"
+            )
+    else:
+        scope_frame = "unknown"
+        conclusion = (
+            "❓ 无法从 marker 匹配中可靠判别 global world 还是 local world。\n"
+            "建议：\n"
+            "1) 使用 num_envs >= 2；\n"
+            "2) 设置 env_spacing > 0；\n"
+            "3) 增大 marker 尺寸；\n"
+            "4) 减少随机障碍物数量或增大 marker AABB margin。"
+        )
+
+    print(f"\n[DIAGNOSE-SCOPE] 判断结果: {scope_frame.upper()}")
+    print(f"[DIAGNOSE-SCOPE] {conclusion}")
+    print("=" * 72)
+
+    # 保存 marker 提取后的点云图
+    if pts1_global is not None:
+        save_pointcloud_png(pts1_global, str(save_dir / "scope_env1_marker_under_global_hypothesis.png"),
+                            title="env1 marker under global hypothesis", s=4)
+    if pts1_local is not None:
+        save_pointcloud_png(pts1_local, str(save_dir / "scope_env1_marker_under_local_hypothesis.png"),
+                            title="env1 marker under local hypothesis", s=4)
+
+    return {
+        "scope_frame": scope_frame,
+        "global_hits_env1": int(n1_global),
+        "local_hits_env1": int(n1_local),
+        "global_residual_env1": float(r1_global),
+        "local_residual_env1": float(r1_local),
+        "expected_global_env1": expected1_global.tolist(),
+        "expected_local_env1": expected1_local.tolist(),
+        "conclusion": conclusion,
+    }
 
 
 # =============================================================================
-# 1) 启动 Kit（关键：必须在 isaaclab/mdp 等 import 之前）
+# 1) 启动 Kit
 # =============================================================================
 args_cli = parse_args()
 
@@ -659,7 +832,7 @@ simulation_app = app_launcher.app
 
 
 # =============================================================================
-# 2) 现在再 import isaaclab/torch/pxr 相关
+# 2) import isaaclab / torch / pxr
 # =============================================================================
 import numpy as np
 import torch
@@ -680,13 +853,10 @@ from isaaclab.managers import (
     TerminationTermCfg as DoneTerm,
     ActionTermCfg as ActionTermCfg,
 )
-
 from isaaclab.managers.action_manager import ActionTerm
-
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-
 from isaaclab.sensors import LidarSensorCfg
 
 import sys
@@ -735,8 +905,8 @@ class RootTwistVelocityActionTerm(ActionTerm):
 
         self._lin_scale = float(p_get("lin_scale", getattr(cfg, "lin_scale", args_cli.lin_vel_scale)))
         self._ang_scale = float(p_get("ang_scale", getattr(cfg, "ang_scale", args_cli.ang_vel_scale)))
-        self._lin_clip  = float(p_get("lin_clip",  getattr(cfg, "lin_clip",  args_cli.lin_vel_clip)))
-        self._ang_clip  = float(p_get("ang_clip",  getattr(cfg, "ang_clip",  args_cli.ang_vel_clip)))
+        self._lin_clip = float(p_get("lin_clip", getattr(cfg, "lin_clip", args_cli.lin_vel_clip)))
+        self._ang_clip = float(p_get("ang_clip", getattr(cfg, "ang_clip", args_cli.ang_vel_clip)))
 
     @property
     def action_dim(self) -> int:
@@ -888,26 +1058,22 @@ def obs_lidar_min_range_grid(
     empty_value: float = 0.0,
     max_vis_points: int | None = None,
 ) -> torch.Tensor:
-    T = int((theta_max - theta_min) / delta_theta)
-    Pn = int((phi_max - phi_min) / delta_phi)
-    out_shape = (env.num_envs, T * Pn)
+    t_bins = max(int((theta_max - theta_min) / delta_theta), 1)
+    p_bins = max(int((phi_max - phi_min) / delta_phi), 1)
+    out_shape = (env.num_envs, t_bins * p_bins)
 
     if not hasattr(env, "scene"):
         return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
 
     try:
         lidar = env.scene[lidar_name]
-    except KeyError:
-        return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
     except Exception:
         return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
 
     env_ids = torch.arange(env.num_envs, device=env.device)
     pc, _ = _get_downsampled_pc_torch(env, lidar, env_ids, max_pts=max_vis_points)
     if pc is None:
-        T = int((theta_max - theta_min) / delta_theta)
-        P = int((phi_max - phi_min) / delta_phi)
-        return torch.zeros((env.num_envs, T * P), device=env.device, dtype=torch.float32)
+        return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
 
     x = pc[..., 0]
     y = pc[..., 1]
@@ -915,6 +1081,7 @@ def obs_lidar_min_range_grid(
 
     valid = torch.isfinite(x) & torch.isfinite(y) & torch.isfinite(z)
     r = torch.sqrt(x * x + y * y + z * z + 1e-12)
+
     cos_theta = torch.clamp(z / r, -1.0, 1.0)
     theta = torch.rad2deg(torch.acos(cos_theta))
     phi = torch.rad2deg(torch.atan2(y, x))
@@ -924,18 +1091,15 @@ def obs_lidar_min_range_grid(
     in_phi = (phi >= phi_min) & (phi < phi_max)
     m = valid & in_theta & in_phi
 
-    T = int((theta_max - theta_min) / delta_theta)
-    Pn = int((phi_max - phi_min) / delta_phi)
-    num_bins = T * Pn
-
+    num_bins = t_bins * p_bins
     bins = torch.full((env.num_envs, num_bins), float("inf"), device=env.device, dtype=torch.float32)
 
     if m.any():
         t_idx = torch.floor((theta - theta_min) / delta_theta).to(torch.long)
         p_idx = torch.floor((phi - phi_min) / delta_phi).to(torch.long)
-        t_idx = torch.clamp(t_idx, 0, T - 1)
-        p_idx = torch.clamp(p_idx, 0, Pn - 1)
-        lin_idx = t_idx * Pn + p_idx
+        t_idx = torch.clamp(t_idx, 0, t_bins - 1)
+        p_idx = torch.clamp(p_idx, 0, p_bins - 1)
+        lin_idx = t_idx * p_bins + p_idx
 
         for e in range(env.num_envs):
             me = m[e]
@@ -970,6 +1134,7 @@ class MySceneCfg(InteractiveSceneCfg):
         ),
         debug_vis=True,
     )
+
     robot: ArticulationCfg = DRONE_CFG.replace(
         prim_path="{ENV_REGEX_NS}/Robot",
     )
@@ -982,10 +1147,12 @@ class MySceneCfg(InteractiveSceneCfg):
         rot=(1.0, 0.0, 0.0, 0.0),
         joint_pos={".*": 0.0},
     )
+
     if LIDAR_CFG is not None and args_cli.enable_lidar:
         lidar: LidarSensorCfg = LIDAR_CFG.replace(
             prim_path="{ENV_REGEX_NS}/Robot/body",
         )
+
     dome_light = AssetBaseCfg(
         prim_path="/World/DomeLight",
         spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75)),
@@ -1006,8 +1173,8 @@ class ActionsCfg:
     root_twist.params = {
         "lin_scale": args_cli.lin_vel_scale,
         "ang_scale": args_cli.ang_vel_scale,
-        "lin_clip":  args_cli.lin_vel_clip,
-        "ang_clip":  args_cli.ang_vel_clip,
+        "lin_clip": args_cli.lin_vel_clip,
+        "ang_clip": args_cli.ang_vel_clip,
     }
 
 
@@ -1035,7 +1202,8 @@ class ObservationsCfg:
                 "max_vis_points": int(args_cli.lidar_max_vis_points),
             },
         )
-        def post_init(self):
+
+        def __post_init__(self):
             self.enable_corruption = False
             self.concatenate_terms = True
 
@@ -1134,6 +1302,7 @@ class ObstacleSpawner:
 
     def spawn_obstacles(self):
         import isaacsim.core.utils.prims as prim_utils
+
         prim_utils.create_prim("/World/Obstacles", "Xform")
         print(f"\n[INFO]: 正在生成 {self.num_obstacles} 个共享障碍物...")
         for i in range(self.num_obstacles):
@@ -1143,7 +1312,11 @@ class ObstacleSpawner:
             x_size = np.random.uniform(*self.xy_size_range)
             y_size = np.random.uniform(*self.xy_size_range)
             z_size = self.z_height
-            color = (np.random.uniform(0.3, 0.7), np.random.uniform(0.3, 0.7), np.random.uniform(0.3, 0.7))
+            color = (
+                np.random.uniform(0.3, 0.7),
+                np.random.uniform(0.3, 0.7),
+                np.random.uniform(0.3, 0.7),
+            )
             cfg_obstacle = sim_utils.CuboidCfg(
                 size=(x_size, y_size, z_size),
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
@@ -1158,7 +1331,7 @@ class ObstacleSpawner:
 
 
 # =============================================================================
-# 9) 自定义 RLEnv
+# 8) 自定义 RLEnv
 # =============================================================================
 class MyDroneRLEnv(ManagerBasedRLEnv):
     def __init__(self, cfg: MyEnvCfg):
@@ -1192,7 +1365,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
 
 
 # =============================================================================
-# 10) ActorCritic（保持不变）
+# 9) ActorCritic
 # =============================================================================
 def gaussian_log_prob(actions, mu, std):
     var = std * std
@@ -1242,14 +1415,13 @@ class ActorCritic(nn.Module):
 
 
 # =============================================================================
-# 11) main
+# 10) main
 # =============================================================================
 def main():
     print("=" * 80)
     print("ManagerBasedRLEnv Drone - single file + LiDAR 坐标系诊断")
     print("=" * 80)
 
-    # 诊断模式需要 enable_lidar
     if args_cli.diagnose_lidar_frame and not args_cli.enable_lidar:
         print("[ERROR] --diagnose_lidar_frame 需要同时指定 --enable_lidar，退出。")
         simulation_app.close()
@@ -1257,6 +1429,7 @@ def main():
 
     env_cfg = MyEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
+    env_cfg.scene.env_spacing = float(args_cli.env_spacing)
     env_cfg.sim.device = args_cli.device
 
     try:
@@ -1271,7 +1444,7 @@ def main():
     dt = float(env_cfg.sim.dt)
     ctrl_hz = 1.0 / (dt * decim)
 
-    print(f"\n[配置] num_envs={env_cfg.scene.num_envs}, num_obstacles={args_cli.num_obstacles}")
+    print(f"\n[配置] num_envs={env_cfg.scene.num_envs}, env_spacing={env_cfg.scene.env_spacing}, num_obstacles={args_cli.num_obstacles}")
     print(f"[配置] sim_dt={dt:.6f}, decimation={decim}, ctrl_hz={ctrl_hz:.1f}")
 
     print("\n[状态] 正在生成共享障碍物...")
@@ -1304,9 +1477,7 @@ def main():
 
     env0_ids = torch.tensor([0], device=env.device)
 
-    # =========================================================================
-    # 诊断模式：运行完即退出
-    # =========================================================================
+    # 诊断模式
     if args_cli.diagnose_lidar_frame:
         if lidar is None:
             print("[ERROR] LiDAR 未成功初始化，无法进行诊断。")
@@ -1322,7 +1493,7 @@ def main():
 
         save_dir = Path(args_cli.lidar_save_dir).expanduser()
 
-        result = run_lidar_frame_diagnosis(
+        rot_result = run_rotation_frame_diagnosis(
             env=env,
             lidar=lidar,
             robot_asset=robot_asset,
@@ -1332,25 +1503,52 @@ def main():
             phase2_steps=args_cli.diagnose_phase2_steps,
             yaw_rate_rad=args_cli.diagnose_yaw_rate,
             max_pts=int(args_cli.lidar_max_vis_points),
+            collect_every=int(args_cli.diagnose_collect_every),
+            min_xy_radius=float(args_cli.diagnose_min_xy_radius),
+            hist_bin_deg=float(args_cli.diagnose_hist_bin_deg),
         )
 
-        print("\n" + "=" * 70)
+        scope_result = run_world_scope_diagnosis(
+            env=env,
+            lidar=lidar,
+            robot_asset=robot_asset,
+            save_dir=save_dir,
+            marker_center_xyz=(
+                float(args_cli.diagnose_scope_marker_x),
+                float(args_cli.diagnose_scope_marker_y),
+                float(args_cli.diagnose_scope_marker_z),
+            ),
+            marker_size_xyz=(
+                float(args_cli.diagnose_scope_marker_sx),
+                float(args_cli.diagnose_scope_marker_sy),
+                float(args_cli.diagnose_scope_marker_sz),
+            ),
+            local_pose_xyz=(
+                float(args_cli.diagnose_scope_local_pose_x),
+                float(args_cli.diagnose_scope_local_pose_y),
+                float(args_cli.diagnose_scope_local_pose_z),
+            ),
+            settle_steps=int(args_cli.diagnose_scope_settle_steps),
+            max_pts=int(args_cli.lidar_max_vis_points),
+            aabb_margin=float(args_cli.diagnose_scope_aabb_margin),
+        )
+
+        print("\n" + "=" * 72)
         print("[DIAGNOSE] 诊断完成，结果摘要：")
-        print(f"  坐标系类型: {result['frame'].upper()}")
-        print(f"  Δyaw      : {result['delta_yaw']:+.1f}°")
-        print(f"  Δphi      : {result['delta_phi']:+.1f}°")
-        print(f"  phi_mean1 : {result['phi_mean1']:.1f}°")
-        print(f"  phi_mean2 : {result['phi_mean2']:.1f}°")
+        print(f"  旋转诊断: {rot_result['frame'].upper()}")
+        print(f"    Δyaw      : {rot_result['delta_yaw']:+.1f}°")
+        print(f"    Δphi      : {rot_result['delta_phi']:+.1f}°")
+        print(f"    hist_shift: {rot_result['hist_shift_deg']:+.1f}°")
+        print(f"    phi_mean1 : {rot_result['phi_mean1']:.1f}°")
+        print(f"    phi_mean2 : {rot_result['phi_mean2']:.1f}°")
+        print(f"  Scope 诊断: {scope_result['scope_frame'].upper()}")
         print(f"  图像保存至: {save_dir}")
-        print("=" * 70)
+        print("=" * 72)
 
         env.close()
         return
 
-    # =========================================================================
-    # 非诊断模式：正常运行
-    # =========================================================================
-
+    # 非诊断模式
     def _maybe_print_lidar_stats(step_i: int):
         if lidar is None:
             return
@@ -1428,7 +1626,7 @@ def main():
         env.close()
         return
 
-    # ── 训练模式（保持不变）────────────────────────────────────────────────────
+    # 训练模式
     obs_tensor = obs["policy"]
     obs_dim = obs_tensor.shape[-1]
     act_dim = env.action_manager.total_action_dim
@@ -1438,8 +1636,8 @@ def main():
     model = ActorCritic(obs_dim=obs_dim, act_dim=act_dim).to(env.device)
     optimizer = optim.Adam(model.parameters(), lr=args_cli.lr)
 
-    T = args_cli.rollout_len
-    N = env.num_envs
+    t_horizon = args_cli.rollout_len
+    n_envs = env.num_envs
     gamma = float(args_cli.gamma)
     gae_lam = float(args_cli.gae_lambda)
     vf_coef = float(args_cli.value_coef)
@@ -1448,19 +1646,20 @@ def main():
     log_every = int(args_cli.log_every)
 
     for it in range(1, args_cli.train_iters + 1):
-        obs_buf = torch.zeros((T, N, obs_dim), device=env.device)
-        act_buf = torch.zeros((T, N, act_dim), device=env.device)
-        logp_buf = torch.zeros((T, N), device=env.device)
-        val_buf = torch.zeros((T, N), device=env.device)
-        rew_buf = torch.zeros((T, N), device=env.device)
-        done_buf = torch.zeros((T, N), device=env.device, dtype=torch.bool)
+        obs_buf = torch.zeros((t_horizon, n_envs, obs_dim), device=env.device)
+        act_buf = torch.zeros((t_horizon, n_envs, act_dim), device=env.device)
+        logp_buf = torch.zeros((t_horizon, n_envs), device=env.device)
+        val_buf = torch.zeros((t_horizon, n_envs), device=env.device)
+        rew_buf = torch.zeros((t_horizon, n_envs), device=env.device)
+        done_buf = torch.zeros((t_horizon, n_envs), device=env.device, dtype=torch.bool)
 
-        for t in range(T):
+        for t in range(t_horizon):
             obs_t = obs["policy"]
             with torch.no_grad():
                 act_t, logp_t, val_t, ent_t = model.act(obs_t)
             next_obs, rew, terminated, truncated, info = env.step(act_t)
             done = (terminated | truncated)
+
             obs_buf[t].copy_(obs_t)
             act_buf[t].copy_(act_t)
             logp_buf[t].copy_(logp_t)
@@ -1472,11 +1671,11 @@ def main():
         with torch.no_grad():
             last_val = model.value(obs["policy"])
 
-        adv = torch.zeros((T, N), device=env.device)
-        gae = torch.zeros((N,), device=env.device)
-        for t in reversed(range(T)):
+        adv = torch.zeros((t_horizon, n_envs), device=env.device)
+        gae = torch.zeros((n_envs,), device=env.device)
+        for t in reversed(range(t_horizon)):
             not_done = (~done_buf[t]).float()
-            next_value = last_val if t == (T - 1) else val_buf[t + 1]
+            next_value = last_val if t == (t_horizon - 1) else val_buf[t + 1]
             delta = rew_buf[t] + gamma * next_value * not_done - val_buf[t]
             gae = delta + gamma * gae_lam * not_done * gae
             adv[t] = gae
@@ -1486,11 +1685,11 @@ def main():
         adv_std = adv.std().clamp_min(1e-6)
         adv_n = (adv - adv_mean) / adv_std
 
-        B = T * N
-        flat_obs = obs_buf.reshape(B, obs_dim)
-        flat_act = act_buf.reshape(B, act_dim)
-        flat_adv = adv_n.reshape(B)
-        flat_ret = ret.reshape(B)
+        batch = t_horizon * n_envs
+        flat_obs = obs_buf.reshape(batch, obs_dim)
+        flat_act = act_buf.reshape(batch, act_dim)
+        flat_adv = adv_n.reshape(batch)
+        flat_ret = ret.reshape(batch)
 
         new_logp, new_ent, new_val = model.evaluate_actions(flat_obs, flat_act)
         policy_loss = -(flat_adv.detach() * new_logp).mean()
@@ -1517,7 +1716,7 @@ def main():
 
 
 # =============================================================================
-# 12) entrypoint
+# 11) entrypoint
 # =============================================================================
 if __name__ == "__main__":
     try:
