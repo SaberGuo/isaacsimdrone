@@ -40,8 +40,6 @@ class NormalizationCfg:
     y_bounds: tuple[float, float] = (-80.0, 80.0)
     z_bounds: tuple[float, float] = (0.0, 10.0)
 
-    diag_scale: float = 1.1
-
     lin_vel_max: float = 6.0
     ang_vel_max: float = 31.4
 

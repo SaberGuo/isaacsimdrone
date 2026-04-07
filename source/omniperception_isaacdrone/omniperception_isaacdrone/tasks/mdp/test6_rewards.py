@@ -1,5 +1,3 @@
-# omniperception_isaacdrone/tasks/mdp/test6_rewards.py
-
 from __future__ import annotations
 
 import torch
@@ -16,9 +14,10 @@ from .test6_terminations import (
 )
 
 
-# -----------------------------------------------------------------------------
-# TensorBoard / debug cache helpers (store per-step tensors on env)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 日志与调试辅助函数
+# =============================================================================
+
 def _tb_get_dict(env: ManagerBasedRLEnv, attr: str) -> dict:
     d = getattr(env, attr, None)
     if d is None or (not isinstance(d, dict)):
@@ -28,7 +27,7 @@ def _tb_get_dict(env: ManagerBasedRLEnv, attr: str) -> dict:
 
 
 def _tb_store_reward(env: ManagerBasedRLEnv, name: str, value: torch.Tensor):
-    """Store raw reward term output (shape: [N]) for this step."""
+    # 记录当前步的奖励项以供 TensorBoard 统计
     try:
         d = _tb_get_dict(env, "_tb_reward_terms")
         if isinstance(value, torch.Tensor):
@@ -38,7 +37,7 @@ def _tb_store_reward(env: ManagerBasedRLEnv, name: str, value: torch.Tensor):
 
 
 def _tb_store_aux(env: ManagerBasedRLEnv, name: str, value: torch.Tensor):
-    """Store auxiliary debug metrics (shape: [N]) for this step."""
+    # 记录辅助调试指标
     try:
         d = _tb_get_dict(env, "_tb_aux_terms")
         if isinstance(value, torch.Tensor):
@@ -47,15 +46,15 @@ def _tb_store_aux(env: ManagerBasedRLEnv, name: str, value: torch.Tensor):
         pass
 
 
-# -----------------------------------------------------------------------------
-# small helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 基础计算与环境辅助函数
+# =============================================================================
+
 def _safe_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.sqrt(torch.sum(x * x, dim=-1) + eps)
 
 
 def _broadcast_goal(goal: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-    """Make sure goal has shape (N, 3) on the same device as pos."""
     if goal.device != pos.device:
         goal = goal.to(pos.device)
 
@@ -95,11 +94,12 @@ def _get_lidar_max_distance(lidar) -> float:
     return 50.0
 
 
-# -----------------------------------------------------------------------------
-# ① goal distance reward (bounded & stable)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 任务目标与进度奖励
+# =============================================================================
+
 def reward_distance_to_goal(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, std: float = 6.0) -> torch.Tensor:
-    """Bounded goal proximity reward: exp(-0.5*(d/std)^2) in (0, 1]."""
+    # 距离目标点的接近程度奖励 (0, 1]
     pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
     goal = _get_goal_pos(env, pos)
 
@@ -115,21 +115,13 @@ def reward_distance_to_goal(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, s
     return out
 
 
-# -----------------------------------------------------------------------------
-# dense progress reward (approach goal => positive, go away => negative)
-# -----------------------------------------------------------------------------
 def reward_progress_to_goal(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
     speed_ref: float = 3.0,
     clip: float = 1.0,
 ) -> torch.Tensor:
-    """Dense shaping reward based on distance decrease to the goal.
-
-    delta_d = prev_dist - current_dist
-    towards_speed = delta_d / step_dt
-    out = clamp(towards_speed / speed_ref, -clip, clip)
-    """
+    # 靠近目标的密集进度奖励
     pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
     goal = _get_goal_pos(env, pos)
     d = _safe_norm(goal - pos)
@@ -154,57 +146,6 @@ def reward_progress_to_goal(
     return out
 
 
-# -----------------------------------------------------------------------------
-# height tracking
-# -----------------------------------------------------------------------------
-def reward_height_tracking(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-    target_z: float = 5.0,
-    std: float = 2.0,
-) -> torch.Tensor:
-    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
-    dz = pos[:, 2] - float(target_z)
-    std = max(float(std), 1e-6)
-    r2 = torch.clamp((dz / std) ** 2, 0.0, 400.0)
-    out = torch.exp(-0.5 * r2)
-
-    _tb_store_reward(env, "height", out)
-    _tb_store_aux(env, "height_error", dz)
-    return out
-
-
-# -----------------------------------------------------------------------------
-# stability reward
-# -----------------------------------------------------------------------------
-def reward_stability(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-    lin_std: float = 2.0,
-    ang_std: float = 6.0,
-) -> torch.Tensor:
-    lin = mdp.base_lin_vel(env, asset_cfg=asset_cfg)
-    ang = mdp.base_ang_vel(env, asset_cfg=asset_cfg)
-
-    lin2 = torch.sum(lin * lin, dim=-1)
-    ang2 = torch.sum(ang * ang, dim=-1)
-
-    lin_std = max(float(lin_std), 1e-6)
-    ang_std = max(float(ang_std), 1e-6)
-
-    rl = torch.exp(-0.5 * torch.clamp(lin2 / (lin_std * lin_std), 0.0, 400.0))
-    ra = torch.exp(-0.5 * torch.clamp(ang2 / (ang_std * ang_std), 0.0, 400.0))
-    out = rl * ra
-
-    _tb_store_reward(env, "stability", out)
-    _tb_store_aux(env, "lin_speed", _safe_norm(lin))
-    _tb_store_aux(env, "ang_speed", _safe_norm(ang))
-    return out
-
-
-# -----------------------------------------------------------------------------
-# ④ velocity direction reward (towards goal)
-# -----------------------------------------------------------------------------
 def reward_velocity_towards_goal(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -212,12 +153,7 @@ def reward_velocity_towards_goal(
     speed_ref: float = 3.0,
     use_relu: bool = True,
 ) -> torch.Tensor:
-    """Reward the velocity component projected onto the goal direction.
-
-    Compared with the old cos(theta) * speed-factor form, this version directly uses
-    the signed projected speed, so the magnitude is easier to interpret and matches
-    the physical meaning of "moving towards the goal" more closely.
-    """
+    # 鼓励速度方向指向目标点
     pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
     goal = _get_goal_pos(env, pos)
 
@@ -252,9 +188,72 @@ def reward_velocity_towards_goal(
     return out
 
 
-# -----------------------------------------------------------------------------
-# ② LiDAR safety penalty
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 飞行姿态与控制约束奖励
+# =============================================================================
+
+def reward_height_tracking(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    target_z: float = 5.0,
+    std: float = 2.0,
+) -> torch.Tensor:
+    # 目标高度保持奖励
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
+    dz = pos[:, 2] - float(target_z)
+    std = max(float(std), 1e-6)
+    r2 = torch.clamp((dz / std) ** 2, 0.0, 400.0)
+    out = torch.exp(-0.5 * r2)
+
+    _tb_store_reward(env, "height", out)
+    _tb_store_aux(env, "height_error", dz)
+    return out
+
+
+def reward_stability(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    lin_std: float = 2.0,
+    ang_std: float = 6.0,
+) -> torch.Tensor:
+    # 飞行姿态与速度稳定性奖励
+    lin = mdp.base_lin_vel(env, asset_cfg=asset_cfg)
+    ang = mdp.base_ang_vel(env, asset_cfg=asset_cfg)
+
+    lin2 = torch.sum(lin * lin, dim=-1)
+    ang2 = torch.sum(ang * ang, dim=-1)
+
+    lin_std = max(float(lin_std), 1e-6)
+    ang_std = max(float(ang_std), 1e-6)
+
+    rl = torch.exp(-0.5 * torch.clamp(lin2 / (lin_std * lin_std), 0.0, 400.0))
+    ra = torch.exp(-0.5 * torch.clamp(ang2 / (ang_std * ang_std), 0.0, 400.0))
+    out = rl * ra
+
+    _tb_store_reward(env, "stability", out)
+    _tb_store_aux(env, "lin_speed", _safe_norm(lin))
+    _tb_store_aux(env, "ang_speed", _safe_norm(ang))
+    return out
+
+
+def reward_action_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
+    # 控制动作幅度 L2 正则化惩罚（伪奖励）
+    term = env.action_manager.get_term("root_twist")
+
+    a = getattr(term, "processed_actions", None)
+    if not isinstance(a, torch.Tensor):
+        a = term.raw_actions
+
+    out = torch.sum(a * a, dim=-1).to(torch.float32)
+    _tb_store_reward(env, "action_l2", out)
+    _tb_store_aux(env, "action_l2_raw", out)
+    return out
+
+
+# =============================================================================
+# 避障与安全惩罚
+# =============================================================================
+
 def penalty_lidar_threat(
     env: ManagerBasedRLEnv,
     lidar_name: str = "lidar",
@@ -272,9 +271,9 @@ def penalty_lidar_threat(
     delta_phi: float = 5.0,
     max_vis_points: int | None = None,
 ) -> torch.Tensor:
+    # 激光雷达感知到的障碍物逼近惩罚
     exp_scale = max(float(exp_scale), 1e-6)
     cap = float(cap)
-
     out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
 
     try:
@@ -294,17 +293,11 @@ def penalty_lidar_threat(
 
     if bool(use_grid):
         grid = obs_lidar_min_range_grid(
-            env,
-            lidar_name=lidar_name,
-            theta_min=theta_min,
-            theta_max=theta_max,
-            phi_min=phi_min,
-            phi_max=phi_max,
-            delta_theta=delta_theta,
-            delta_phi=delta_phi,
-            empty_value=0.0,
-            max_vis_points=max_vis_points,
-            max_distance=max_d,
+            env, lidar_name=lidar_name,
+            theta_min=theta_min, theta_max=theta_max,
+            phi_min=phi_min, phi_max=phi_max,
+            delta_theta=delta_theta, delta_phi=delta_phi,
+            empty_value=0.0, max_vis_points=max_vis_points, max_distance=max_d,
         )
         max_close = grid.max(dim=1).values
         min_dist = float(max_d) * (1.0 - max_close)
@@ -333,9 +326,131 @@ def penalty_lidar_threat(
     return pen
 
 
-# -----------------------------------------------------------------------------
-# ③ energy penalty
-# -----------------------------------------------------------------------------
+def penalty_safe_vel(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    lidar_name: str = "lidar",
+    safe_dist: float = 8.0,      # 触发危险的距离阈值
+    margin: float = 2.0,         # 安全裕度（寻找新方向时，要求距离 > safe_dist + margin）
+    theta_min: float = 30.0,
+    theta_max: float = 90.0,
+    phi_min: float = 0.0,
+    phi_max: float = 360.0,
+    delta_theta: float = 10.0,
+    delta_phi: float = 5.0,
+    max_vis_points: int | None = 12000,
+) -> torch.Tensor:
+    """
+    动态安全速度惩罚 (NavRL 风格)
+    当进入危险范围，且当前速度方向指向危险区域时触发。
+    计算当前最优的“安全速度(safe_vel)”，并惩罚实际速度与 safe_vel 之间的方向和大小差异。
+    如果当前行进方向已经安全，则不进行惩罚。
+    """
+    # 1. 获取当前速度与方向
+    # 【重要修正】点云处于 local_env (与世界坐标系对齐) 坐标系中，因此必须使用世界坐标系线速度
+    v = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg)
+    v_norm = _safe_norm(v)
+    v_dir = v / (v_norm.unsqueeze(-1) + 1e-6)
+
+    # 获取雷达最大探测距离
+    try:
+        lidar = env.scene[lidar_name]
+        max_d = _get_lidar_max_distance(lidar)
+    except Exception:
+        out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
+        _tb_store_reward(env, "safe_vel_penalty", out0)
+        return out0
+
+    # 2. 获取雷达网格点云 closeness (值域 [0,1]，1表示紧贴，0表示在max_d之外)
+    grid = obs_lidar_min_range_grid(
+        env, lidar_name=lidar_name,
+        theta_min=theta_min, theta_max=theta_max,
+        phi_min=phi_min, phi_max=phi_max,
+        delta_theta=delta_theta, delta_phi=delta_phi,
+        empty_value=0.0, max_vis_points=max_vis_points, max_distance=max_d
+    ) # shape: (N, num_bins)
+
+    # 定义紧迫度阈值
+    closeness_threshold = 1.0 - (float(safe_dist) / max_d)
+    safe_closeness = 1.0 - ((float(safe_dist) + float(margin)) / max_d)
+
+    # 3. 触发条件1：进入危险范围（有任意网格紧迫度超过阈值）
+    max_closeness = grid.max(dim=1).values
+    threat_mask = max_closeness > closeness_threshold
+
+    if not threat_mask.any():
+        out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
+        _tb_store_reward(env, "safe_vel_penalty", out0)
+        return out0
+
+    # 4. 动态构建/获取预计算的网格方向向量 (num_bins, 3) 
+    cache_key = f"_safe_vel_bins_{theta_min}_{theta_max}_{phi_min}_{phi_max}_{delta_theta}_{delta_phi}"
+    bin_dirs = getattr(env, cache_key, None)
+    if bin_dirs is None:
+        T = max(int((theta_max - theta_min) / delta_theta), 1)
+        Pn = max(int((phi_max - phi_min) / delta_phi), 1)
+        
+        theta_idx = torch.arange(T, device=env.device, dtype=torch.float32)
+        phi_idx = torch.arange(Pn, device=env.device, dtype=torch.float32)
+        theta_centers = theta_min + (theta_idx + 0.5) * delta_theta
+        phi_centers = phi_min + (phi_idx + 0.5) * delta_phi
+
+        grid_theta, grid_phi = torch.meshgrid(theta_centers, phi_centers, indexing='ij')
+        rad_theta = torch.deg2rad(grid_theta.flatten())
+        rad_phi = torch.deg2rad(grid_phi.flatten())
+
+        # 球坐标转笛卡尔坐标 (全局坐标系下，Z向上)
+        sin_t = torch.sin(rad_theta)
+        bin_x = sin_t * torch.cos(rad_phi)
+        bin_y = sin_t * torch.sin(rad_phi)
+        bin_z = torch.cos(rad_theta)
+        bin_dirs = torch.stack([bin_x, bin_y, bin_z], dim=-1) # (num_bins, 3)
+        setattr(env, cache_key, bin_dirs)
+
+    # 5. 判断当前行进方向是否安全
+    # 在同一全局坐标系下计算速度方向与网格方向的余弦相似度
+    cos_sim = torch.einsum('ni,ji->nj', v_dir, bin_dirs) # shape: (N, num_bins)
+    
+    current_heading_bin = torch.argmax(cos_sim, dim=1) # (N,)
+    current_heading_closeness = grid.gather(1, current_heading_bin.unsqueeze(1)).squeeze(1) # (N,)
+    
+    is_heading_safe = current_heading_closeness <= safe_closeness
+    active_mask = threat_mask & ~is_heading_safe
+
+    # 如果没有无人机满足惩罚条件，直接返回 0
+    if not active_mask.any():
+        out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
+        _tb_store_reward(env, "safe_vel_penalty", out0)
+        return out0
+
+    # 6. 为不安全的无人机寻找最优的“安全方向”
+    valid_mask = grid <= safe_closeness # shape: (N, num_bins)
+
+    # 屏蔽掉不安全的网格
+    scored_bins = torch.where(valid_mask, cos_sim, torch.full_like(cos_sim, -2.0))
+    best_scores, best_idx = torch.max(scored_bins, dim=1) # (N,)
+
+    # 如果周边全是障碍，has_safe_bin 为 False
+    has_safe_bin = best_scores > -1.5
+    chosen_safe_dirs = bin_dirs[best_idx] # (N, 3)
+
+    # 7. 计算最终的 safe_vel 参数
+    # 正常寻找出路；绝境时反向倒车
+    safe_dir_final = torch.where(has_safe_bin.unsqueeze(-1), chosen_safe_dirs, -v_dir)
+    safe_v_norm = torch.where(has_safe_bin, v_norm, torch.zeros_like(v_norm))
+
+    # 8. 计算奖励惩罚项
+    v_safe_cos = torch.sum(v_dir * safe_dir_final, dim=-1)
+    dir_penalty = 1.0 - v_safe_cos
+    mag_penalty = torch.abs(v_norm - safe_v_norm) / (v_norm + 1e-6)
+
+    # 仅对激活条件成立的施加惩罚
+    penalty = (dir_penalty + mag_penalty) * active_mask.float()
+
+    _tb_store_reward(env, "safe_vel_penalty", penalty)
+    _tb_store_aux(env, "safe_vel_trigger_ratio", active_mask.float())
+    return penalty
+
 def penalty_energy(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -347,6 +462,7 @@ def penalty_energy(
     acc_weight: float = 0.2,
     max_penalty: float = 10.0,
 ) -> torch.Tensor:
+    # 动能与加速度消耗惩罚
     lin_vel_scale = max(float(lin_vel_scale), 1e-6)
     ang_vel_scale = max(float(ang_vel_scale), 1e-6)
     lin_acc_scale = max(float(lin_acc_scale), 1e-6)
@@ -415,10 +531,12 @@ def penalty_energy(
     return pen
 
 
-# -----------------------------------------------------------------------------
-# ⑤ termination-related rewards / penalties
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 终止条件相关奖惩
+# =============================================================================
+
 def reward_goal_reached(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, threshold: float = 1.0) -> torch.Tensor:
+    # 抵达目标点成功奖励
     out = termination_reached_goal(env, asset_cfg=asset_cfg, threshold=threshold).to(torch.float32)
     _tb_store_reward(env, "success_bonus", out)
     return out
@@ -431,6 +549,7 @@ def penalty_out_of_workspace(
     y_bounds: tuple[float, float] = (-60.0, 60.0),
     z_bounds: tuple[float, float] = (0.0, 10.0),
 ) -> torch.Tensor:
+    # 越界惩罚
     out = termination_out_of_workspace(
         env,
         asset_cfg=asset_cfg,
@@ -443,6 +562,7 @@ def penalty_out_of_workspace(
 
 
 def penalty_time_out(env: ManagerBasedRLEnv) -> torch.Tensor:
+    # 超时惩罚
     out = mdp.time_out(env).to(torch.float32)
     _tb_store_reward(env, "timeout_penalty", out)
     return out
@@ -453,164 +573,7 @@ def penalty_collision(
     sensor_cfg: SceneEntityCfg,
     threshold: float = 1.0,
 ) -> torch.Tensor:
+    # 碰撞惩罚
     out = termination_collision(env, sensor_cfg=sensor_cfg, threshold=threshold).to(torch.float32)
     _tb_store_reward(env, "collision_penalty", out)
     return out
-
-
-# -----------------------------------------------------------------------------
-# action L2 penalty
-# -----------------------------------------------------------------------------
-def reward_action_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
-    term = env.action_manager.get_term("root_twist")
-
-    a = getattr(term, "processed_actions", None)
-    if not isinstance(a, torch.Tensor):
-        a = term.raw_actions
-
-    out = torch.sum(a * a, dim=-1).to(torch.float32)
-    _tb_store_reward(env, "action_l2", out)
-    _tb_store_aux(env, "action_l2_raw", out)
-    return out
-
-
-# -----------------------------------------------------------------------------
-# ⑥ Safe Velocity Penalty (NavRL 风格)
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# ⑥ Safe Velocity Penalty (NavRL 风格)
-# -----------------------------------------------------------------------------
-def penalty_safe_vel(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-    lidar_name: str = "lidar",
-    safe_dist: float = 8.0,      # 触发危险的距离阈值
-    margin: float = 2.0,         # 安全裕度（寻找新方向时，要求距离 > safe_dist + margin）
-    theta_min: float = 30.0,
-    theta_max: float = 90.0,
-    phi_min: float = 0.0,
-    phi_max: float = 360.0,
-    delta_theta: float = 10.0,
-    delta_phi: float = 5.0,
-    max_vis_points: int | None = 12000,
-) -> torch.Tensor:
-    """
-    当进入危险范围，且当前速度方向指向危险区域时触发。
-    计算当前最优的“安全速度(safe_vel)”，并惩罚实际速度与 safe_vel 之间的方向和大小差异。
-    如果当前行进方向已经安全，则不进行惩罚。
-    """
-    # 1. 获取当前速度与方向
-    # 【重要修正】必须使用机体坐标系(base_lin_vel)的速度，以对齐 LiDAR 的局部传感器坐标系
-    v = mdp.base_lin_vel(env, asset_cfg=asset_cfg)
-    v_norm = _safe_norm(v)
-    v_dir = v / (v_norm.unsqueeze(-1) + 1e-6)
-
-    # 获取雷达最大探测距离
-    try:
-        lidar = env.scene[lidar_name]
-        max_d = _get_lidar_max_distance(lidar)
-    except Exception:
-        out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
-        _tb_store_reward(env, "safe_vel_penalty", out0)
-        return out0
-
-    # 2. 获取雷达网格点云 closeness (值域 [0,1]，1表示紧贴，0表示在max_d之外)
-    grid = obs_lidar_min_range_grid(
-        env, lidar_name=lidar_name,
-        theta_min=theta_min, theta_max=theta_max,
-        phi_min=phi_min, phi_max=phi_max,
-        delta_theta=delta_theta, delta_phi=delta_phi,
-        empty_value=0.0, max_vis_points=max_vis_points, max_distance=max_d
-    ) # shape: (N, num_bins)
-
-    # 定义紧迫度阈值
-    closeness_threshold = 1.0 - (float(safe_dist) / max_d)
-    safe_closeness = 1.0 - ((float(safe_dist) + float(margin)) / max_d)
-
-    # 3. 触发条件1：进入危险范围（有任意网格紧迫度超过阈值）
-    max_closeness = grid.max(dim=1).values
-    threat_mask = max_closeness > closeness_threshold
-
-    if not threat_mask.any():
-        out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
-        _tb_store_reward(env, "safe_vel_penalty", out0)
-        return out0
-
-    # 4. 动态构建/获取预计算的网格方向向量 (num_bins, 3) 
-    cache_key = f"_safe_vel_bins_{theta_min}_{theta_max}_{phi_min}_{phi_max}_{delta_theta}_{delta_phi}"
-    bin_dirs = getattr(env, cache_key, None)
-    if bin_dirs is None:
-        T = max(int((theta_max - theta_min) / delta_theta), 1)
-        Pn = max(int((phi_max - phi_min) / delta_phi), 1)
-        
-        theta_idx = torch.arange(T, device=env.device, dtype=torch.float32)
-        phi_idx = torch.arange(Pn, device=env.device, dtype=torch.float32)
-        theta_centers = theta_min + (theta_idx + 0.5) * delta_theta
-        phi_centers = phi_min + (phi_idx + 0.5) * delta_phi
-
-        grid_theta, grid_phi = torch.meshgrid(theta_centers, phi_centers, indexing='ij')
-        rad_theta = torch.deg2rad(grid_theta.flatten())
-        rad_phi = torch.deg2rad(grid_phi.flatten())
-
-        # 球坐标转笛卡尔坐标 (机体坐标系下，Z向上)
-        sin_t = torch.sin(rad_theta)
-        bin_x = sin_t * torch.cos(rad_phi)
-        bin_y = sin_t * torch.sin(rad_phi)
-        bin_z = torch.cos(rad_theta)
-        bin_dirs = torch.stack([bin_x, bin_y, bin_z], dim=-1) # (num_bins, 3)
-        setattr(env, cache_key, bin_dirs)
-
-    # 5. 【新增逻辑】判断当前行进方向是否安全
-    # 计算当前速度方向与所有网格方向的余弦相似度
-    cos_sim = torch.einsum('ni,ji->nj', v_dir, bin_dirs) # shape: (N, num_bins)
-    
-    # 找到与当前速度方向最接近的网格索引（无人机当前正朝着该网格飞）
-    current_heading_bin = torch.argmax(cos_sim, dim=1) # (N,)
-    
-    # 获取该方向上的网格紧迫度
-    current_heading_closeness = grid.gather(1, current_heading_bin.unsqueeze(1)).squeeze(1) # (N,)
-    
-    # 当前方向是否属于安全网格
-    is_heading_safe = current_heading_closeness <= safe_closeness
-
-    # 最终触发条件：在危险范围内，且 当前行进方向不安全
-    active_mask = threat_mask & ~is_heading_safe
-
-    # 如果所有无人机要么没在危险区，要么虽然在危险区但已经往安全方向飞了，直接返回0
-    if not active_mask.any():
-        out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
-        _tb_store_reward(env, "safe_vel_penalty", out0)
-        return out0
-
-    # 6. 仅为不安全的无人机寻找最接近当前意图的“安全方向”
-    valid_mask = grid <= safe_closeness # shape: (N, num_bins)
-
-    # 给不安全的网格打上极低的分数 (-2.0)，确保 argmax 选不到它们
-    scored_bins = torch.where(valid_mask, cos_sim, torch.full_like(cos_sim, -2.0))
-
-    # 取出最优（最顺滑且安全）的网格索引
-    best_scores, best_idx = torch.max(scored_bins, dim=1) # (N,)
-
-    # 如果 best_scores <= -1.5，说明周围360度全是障碍物死角（绝境）
-    has_safe_bin = best_scores > -1.5
-    chosen_safe_dirs = bin_dirs[best_idx] # (N, 3)
-
-    # 7. 计算最终的 safe_vel 参数
-    # 如果有安全方向，朝着那个方向飞；如果处于绝境，减速或反向倒车 (-v_dir)
-    safe_dir_final = torch.where(has_safe_bin.unsqueeze(-1), chosen_safe_dirs, -v_dir)
-    safe_v_norm = torch.where(has_safe_bin, v_norm, torch.zeros_like(v_norm))
-
-    # 8. 计算奖励惩罚项
-    # 方向差异惩罚: 1.0 - 余弦相似度 (值域 [0, 2])
-    v_safe_cos = torch.sum(v_dir * safe_dir_final, dim=-1)
-    dir_penalty = 1.0 - v_safe_cos
-
-    # 速度大小惩罚: |实际速度 - 安全速度| / 实际速度
-    mag_penalty = torch.abs(v_norm - safe_v_norm) / (v_norm + 1e-6)
-
-    # 仅对满足 active_mask 的环境施加惩罚
-    penalty = (dir_penalty + mag_penalty) * active_mask.float()
-
-    _tb_store_reward(env, "safe_vel_penalty", penalty)
-    _tb_store_aux(env, "safe_vel_trigger_ratio", active_mask.float())
-    return penalty
