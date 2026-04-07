@@ -38,12 +38,18 @@ def _get_step_dt(env: ManagerBasedRLEnv) -> float:
 
 
 class RootTwistVelocityActionTerm(ActionTerm):
-    """4D 动作: [vx, vy, vz, yaw_rate]
-    - vx,vy,vz: world frame desired velocity (m/s)
+    """4D 动作: [delta_vx, delta_vy, delta_vz, yaw_rate]
+    - delta_vx, delta_vy, delta_vz: world frame velocity change (m/s per step)
     - yaw_rate: desired yaw rate in body frame (rad/s)
+
+    动作解释：
+    - 前三个维度表示相对于当前目标速度的变化量（增量控制）
+    - yaw_rate 仍然是绝对角速度命令（积分得到目标偏航角）
+    - 目标速度会通过 clip 限制在 [-vel_clip, vel_clip] 范围内
 
     修复点：
     - 强制 raw action clip 到 [-1, 1]，保证 action_space 有意义且 PPO 稳定
+    - 使用增量控制使动作更加平滑，便于学习精细控制
     """
 
     def __init__(self, cfg: ActionTermCfg, env: ManagerBasedRLEnv):
@@ -62,6 +68,9 @@ class RootTwistVelocityActionTerm(ActionTerm):
         self._torques = torch.zeros((self._num_envs, 1, 3), device=self._device, dtype=torch.float32)
 
         self._yaw_target = torch.zeros((self._num_envs,), device=self._device, dtype=torch.float32)
+
+        # 目标速度缓冲区（增量控制使用）
+        self._target_vel = torch.zeros((self._num_envs, 3), device=self._device, dtype=torch.float32)
 
         params = getattr(cfg, "params", None) or {}
         p_get = params.get if isinstance(params, dict) else lambda k, d=None: getattr(params, k, d)
@@ -189,12 +198,14 @@ class RootTwistVelocityActionTerm(ActionTerm):
             self._processed_actions.zero_()
             self._forces.zero_()
             self._torques.zero_()
+            self._target_vel.zero_()  # 重置目标速度
             self._init_yaw_target_all()
         else:
             self._raw_actions[env_ids] = 0.0
             self._processed_actions[env_ids] = 0.0
             self._forces[env_ids] = 0.0
             self._torques[env_ids] = 0.0
+            self._target_vel[env_ids] = 0.0  # 重置目标速度
             try:
                 quat = self._asset.data.root_link_state_w[env_ids, 3:7]
                 self._yaw_target[env_ids] = _quat_to_yaw(quat)
@@ -213,15 +224,20 @@ class RootTwistVelocityActionTerm(ActionTerm):
         # store clipped raw actions
         self._raw_actions.copy_(actions)
 
-        v_cmd = actions[:, 0:3] * self._vel_scale
+        # 动作解释：前三个维度是速度变化量（增量控制），第四个是偏航角速度
+        delta_v = actions[:, 0:3] * self._vel_scale  # 速度变化量
         yaw_rate_cmd = actions[:, 3:4] * self._yaw_rate_scale
 
+        # 更新目标速度（累加变化量）
+        self._target_vel += delta_v
+
+        # 对目标速度进行限幅
         if self._vel_clip > 0:
-            v_cmd = torch.clamp(v_cmd, -self._vel_clip, self._vel_clip)
+            self._target_vel = torch.clamp(self._target_vel, -self._vel_clip, self._vel_clip)
         if self._yaw_rate_clip > 0:
             yaw_rate_cmd = torch.clamp(yaw_rate_cmd, -self._yaw_rate_clip, self._yaw_rate_clip)
 
-        self._processed_actions[:, 0:3] = v_cmd
+        self._processed_actions[:, 0:3] = self._target_vel
         self._processed_actions[:, 3:4] = yaw_rate_cmd
 
     def apply_actions(self):
