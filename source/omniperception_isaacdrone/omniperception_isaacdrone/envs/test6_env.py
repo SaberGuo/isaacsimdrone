@@ -333,25 +333,16 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
     def _reset_idx(self, env_ids: torch.Tensor | None = None):
         env_ids = torch.arange(self.num_envs, device=self.device) if env_ids is None else env_ids
         
-        # 注意：这里删除了旧的 self._sample_goals(env_ids) 调用
-        
-        # 1. 执行父类的 reset
-        # 在这一步内部，刚刚我们在 event 里写的 reset_root_state_on_square_edge 会被触发
-        # 于是无人机到了边界，且 goal 到了对面
         parent = super()
         out = parent._reset_idx(env_ids) if hasattr(parent, "_reset_idx") else parent.reset_idx(env_ids)
 
-        # 2. 刷新依赖状态的缓存
         self._refresh_energy_prev_buffers(env_ids)
         self._refresh_progress_prev_dist(env_ids)
         
-        # 3. 极其关键的一步：由于目标在事件处理期间被更新了，原 out[0] 里包含的 goal_delta 观测值已过时
-        # 我们需要强制重新计算当前步的观测，确保返回给 RL 算法的观测是基于最新目标的！
         obs_dict = self.observation_manager.compute()
         
         goal_info = self._build_goal_info()
         if isinstance(out, tuple) and len(out) == 2:
-            # 替换掉过时的观测字典
             out = (obs_dict, out[1])
             if isinstance(out[1], dict):
                 out[1].update(goal_info)

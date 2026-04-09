@@ -7,6 +7,7 @@ import torch
 import isaaclab.envs.mdp as mdp
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import quat_apply
 
 
 # =============================================================================
@@ -133,7 +134,7 @@ def _get_downsampled_pc_torch(env, lidar, env_ids: torch.Tensor, max_pts: int | 
 # =============================================================================
 
 def obs_goal_delta(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    # 获取目标位置与当前位置的误差
+    # 获取目标位置与当前位置的误差，并转换到【机体坐标系 (Body Frame)】
     pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
     goal = getattr(env, "goal_pos_w", None)
     
@@ -148,7 +149,16 @@ def obs_goal_delta(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.T
     elif goal.shape[0] != pos.shape[0]:
         goal = goal[:1].expand(pos.shape[0], 3)
 
-    return goal - pos
+    # 世界坐标系下的距离差
+    delta_w = goal - pos
+    
+    # 将世界系坐标转换到机体坐标系（通过乘以机体四元数的共轭，即逆旋转）
+    quat_w = mdp.root_quat_w(env, asset_cfg=asset_cfg)
+    quat_inv = quat_w.clone()
+    quat_inv[..., 1:] = -quat_inv[..., 1:] # 共轭即为逆 [w, -x, -y, -z]
+    
+    delta_b = quat_apply(quat_inv, delta_w)
+    return delta_b
 
 
 # =============================================================================
@@ -195,16 +205,16 @@ def obs_root_quat_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> tor
 
 
 def obs_root_lin_vel_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    # 根节点线速度归一化
-    v = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg).to(torch.float32)
+    # 根节点线速度归一化 (使用机体系速度 base_lin_vel)
+    v = mdp.base_lin_vel(env, asset_cfg=asset_cfg).to(torch.float32)
     vmax, _ = _get_vmax_wmax(env)
     vmax = max(float(vmax), 1e-6)
     return _clamp_m11(v / vmax)
 
 
 def obs_root_ang_vel_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    # 根节点角速度归一化
-    w = mdp.root_ang_vel_w(env, asset_cfg=asset_cfg).to(torch.float32)
+    # 根节点角速度归一化 (使用机体系角速度 base_ang_vel)
+    w = mdp.base_ang_vel(env, asset_cfg=asset_cfg).to(torch.float32)
     _, wmax = _get_vmax_wmax(env)
     wmax = max(float(wmax), 1e-6)
     return _clamp_m11(w / wmax)
@@ -217,18 +227,17 @@ def obs_projected_gravity_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg
 
 
 def obs_goal_delta_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    # 目标误差归一化
-    delta = obs_goal_delta(env, asset_cfg=asset_cfg).to(torch.float32)
+    # 目标误差归一化 (基于机体坐标系的值)
+    delta_b = obs_goal_delta(env, asset_cfg=asset_cfg).to(torch.float32)
     xb, yb, zb = _get_workspace_bounds(env)
 
-    axis_range = torch.tensor(
-        [float(xb[1]) - float(xb[0]), float(yb[1]) - float(yb[0]), float(zb[1]) - float(zb[0])],
-        device=delta.device,
-        dtype=torch.float32,
-    )
-
-    axis_range = torch.clamp(axis_range, min=1e-6)
-    out = delta / axis_range
+    # 为了保持机体坐标系下的旋转不变性 (各向同性)，取所有轴的最大范围作为统一缩放系数
+    max_range = max(float(xb[1]) - float(xb[0]), 
+                    float(yb[1]) - float(yb[0]), 
+                    float(zb[1]) - float(zb[0]))
+    max_range = max(max_range, 1e-6)
+    
+    out = delta_b / max_range
 
     return _clamp_m11(out)
 
@@ -324,4 +333,3 @@ def obs_lidar_min_range_grid(
     closeness = (torch.exp(-alpha * norm_dist) - exp_alpha) / (1.0 - exp_alpha)
     
     return _clamp_01(closeness.to(torch.float32))
-

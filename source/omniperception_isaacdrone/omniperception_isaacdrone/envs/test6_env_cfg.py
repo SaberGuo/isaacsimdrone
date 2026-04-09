@@ -124,7 +124,7 @@ class Test6SceneCfg(InteractiveSceneCfg):
         init_state=AssetBaseCfg.InitialStateCfg(rot=(0.738, 0.477, 0.477, 0.0)),
     )
     obstacles: RigidObjectCfg = RigidObjectCfg(
-        prim_path="/World/Obstacles/obj_.*",  # 修改为全局路径，即每个env共享碰撞
+        prim_path="/World/Obstacles/obj_.*",
         spawn=None,
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=(1000.0, 1000.0, -1000.0)
@@ -361,13 +361,11 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "max_vis_points": 12000,
         }
 
-        # 配置 NavRL 的 Safe Velocity 参数
         self.rewards.safe_vel_penalty.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "lidar_name": "lidar",
-            "safe_dist": 6.0,          # 触发判定危险的距离 (假设 max_range为50, 6.0是个合理的提前避障距离)
-            "margin": 2.0,             # 安全方向的裕度 (筛出网格时要求距离大于 6.0+2.0=8.0)
-            # 保持与 observation 中 lidar grid 相同的视野参数
+            "safe_dist": 6.0,          
+            "margin": 2.0,             
             "theta_min": 30.0,
             "theta_max": 90.0,
             "phi_min": 0.0,
@@ -376,7 +374,6 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "delta_phi": 5.0,
             "max_vis_points": 12000,
         }
-
 
         self.rewards.energy.params = {
             "asset_cfg": SceneEntityCfg("robot"),

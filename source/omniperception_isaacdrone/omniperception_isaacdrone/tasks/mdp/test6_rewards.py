@@ -159,7 +159,7 @@ def reward_velocity_towards_goal(
     speed_ref: float = 3.0,
     use_relu: bool = True,
 ) -> torch.Tensor:
-    # 鼓励速度方向指向目标点
+    # 鼓励速度方向指向目标点（这里世界系点乘由于等价性无需更改）
     pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
     goal = _get_goal_pos(env, pos)
 
@@ -358,7 +358,8 @@ def penalty_safe_vel(
     动态安全速度惩罚 (NavRL 风格)
     当进入危险范围，且当前速度方向指向危险区域时触发。
     """
-    v = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg)
+    # 【修复】：采用 base_lin_vel 获取机体坐标系下的速度！
+    v = mdp.base_lin_vel(env, asset_cfg=asset_cfg)
     v_norm = _safe_norm(v)
     v_dir = v / (v_norm.unsqueeze(-1) + 1e-6)
 
@@ -410,9 +411,10 @@ def penalty_safe_vel(
         bin_x = sin_t * torch.cos(rad_phi)
         bin_y = sin_t * torch.sin(rad_phi)
         bin_z = torch.cos(rad_theta)
-        bin_dirs = torch.stack([bin_x, bin_y, bin_z], dim=-1) # (num_bins, 3)
+        bin_dirs = torch.stack([bin_x, bin_y, bin_z], dim=-1) # (num_bins, 3) 已经是机体坐标系
         setattr(env, cache_key, bin_dirs)
 
+    # v_dir 已经变成机体系，可以直接求点乘！
     cos_sim = torch.einsum('ni,ji->nj', v_dir, bin_dirs) # shape: (N, num_bins)
     
     current_heading_bin = torch.argmax(cos_sim, dim=1) # (N,)
@@ -447,6 +449,7 @@ def penalty_safe_vel(
     _tb_store_aux(env, "safe_vel_trigger_ratio", active_mask.float())
     return penalty
 
+
 def penalty_energy(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -458,7 +461,7 @@ def penalty_energy(
     acc_weight: float = 0.2,
     max_penalty: float = 10.0,
 ) -> torch.Tensor:
-    # 动能与加速度消耗惩罚
+    # 动能与加速度消耗惩罚 (物理能量应该基于世界坐标系变化)
     lin_vel_scale = max(float(lin_vel_scale), 1e-6)
     ang_vel_scale = max(float(ang_vel_scale), 1e-6)
     lin_acc_scale = max(float(lin_acc_scale), 1e-6)
