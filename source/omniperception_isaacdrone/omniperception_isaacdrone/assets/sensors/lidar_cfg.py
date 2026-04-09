@@ -6,7 +6,7 @@ from isaaclab.sensors.ray_caster.patterns import LivoxPatternCfg
 # 推荐：先用 mid360（360°）方便验证
 LIDAR_CFG = LidarSensorCfg(
     # 注意：这里先写一个默认 link，后面在 SceneCfg 里 replace 成你真实的 link
-    prim_path="{ENV_REGEX_NS}/Robot/base",
+    prim_path="{ENV_REGEX_NS}/Robot/body",
 
     pattern_cfg=LivoxPatternCfg(
         sensor_type="mid360",

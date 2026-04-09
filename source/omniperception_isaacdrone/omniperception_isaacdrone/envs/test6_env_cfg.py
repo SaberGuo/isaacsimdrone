@@ -134,7 +134,7 @@ class Test6SceneCfg(InteractiveSceneCfg):
 @configclass
 class Test6SceneWithLidarCfg(Test6SceneCfg):
     if LIDAR_CFG is not None:
-        lidar: LidarSensorCfg = LIDAR_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        lidar: LidarSensorCfg = LIDAR_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot/body")
 
 
 # -----------------------------------------------------------------------------

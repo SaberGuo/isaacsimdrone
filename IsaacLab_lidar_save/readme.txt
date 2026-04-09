@@ -1,0 +1,4 @@
+修改了/home/hjr/hjr_isaacdrone_ws/IsaacLab/source/isaaclab/isaaclab/sensors这个路径下的lidar_sensor.py
+这个文件本身来自OmniPerception的github
+但是没有加子坐标系的旋转？
+修正备份一下
