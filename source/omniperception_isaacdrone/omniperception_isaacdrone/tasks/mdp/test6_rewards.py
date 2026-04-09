@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import torch
 
 import isaaclab.envs.mdp as mdp
@@ -93,6 +94,11 @@ def _get_lidar_max_distance(lidar) -> float:
         pass
     return 50.0
 
+# 用于将物理距离映射为当前的指数型closeness
+def _get_exp_closeness(d: float, max_d: float, alpha: float = 3.0) -> float:
+    norm_dist = min(max(d / max_d, 0.0), 1.0)
+    exp_alpha = math.exp(-alpha)
+    return (math.exp(-alpha * norm_dist) - exp_alpha) / (1.0 - exp_alpha)
 
 # =============================================================================
 # 任务目标与进度奖励
@@ -300,7 +306,15 @@ def penalty_lidar_threat(
             empty_value=0.0, max_vis_points=max_vis_points, max_distance=max_d,
         )
         max_close = grid.max(dim=1).values
-        min_dist = float(max_d) * (1.0 - max_close)
+        
+        # 利用解析求逆方法从 closeness 恢复为原本物理的 min_dist 用于计算威胁
+        alpha = 3.0
+        exp_alpha = math.exp(-alpha)
+        # closeness = (exp(-alpha * d) - e^-alpha) / (1 - e^-alpha)
+        # d = -1/alpha * ln( closeness * (1 - e^-alpha) + e^-alpha )
+        val = max_close * (1.0 - exp_alpha) + exp_alpha
+        val = torch.clamp(val, min=exp_alpha, max=1.0)
+        min_dist = - (max_d / alpha) * torch.log(val)
     else:
         dist = lidar.get_distances(env_ids)
         if dist is None:
@@ -343,16 +357,11 @@ def penalty_safe_vel(
     """
     动态安全速度惩罚 (NavRL 风格)
     当进入危险范围，且当前速度方向指向危险区域时触发。
-    计算当前最优的“安全速度(safe_vel)”，并惩罚实际速度与 safe_vel 之间的方向和大小差异。
-    如果当前行进方向已经安全，则不进行惩罚。
     """
-    # 1. 获取当前速度与方向
-    # 【重要修正】点云处于 local_env (与世界坐标系对齐) 坐标系中，因此必须使用世界坐标系线速度
     v = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg)
     v_norm = _safe_norm(v)
     v_dir = v / (v_norm.unsqueeze(-1) + 1e-6)
 
-    # 获取雷达最大探测距离
     try:
         lidar = env.scene[lidar_name]
         max_d = _get_lidar_max_distance(lidar)
@@ -361,7 +370,6 @@ def penalty_safe_vel(
         _tb_store_reward(env, "safe_vel_penalty", out0)
         return out0
 
-    # 2. 获取雷达网格点云 closeness (值域 [0,1]，1表示紧贴，0表示在max_d之外)
     grid = obs_lidar_min_range_grid(
         env, lidar_name=lidar_name,
         theta_min=theta_min, theta_max=theta_max,
@@ -370,11 +378,11 @@ def penalty_safe_vel(
         empty_value=0.0, max_vis_points=max_vis_points, max_distance=max_d
     ) # shape: (N, num_bins)
 
-    # 定义紧迫度阈值
-    closeness_threshold = 1.0 - (float(safe_dist) / max_d)
-    safe_closeness = 1.0 - ((float(safe_dist) + float(margin)) / max_d)
+    # 映射阈值到指数型 closeness
+    alpha = 3.0
+    closeness_threshold = _get_exp_closeness(float(safe_dist), max_d, alpha)
+    safe_closeness = _get_exp_closeness(float(safe_dist) + float(margin), max_d, alpha)
 
-    # 3. 触发条件1：进入危险范围（有任意网格紧迫度超过阈值）
     max_closeness = grid.max(dim=1).values
     threat_mask = max_closeness > closeness_threshold
 
@@ -383,7 +391,6 @@ def penalty_safe_vel(
         _tb_store_reward(env, "safe_vel_penalty", out0)
         return out0
 
-    # 4. 动态构建/获取预计算的网格方向向量 (num_bins, 3) 
     cache_key = f"_safe_vel_bins_{theta_min}_{theta_max}_{phi_min}_{phi_max}_{delta_theta}_{delta_phi}"
     bin_dirs = getattr(env, cache_key, None)
     if bin_dirs is None:
@@ -399,7 +406,6 @@ def penalty_safe_vel(
         rad_theta = torch.deg2rad(grid_theta.flatten())
         rad_phi = torch.deg2rad(grid_phi.flatten())
 
-        # 球坐标转笛卡尔坐标 (全局坐标系下，Z向上)
         sin_t = torch.sin(rad_theta)
         bin_x = sin_t * torch.cos(rad_phi)
         bin_y = sin_t * torch.sin(rad_phi)
@@ -407,8 +413,6 @@ def penalty_safe_vel(
         bin_dirs = torch.stack([bin_x, bin_y, bin_z], dim=-1) # (num_bins, 3)
         setattr(env, cache_key, bin_dirs)
 
-    # 5. 判断当前行进方向是否安全
-    # 在同一全局坐标系下计算速度方向与网格方向的余弦相似度
     cos_sim = torch.einsum('ni,ji->nj', v_dir, bin_dirs) # shape: (N, num_bins)
     
     current_heading_bin = torch.argmax(cos_sim, dim=1) # (N,)
@@ -417,34 +421,26 @@ def penalty_safe_vel(
     is_heading_safe = current_heading_closeness <= safe_closeness
     active_mask = threat_mask & ~is_heading_safe
 
-    # 如果没有无人机满足惩罚条件，直接返回 0
     if not active_mask.any():
         out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
         _tb_store_reward(env, "safe_vel_penalty", out0)
         return out0
 
-    # 6. 为不安全的无人机寻找最优的“安全方向”
     valid_mask = grid <= safe_closeness # shape: (N, num_bins)
 
-    # 屏蔽掉不安全的网格
     scored_bins = torch.where(valid_mask, cos_sim, torch.full_like(cos_sim, -2.0))
     best_scores, best_idx = torch.max(scored_bins, dim=1) # (N,)
 
-    # 如果周边全是障碍，has_safe_bin 为 False
     has_safe_bin = best_scores > -1.5
     chosen_safe_dirs = bin_dirs[best_idx] # (N, 3)
 
-    # 7. 计算最终的 safe_vel 参数
-    # 正常寻找出路；绝境时反向倒车
     safe_dir_final = torch.where(has_safe_bin.unsqueeze(-1), chosen_safe_dirs, -v_dir)
     safe_v_norm = torch.where(has_safe_bin, v_norm, torch.zeros_like(v_norm))
 
-    # 8. 计算奖励惩罚项
     v_safe_cos = torch.sum(v_dir * safe_dir_final, dim=-1)
     dir_penalty = 1.0 - v_safe_cos
     mag_penalty = torch.abs(v_norm - safe_v_norm) / (v_norm + 1e-6)
 
-    # 仅对激活条件成立的施加惩罚
     penalty = (dir_penalty + mag_penalty) * active_mask.float()
 
     _tb_store_reward(env, "safe_vel_penalty", penalty)
@@ -506,10 +502,10 @@ def penalty_energy(
             dw = torch.clamp(w - prev_w, min=-20.0 * dt, max=20.0 * dt)
 
             a = dv / dt
-            alpha = dw / dt
+            alpha_dw = dw / dt
 
             a_norm = _safe_norm(a)
-            alpha_norm = _safe_norm(alpha)
+            alpha_norm = _safe_norm(alpha_dw)
 
             pa = (a_norm / lin_acc_scale) ** 2
             palpha = (alpha_norm / ang_acc_scale) ** 2

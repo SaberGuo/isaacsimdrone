@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import traceback
 from pathlib import Path
@@ -21,10 +22,10 @@ parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lida
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 
 parser.add_argument("--num_envs", type=int, default=1)
-parser.add_argument("--num_obstacles", type=int, default=100)  # 修改为默认 100，与训练脚本对齐
+parser.add_argument("--num_obstacles", type=int, default=100)
 parser.add_argument("--seed", type=int, default=42)
 
-parser.add_argument("--state_dim", type=int, default=17)       # 修改为默认 17 维，与训练脚本对齐
+parser.add_argument("--state_dim", type=int, default=17)
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
 
@@ -32,7 +33,7 @@ parser.add_argument(
     "--checkpoint",
     type=str,
     default="",
-    help="Checkpoint path. If empty, auto search the latest under logs/",
+    help="Checkpoint path (.pt). If empty, auto-search the latest under logs/",
 )
 parser.add_argument(
     "--use_stochastic_policy",
@@ -77,16 +78,16 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.distributions as D
 import omniperception_isaacdrone.tasks.test6_registry as _test6_registry  # noqa: F401
 from gymnasium.spaces import Box
 from isaaclab_tasks.utils import parse_env_cfg
 import isaacsim.core.utils.prims as prim_utils
 from pxr import UsdGeom, Gf
 
-# 替换旧的 ObstacleSpawner，使用统一的全局障碍物生成函数
-from omniperception_isaacdrone.envs.test6_env import WallSpawner, setup_global_obstacles
+# 与训练脚本保持一致：使用 skrl 的 GaussianMixin / DeterministicMixin / Model
+from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 
+from omniperception_isaacdrone.envs.test6_env import WallSpawner, setup_global_obstacles
 
 # -----------------------------------------------------------------------------
 # Names
@@ -103,7 +104,7 @@ ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
 
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Helpers — visual / debug
 # -----------------------------------------------------------------------------
 
 def scale_robot_visual_only(num_envs: int, visual_scale=(20.0, 20.0, 10.0)) -> None:
@@ -114,14 +115,13 @@ def scale_robot_visual_only(num_envs: int, visual_scale=(20.0, 20.0, 10.0)) -> N
     for i in range(int(num_envs)):
         visual_path = f"/World/envs/env_{i}/Robot/body/body_visual"
         prim = stage.GetPrimAtPath(visual_path)
-
         if not prim.IsValid():
             continue
-
         xform = UsdGeom.Xformable(prim)
-
-        scale_ops = [op for op in xform.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeScale]
-
+        scale_ops = [
+            op for op in xform.GetOrderedXformOps()
+            if op.GetOpType() == UsdGeom.XformOp.TypeScale
+        ]
         if len(scale_ops) > 0:
             scale_ops[0].Set(Gf.Vec3f(sx, sy, sz))
         else:
@@ -132,25 +132,40 @@ def format_array_preview(x: np.ndarray, max_items: int = 16) -> str:
     x = np.asarray(x).reshape(-1)
     if x.size <= max_items:
         return np.array2string(x, precision=3, separator=", ")
-    head = x[:max_items]
-    return f"{np.array2string(head, precision=3, separator=', ')} ... (total={x.size})"
+    return f"{np.array2string(x[:max_items], precision=3, separator=', ')} ... (total={x.size})"
 
 
 def print_space_bounds(name: str, space: gym.Space) -> None:
     print(f"\n[SPACE] {name}: type={type(space).__name__}", flush=True)
-
     if isinstance(space, gym.spaces.Dict):
         print(f"[SPACE] {name}.keys={list(space.spaces.keys())}", flush=True)
         for k, subspace in space.spaces.items():
             print_space_bounds(f"{name}.{k}", subspace)
         return
-
     if isinstance(space, gym.spaces.Box):
         print(f"[SPACE] {name}.shape={space.shape}, dtype={space.dtype}", flush=True)
         return
-
     print(f"[SPACE] {name} = {space}", flush=True)
 
+
+def to_float(x: Any) -> float:
+    if isinstance(x, (float, int)):
+        return float(x)
+    if isinstance(x, torch.Tensor):
+        y = x.detach().float()
+        if y.numel() == 0:
+            return 0.0
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+        return float(y.mean().item())
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+# -----------------------------------------------------------------------------
+# Observation / action utilities  （与训练脚本保持完全一致）
+# -----------------------------------------------------------------------------
 
 def extract_policy_obs(obs: Any) -> torch.Tensor:
     if isinstance(obs, torch.Tensor):
@@ -165,13 +180,7 @@ def extract_policy_obs(obs: Any) -> torch.Tensor:
 
 
 def ensure_obs_shape(x: torch.Tensor, num_envs: int, obs_dim: int) -> torch.Tensor:
-    if x.dim() == 2 and x.shape == (num_envs, obs_dim):
-        return x
-    if x.dim() == 1 and x.numel() == num_envs * obs_dim:
-        return x.view(num_envs, obs_dim)
-    if x.dim() == 2 and x.shape == (1, num_envs * obs_dim):
-        return x.view(num_envs, obs_dim)
-    raise RuntimeError(f"Invalid obs shape {tuple(x.shape)}; expected ({num_envs}, {obs_dim})")
+    return x.view(num_envs, obs_dim)
 
 
 def ensure_action_shape(x: torch.Tensor, num_envs: int, act_dim: int) -> torch.Tensor:
@@ -179,9 +188,6 @@ def ensure_action_shape(x: torch.Tensor, num_envs: int, act_dim: int) -> torch.T
         x = x.unsqueeze(0).repeat(num_envs, 1)
     elif x.dim() == 2 and x.shape == (1, act_dim) and num_envs > 1:
         x = x.repeat(num_envs, 1)
-
-    if x.dim() != 2 or x.shape != (num_envs, act_dim):
-        raise RuntimeError(f"Invalid action shape {tuple(x.shape)}; expected ({num_envs}, {act_dim})")
     return x
 
 
@@ -203,23 +209,10 @@ def sanitize_states(states: torch.Tensor, state_dim: int, lidar_dim: int) -> tor
 
 
 def sanitize_actions(actions: torch.Tensor) -> torch.Tensor:
-    actions = torch.nan_to_num(actions.float(), nan=0.0, posinf=0.0, neginf=0.0)
-    return torch.clamp(actions, -1.0, 1.0)
-
-
-def to_float(x: Any) -> float:
-    if isinstance(x, (float, int)):
-        return float(x)
-    if isinstance(x, torch.Tensor):
-        y = x.detach().float()
-        if y.numel() == 0:
-            return 0.0
-        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-        return float(y.mean().item())
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
+    return torch.clamp(
+        torch.nan_to_num(actions.float(), nan=0.0, posinf=0.0, neginf=0.0),
+        -1.0, 1.0,
+    )
 
 
 def infer_single_dim_from_box(space: Box) -> int:
@@ -243,27 +236,29 @@ def build_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int, in
     act_space = getattr(base_env, "single_action_space", None)
     if not isinstance(act_space, gym.spaces.Box):
         act_space = getattr(base_env, "action_space", None)
-
     if not isinstance(act_space, gym.spaces.Box):
         raise RuntimeError("Action space is not a gym.spaces.Box")
 
     act_dim = infer_single_dim_from_box(act_space)
     obs_dim = state_dim + lidar_dim
 
-    obs_low = -np.ones((obs_dim,), dtype=np.float32)
-    obs_high = np.ones((obs_dim,), dtype=np.float32)
+    obs_low  = -np.ones((obs_dim,), dtype=np.float32)
+    obs_high =  np.ones((obs_dim,), dtype=np.float32)
     if lidar_dim > 0:
         obs_low[state_dim:] = 0.0
 
-    obs_box = Box(low=obs_low, high=obs_high, dtype=np.float32)
-    act_box = Box(
+    obs_space = gym.spaces.Dict({"policy": Box(low=obs_low, high=obs_high, dtype=np.float32)})
+    act_box   = Box(
         low=-np.ones((act_dim,), dtype=np.float32),
-        high=np.ones((act_dim,), dtype=np.float32),
+        high= np.ones((act_dim,), dtype=np.float32),
         dtype=np.float32,
     )
-    obs_space = gym.spaces.Dict({"policy": obs_box})
     return obs_dim, act_dim, obs_space, act_box
 
+
+# -----------------------------------------------------------------------------
+# Env adapter  （与训练脚本 SkrlSpaceAdapter 逻辑完全一致）
+# -----------------------------------------------------------------------------
 
 class PlaySpaceAdapter(gym.Wrapper):
     """Expose stable single-env semantic spaces and sanitized observations."""
@@ -279,30 +274,39 @@ class PlaySpaceAdapter(gym.Wrapper):
         super().__init__(env)
         self.state_dim = int(state_dim)
         self.lidar_dim = int(lidar_dim)
-        self.obs_dim = self.state_dim + self.lidar_dim
+        self.obs_dim   = self.state_dim + self.lidar_dim
 
-        self.observation_space = obs_space
+        self.observation_space        = obs_space
         self.single_observation_space = obs_space
-        self.action_space = act_space
-        self.single_action_space = act_space
+        self.action_space             = act_space
+        self.single_action_space      = act_space
 
         self.num_envs = int(getattr(env, "num_envs", 1))
-        self.device = getattr(env, "device", None)
+        self.device   = getattr(env, "device", None)
 
     def _convert_obs(self, raw_obs: Any) -> dict[str, torch.Tensor]:
-        x = extract_policy_obs(raw_obs)
-        x = ensure_obs_shape(x, self.num_envs, self.obs_dim)
-        x = sanitize_states(x, state_dim=self.state_dim, lidar_dim=self.lidar_dim)
-        return {"policy": x}
+        return {
+            "policy": sanitize_states(
+                ensure_obs_shape(extract_policy_obs(raw_obs), self.num_envs, self.obs_dim),
+                self.state_dim,
+                self.lidar_dim,
+            )
+        }
 
     def reset(self, **kwargs):
-        raw_obs, infos = self.env.reset(**kwargs)
+        # IsaacLab ManagerBasedRLEnv.reset() 不接受 env_ids 关键字；
+        # 直接忽略多余参数，整体 reset。
+        raw_obs, infos = self.env.reset()
         return self._convert_obs(raw_obs), infos
 
     def step(self, actions):
         raw_obs, rewards, terminated, truncated, infos = self.env.step(actions)
         return self._convert_obs(raw_obs), rewards, terminated, truncated, infos
 
+
+# -----------------------------------------------------------------------------
+# Model definitions  — 与训练脚本完全一致，保证权重键名匹配
+# -----------------------------------------------------------------------------
 
 def init_hidden(m: nn.Module) -> None:
     if isinstance(m, nn.Linear):
@@ -317,100 +321,119 @@ def init_policy_head(m: nn.Linear) -> None:
         nn.init.constant_(m.bias, 0.0)
 
 
+def init_value_head(m: nn.Linear) -> None:
+    nn.init.orthogonal_(m.weight, gain=1.0)
+    if m.bias is not None:
+        nn.init.constant_(m.bias, 0.0)
+
+
+def gaussian_mixin_kwargs() -> dict:
+    kwargs: dict = {"clip_actions": True}
+    if "clip_mean_actions" in inspect.signature(GaussianMixin.__init__).parameters:
+        kwargs["clip_mean_actions"] = True
+    return kwargs
+
+
 class StructuredFeatureExtractor(nn.Module):
     def __init__(self, state_dim: int, lidar_dim: int, feat_dim: int = 256):
         super().__init__()
         self.state_dim = int(state_dim)
         self.lidar_dim = int(lidar_dim)
 
-        self.state_ln = nn.LayerNorm(self.state_dim)
+        self.state_ln  = nn.LayerNorm(self.state_dim)
         self.state_net = nn.Sequential(
-            nn.Linear(self.state_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, 128),
-            nn.Tanh(),
+            nn.Linear(self.state_dim, 128), nn.Tanh(),
+            nn.Linear(128, 128),           nn.Tanh(),
         )
 
         if self.lidar_dim > 0:
-            self.lidar_ln = nn.LayerNorm(self.lidar_dim)
+            self.lidar_ln  = nn.LayerNorm(self.lidar_dim)
             self.lidar_net = nn.Sequential(
-                nn.Linear(self.lidar_dim, 256),
-                nn.Tanh(),
-                nn.Linear(256, 256),
-                nn.Tanh(),
+                nn.Linear(self.lidar_dim, 256), nn.Tanh(),
+                nn.Linear(256, 256),            nn.Tanh(),
             )
             fuse_in = 128 + 256
         else:
-            self.lidar_ln = nn.Identity()
+            self.lidar_ln  = nn.Identity()
             self.lidar_net = None
             fuse_in = 128
 
-        self.fuse_net = nn.Sequential(
-            nn.Linear(fuse_in, feat_dim),
-            nn.Tanh(),
-        )
+        self.fuse_net = nn.Sequential(nn.Linear(fuse_in, feat_dim), nn.Tanh())
         self.apply(init_hidden)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        state = self.state_net(self.state_ln(torch.clamp(obs[:, :self.state_dim], -1.0, 1.0)))
+        state = self.state_net(
+            self.state_ln(torch.clamp(obs[:, :self.state_dim], -1.0, 1.0))
+        )
         if self.lidar_dim <= 0:
             return self.fuse_net(state)
-
-        lidar = torch.clamp(obs[:, self.state_dim:self.state_dim + self.lidar_dim], 0.0, 1.0)
-        lidar = self.lidar_net(self.lidar_ln(lidar * 2.0 - 1.0))
+        lidar = self.lidar_net(
+            self.lidar_ln(
+                torch.clamp(obs[:, self.state_dim:self.state_dim + self.lidar_dim], 0.0, 1.0) * 2.0 - 1.0
+            )
+        )
         return self.fuse_net(torch.cat([state, lidar], dim=-1))
 
 
-class Policy(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, state_dim: int, lidar_dim: int, feat_dim: int = 256):
-        super().__init__()
-        self.obs_dim = int(obs_dim)
-        self.act_dim = int(act_dim)
-        self.state_dim = int(state_dim)
-        self.lidar_dim = int(lidar_dim)
+class Policy(GaussianMixin, Model):
+    """与训练脚本中的 Policy 类完全一致，保证 state_dict 键名匹配。"""
 
-        self.fe = StructuredFeatureExtractor(state_dim, lidar_dim, feat_dim)
-        self.mean = nn.Linear(feat_dim, self.act_dim)
-        self.log_std_parameter = nn.Parameter(torch.full((self.act_dim,), -1.0))
+    def __init__(self, observation_space, action_space, device, state_dim, lidar_dim, feat_dim=256):
+        Model.__init__(self, observation_space, action_space, device)
+        GaussianMixin.__init__(self, **gaussian_mixin_kwargs())
+        if self.num_observations != state_dim + lidar_dim:
+            raise RuntimeError(
+                f"obs dim mismatch: model expects {state_dim + lidar_dim}, "
+                f"got {self.num_observations}"
+            )
+        self.fe              = StructuredFeatureExtractor(state_dim, lidar_dim, feat_dim)
+        self.mean            = nn.Linear(feat_dim, self.num_actions)
+        self.log_std_parameter = nn.Parameter(torch.full((self.num_actions,), -1.0))
         init_policy_head(self.mean)
 
-    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        feat = self.fe(obs)
-        mean = torch.tanh(self.mean(feat))
+    def compute(self, inputs, role):
+        mean    = torch.tanh(self.mean(self.fe(inputs["states"])))
         log_std = torch.clamp(self.log_std_parameter, min=-5.0, max=0.0).expand_as(mean)
-        return mean, log_std
+        return mean, log_std, {}
 
+    # ------------------------------------------------------------------
+    # 推理接口：deterministic → mean；stochastic → 从高斯分布采样
+    # ------------------------------------------------------------------
     @torch.no_grad()
-    def act(self, obs: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
-        mean, log_std = self.forward(obs)
+    def play_act(self, obs: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        """
+        obs: (num_envs, obs_dim) tensor already on the correct device.
+        返回 clamp 后的 action tensor，shape (num_envs, act_dim)。
+        """
+        inputs = {"states": obs}
+        mean, log_std, _ = self.compute(inputs, role="policy")
         if deterministic:
             action = mean
         else:
-            std = torch.exp(log_std)
-            dist = D.Normal(mean, std)
-            action = dist.sample()
+            std    = torch.exp(log_std)
+            action = mean + std * torch.randn_like(std)
         return torch.clamp(action, -1.0, 1.0)
 
 
+# -----------------------------------------------------------------------------
+# Space / name utilities
+# -----------------------------------------------------------------------------
+
 def build_state_names(state_dim: int) -> list[str]:
-    if int(state_dim) == len(STATE_OBS_NAMES_17):
-        return list(STATE_OBS_NAMES_17)
-    return [f"state_{i}" for i in range(int(state_dim))]
+    return list(STATE_OBS_NAMES_17) if int(state_dim) == len(STATE_OBS_NAMES_17) else [f"state_{i}" for i in range(int(state_dim))]
 
 
 def build_action_names(act_dim: int) -> list[str]:
-    if int(act_dim) == len(ACTION_NAMES_4):
-        return list(ACTION_NAMES_4)
-    return [f"action_{i}" for i in range(int(act_dim))]
+    return list(ACTION_NAMES_4) if int(act_dim) == len(ACTION_NAMES_4) else [f"action_{i}" for i in range(int(act_dim))]
 
 
 def print_obs_summary(obs: torch.Tensor, state_dim: int, lidar_dim: int, prefix: str = "[OBS]") -> None:
-    obs0 = obs[0].detach().cpu()
+    obs0  = obs[0].detach().cpu()
     state = obs0[:state_dim]
     print(f"{prefix} state = {np.array2string(state.numpy(), precision=3, separator=', ')}", flush=True)
     if lidar_dim > 0:
-        lidar = obs0[state_dim:state_dim + lidar_dim]
-        nz = float((lidar > 1e-6).float().mean().item())
+        lidar = obs0[state_dim: state_dim + lidar_dim]
+        nz    = float((lidar > 1e-6).float().mean().item())
         print(
             f"{prefix} lidar: min={float(lidar.min().item()):.4f}, "
             f"max={float(lidar.max().item()):.4f}, "
@@ -420,81 +443,111 @@ def print_obs_summary(obs: torch.Tensor, state_dim: int, lidar_dim: int, prefix:
         )
 
 
-def extract_model_state_dict(payload: Any, key_hint: str | None = None) -> dict[str, torch.Tensor]:
-    if isinstance(payload, dict):
-        if key_hint is not None and key_hint in payload and isinstance(payload[key_hint], dict):
-            return payload[key_hint]
-
-        for k in ["policy", "policy_state_dict", "model", "state_dict"]:
-            if k in payload and isinstance(payload[k], dict):
-                return payload[k]
-
-        if all(isinstance(k, str) for k in payload.keys()):
-            if any(("weight" in k) or ("bias" in k) or ("log_std_parameter" in k) for k in payload.keys()):
-                return payload
-
-    raise RuntimeError("Could not extract policy state_dict from checkpoint payload")
-
+# -----------------------------------------------------------------------------
+# Checkpoint loading
+# -----------------------------------------------------------------------------
 
 def find_latest_checkpoint(log_root: Path) -> Path:
-    candidates: list[Path] = []
-
     if not log_root.exists():
         raise FileNotFoundError(f"log root not found: {log_root}")
 
-    for p in log_root.rglob("*.pt"):
-        if "manual_checkpoints" in str(p):
-            candidates.append(p)
+    # 优先搜索 manual_checkpoints 目录下的 .pt 文件
+    candidates: list[Path] = sorted(
+        log_root.rglob("*.pt"),
+        key=lambda x: x.stat().st_mtime,
+        reverse=True,
+    )
+    # 按优先级：manual_checkpoints → 其余 .pt → .pth
+    manual = [p for p in candidates if "manual_checkpoints" in str(p)]
+    other  = [p for p in candidates if "manual_checkpoints" not in str(p)]
+    pth    = sorted(log_root.rglob("*.pth"), key=lambda x: x.stat().st_mtime, reverse=True)
 
-    if len(candidates) == 0:
-        for p in log_root.rglob("*.pth"):
-            candidates.append(p)
-    if len(candidates) == 0:
-        for p in log_root.rglob("*.pt"):
-            candidates.append(p)
+    ordered = manual + other + pth
+    if len(ordered) == 0:
+        raise FileNotFoundError(f"No checkpoint (.pt / .pth) found under {log_root}")
 
-    if len(candidates) == 0:
-        raise FileNotFoundError(f"No checkpoint found under {log_root}")
-
-    candidates = sorted(candidates, key=lambda x: x.stat().st_mtime, reverse=True)
-    return candidates[0]
+    chosen = ordered[0]
+    print(f"[INFO] Auto-selected checkpoint: {chosen}", flush=True)
+    return chosen
 
 
-def load_policy_checkpoint(policy: Policy, checkpoint_path: Path, device: torch.device) -> None:
+def load_policy_checkpoint(
+    policy: Policy,
+    checkpoint_path: Path,
+    device: torch.device,
+) -> None:
+    """
+    训练脚本保存格式（manual_checkpoints）：
+        torch.save({name: model.state_dict() for name, model in models.items()}, ...)
+    即 payload = {"policy": {...}, "value": {...}}
+
+    skrl 内置保存格式（experiment checkpoints）：
+        payload["policy"] 可能是完整 state_dict，也可能嵌套在其他键下。
+
+    本函数统一处理以上两种格式。
+    """
     print(f"[INFO] Loading checkpoint: {checkpoint_path}", flush=True)
-    payload = torch.load(checkpoint_path, map_location=device)
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    try:
-        state_dict = extract_model_state_dict(payload, key_hint="policy")
-    except Exception:
-        state_dict = extract_model_state_dict(payload, key_hint=None)
+    state_dict: dict | None = None
+
+    # ① 训练脚本 manual_checkpoints 格式：{"policy": state_dict, "value": state_dict}
+    if isinstance(payload, dict) and "policy" in payload and isinstance(payload["policy"], dict):
+        candidate = payload["policy"]
+        # 确认确实是 state_dict（含 weight/bias/log_std_parameter 等键）
+        if any(("weight" in k or "bias" in k or "log_std_parameter" in k) for k in candidate.keys()):
+            state_dict = candidate
+
+    # ② 直接是 state_dict（顶层就是参数键）
+    if state_dict is None and isinstance(payload, dict):
+        if any(("weight" in k or "bias" in k or "log_std_parameter" in k) for k in payload.keys()):
+            state_dict = payload
+
+    # ③ skrl 内置 checkpoint 可能再嵌套一层
+    if state_dict is None and isinstance(payload, dict):
+        for k in ["policy_state_dict", "model", "state_dict", "actor", "network"]:
+            if k in payload and isinstance(payload[k], dict):
+                state_dict = payload[k]
+                break
+
+    if state_dict is None:
+        raise RuntimeError(
+            f"Cannot extract policy state_dict from checkpoint {checkpoint_path}. "
+            f"Top-level keys: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}"
+        )
 
     missing, unexpected = policy.load_state_dict(state_dict, strict=False)
+    print("[INFO] Policy checkpoint loaded successfully.", flush=True)
+    if missing:
+        print(f"[WARN] Missing keys  ({len(missing)}): {missing}", flush=True)
+    if unexpected:
+        print(f"[WARN] Unexpected keys ({len(unexpected)}): {unexpected}", flush=True)
 
-    print(f"[INFO] Policy checkpoint loaded", flush=True)
-    if len(missing) > 0:
-        print(f"[WARN] Missing keys: {missing}", flush=True)
-    if len(unexpected) > 0:
-        print(f"[WARN] Unexpected keys: {unexpected}", flush=True)
 
+# -----------------------------------------------------------------------------
+# Misc
+# -----------------------------------------------------------------------------
 
 def maybe_print_goal(base_env: Any, env_ids: list[int] | None = None) -> None:
     try:
         if not hasattr(base_env, "goal_pos_w"):
             return
         goal = base_env.goal_pos_w.detach().cpu().numpy()
-        if env_ids is None:
-            env_ids = [0]
-        for eid in env_ids:
+        for eid in (env_ids or [0]):
             if 0 <= int(eid) < goal.shape[0]:
                 print(f"[INFO] goal_pos_w[{eid}]={goal[eid]}", flush=True)
     except Exception:
         pass
 
 
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
 def main() -> None:
     print(
-        f"[INFO] task={args.task}, num_envs={args.num_envs}, device={args.device}, headless={args.headless}",
+        f"[INFO] task={args.task}, num_envs={args.num_envs}, "
+        f"device={args.device}, headless={args.headless}",
         flush=True,
     )
 
@@ -503,22 +556,21 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(args.seed))
 
+    # ------------------------------------------------------------------
+    # 环境配置（与训练脚本保持一致）
+    # ------------------------------------------------------------------
     env_cfg = parse_env_cfg(
         args.task,
         device=args.device,
         num_envs=args.num_envs,
         use_fabric=not args.disable_fabric,
     )
+    env_cfg.scene.replicate_physics = True
+    env_cfg.scene.filter_collisions = True
     try:
         setattr(env_cfg, "seed", int(args.seed))
     except Exception:
         pass
-
-    # ---------------------------------------------------------
-    # 强制使能碰撞和物理同步，与训练脚本对齐
-    # ---------------------------------------------------------
-    env_cfg.scene.replicate_physics = True
-    env_cfg.scene.filter_collisions = True
 
     print("[INFO] Spawning workspace walls...", flush=True)
     WallSpawner(
@@ -528,30 +580,26 @@ def main() -> None:
         wall_thickness=0.5,
         color=(0.7, 0.7, 0.2),
         wall_colors={
-            "Wall_XMin": (0.5, 1.0, 1.0),  
-            "Wall_XMax": (1.0, 1.0, 0.5),  
-            "Wall_YMin": (0.0, 1.0, 1.0),  
-            "Wall_YMax": (1.0, 1.0, 0.0),  
-            "Wall_ZMin": (1.0, 1.0, 1.0),  
-            "Wall_ZMax": (0.0, 0.0, 0.0),  
+            "Wall_XMin": (0.5, 1.0, 1.0),
+            "Wall_XMax": (1.0, 1.0, 0.5),
+            "Wall_YMin": (0.0, 1.0, 1.0),
+            "Wall_YMax": (1.0, 1.0, 0.0),
+            "Wall_ZMin": (1.0, 1.0, 1.0),
+            "Wall_ZMax": (0.0, 0.0, 0.0),
         },
     ).spawn_walls()
 
-    # ---------------------------------------------------------
-    # 调用统一的全局障碍物生成器
-    # ---------------------------------------------------------
     print("[INFO] Setting up global obstacles template...", flush=True)
     setup_global_obstacles(int(args.num_obstacles))
 
     print("[INFO] Creating env...", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
+    scale_robot_visual_only(num_envs=base_env.num_envs, visual_scale=(20.0, 20.0, 10.0))
 
-    scale_robot_visual_only(
-        num_envs=base_env.num_envs,
-        visual_scale=(20.0, 20.0, 10.0),
-    )
-
-    space = getattr(base_env, "single_observation_space", None)
+    # ------------------------------------------------------------------
+    # 推断观测 / 动作空间
+    # ------------------------------------------------------------------
+    space        = getattr(base_env, "single_observation_space", None)
     policy_space = (
         space.spaces.get("policy", None)
         if isinstance(space, gym.spaces.Dict)
@@ -560,7 +608,7 @@ def main() -> None:
     if policy_space is None:
         raise RuntimeError("policy observation space not found")
 
-    obs_dim_raw = int(np.prod(policy_space.shape))
+    obs_dim_raw          = int(np.prod(policy_space.shape))
     state_dim, lidar_dim = get_state_lidar_dims(base_env, obs_dim_raw)
     obs_dim, act_dim, obs_space, act_space = build_spaces(base_env, state_dim, lidar_dim)
 
@@ -576,7 +624,7 @@ def main() -> None:
     )
 
     num_envs = int(getattr(env, "num_envs", args.num_envs))
-    device = torch.device(getattr(env, "device", args.device))
+    device   = torch.device(getattr(env, "device", args.device))
 
     print(
         f"[INFO] play spaces -> obs={obs_dim} (state={state_dim}, lidar={lidar_dim}), act={act_dim}",
@@ -584,15 +632,23 @@ def main() -> None:
     )
     print(f"[INFO] num_envs={num_envs}, device={device}", flush=True)
 
+    # ------------------------------------------------------------------
+    # 构建策略网络（与训练脚本 Policy 完全一致）
+    # ------------------------------------------------------------------
     policy = Policy(
-        obs_dim=obs_dim,
-        act_dim=act_dim,
+        observation_space=obs_space,
+        action_space=act_space,
+        device=device,
         state_dim=state_dim,
         lidar_dim=lidar_dim,
         feat_dim=args.feat_dim,
-    ).to(device)
+    )
+    policy.to(device)
     policy.eval()
 
+    # ------------------------------------------------------------------
+    # 加载 checkpoint
+    # ------------------------------------------------------------------
     script_dir = Path(__file__).resolve().parent
     project_dir = script_dir.parent
     log_root = project_dir / "logs"
@@ -607,6 +663,9 @@ def main() -> None:
 
     load_policy_checkpoint(policy, checkpoint_path, device=device)
 
+    # ------------------------------------------------------------------
+    # 初始 reset
+    # ------------------------------------------------------------------
     obs, infos = env.reset()
     states = sanitize_states(
         ensure_obs_shape(extract_policy_obs(obs), num_envs, obs_dim),
@@ -615,14 +674,13 @@ def main() -> None:
     )
 
     maybe_print_goal(base_env)
-
     if args.show_obs_stats:
         print_obs_summary(states, state_dim=state_dim, lidar_dim=lidar_dim, prefix="[RESET]")
 
     print("[INFO] Start play loop...", flush=True)
 
-    step = 0
-    episode_idx = 0
+    step           = 0
+    episode_idx    = 0
     episode_reward = torch.zeros((num_envs,), device=device, dtype=torch.float32)
 
     try:
@@ -631,8 +689,11 @@ def main() -> None:
                 print("[INFO] Reached max play steps, exiting.", flush=True)
                 break
 
+            # --------------------------------------------------------------
+            # 推理
+            # --------------------------------------------------------------
             with torch.no_grad():
-                actions = policy.act(
+                actions = policy.play_act(
                     states,
                     deterministic=not bool(args.use_stochastic_policy),
                 )
@@ -640,6 +701,9 @@ def main() -> None:
             actions = ensure_action_shape(actions, num_envs, act_dim)
             actions = sanitize_actions(actions)
 
+            # --------------------------------------------------------------
+            # 环境交互
+            # --------------------------------------------------------------
             next_obs, rewards, terminated, truncated, infos = env.step(actions)
 
             next_states = sanitize_states(
@@ -647,31 +711,30 @@ def main() -> None:
                 state_dim=state_dim,
                 lidar_dim=lidar_dim,
             )
-            rewards = ensure_vec_shape(
-                torch.nan_to_num(rewards.float(), nan=0.0, posinf=0.0, neginf=0.0),
-                num_envs,
-                "rewards",
+            rewards    = ensure_vec_shape(
+                torch.nan_to_num(rewards.float(),    nan=0.0, posinf=0.0, neginf=0.0),
+                num_envs, "rewards",
             )
             terminated = ensure_vec_shape(
                 torch.nan_to_num(terminated.float(), nan=0.0, posinf=0.0, neginf=0.0),
-                num_envs,
-                "terminated",
+                num_envs, "terminated",
             ).bool()
-            truncated = ensure_vec_shape(
-                torch.nan_to_num(truncated.float(), nan=0.0, posinf=0.0, neginf=0.0),
-                num_envs,
-                "truncated",
+            truncated  = ensure_vec_shape(
+                torch.nan_to_num(truncated.float(),  nan=0.0, posinf=0.0, neginf=0.0),
+                num_envs, "truncated",
             ).bool()
 
             episode_reward += rewards.squeeze(-1)
-            done = terminated | truncated
+            done      = terminated | truncated
             done_mask = done.squeeze(-1) if done.dim() == 2 else done
 
+            # --------------------------------------------------------------
+            # 打印
+            # --------------------------------------------------------------
             if (step % int(args.print_every) == 0) or done_mask.any().item():
-                a0 = actions[0].detach().cpu().numpy()
-                r_mean = float(rewards.mean().item())
+                a0         = actions[0].detach().cpu().numpy()
+                r_mean     = float(rewards.mean().item())
                 done_count = int(done.sum().item())
-
                 print(
                     f"[PLAY] step={step:06d} "
                     f"reward_mean={r_mean:+.4f} "
@@ -679,9 +742,10 @@ def main() -> None:
                     f"action0={np.array2string(a0, precision=3, separator=', ')}",
                     flush=True,
                 )
-
                 if args.show_obs_stats:
-                    print_obs_summary(next_states, state_dim=state_dim, lidar_dim=lidar_dim, prefix="[PLAY]")
+                    print_obs_summary(
+                        next_states, state_dim=state_dim, lidar_dim=lidar_dim, prefix="[PLAY]"
+                    )
 
             if not args.headless:
                 try:
@@ -689,14 +753,19 @@ def main() -> None:
                 except Exception:
                     pass
 
+            # --------------------------------------------------------------
+            # Episode 结束处理
+            # IsaacLab ManagerBasedRLEnv 在 done 时已在内部自动重置对应子环境，
+            # 并把重置后的 obs 作为 next_obs 返回，因此通常无需额外调用 reset()。
+            # --reset_on_done 标志仅用于打印诊断信息并刷新状态缓存。
+            # --------------------------------------------------------------
             if done_mask.any().item():
                 done_ids = torch.nonzero(done_mask, as_tuple=False).squeeze(-1)
-                done_ids_list = done_ids.detach().cpu().tolist()
+                done_ids_list: list[int] = done_ids.detach().cpu().tolist()
                 if isinstance(done_ids_list, int):
                     done_ids_list = [done_ids_list]
 
                 print(f"[PLAY] episode finished on env ids: {done_ids_list}", flush=True)
-
                 for eid in done_ids_list:
                     print(
                         f"[PLAY] env{eid} episode_reward={float(episode_reward[eid].item()):+.4f}",
@@ -705,27 +774,15 @@ def main() -> None:
                     episode_reward[eid] = 0.0
 
                 episode_idx += len(done_ids_list)
+                maybe_print_goal(base_env, env_ids=done_ids_list)
 
-                # IsaacLab 的 ManagerBasedRLEnv 通常在 done 的时候会自动返回重置后的 obs
-                # 这里我们仅对用户可能强制要求二次 reset 做个兜底。通常在 IsaacLab 里这段逻辑是不必要的
-                if args.reset_on_done:
-                    # 避免对整个环境重复 reset，只刷新状态
-                    reset_obs, reset_infos = env.reset(env_ids=done_ids)
-                    reset_states = sanitize_states(
-                        ensure_obs_shape(extract_policy_obs(reset_obs), num_envs, obs_dim),
-                        state_dim=state_dim,
-                        lidar_dim=lidar_dim,
+                if args.show_obs_stats:
+                    print_obs_summary(
+                        next_states, state_dim=state_dim, lidar_dim=lidar_dim, prefix="[DONE]"
                     )
 
-                    next_states[done_ids] = reset_states[done_ids]
-
-                    maybe_print_goal(base_env, env_ids=done_ids_list)
-
-                    if args.show_obs_stats:
-                        print_obs_summary(next_states, state_dim=state_dim, lidar_dim=lidar_dim, prefix="[RESET_DONE]")
-
             states = next_states
-            step += 1
+            step  += 1
 
     except KeyboardInterrupt:
         print("\n[WARN] KeyboardInterrupt: stopping play", flush=True)

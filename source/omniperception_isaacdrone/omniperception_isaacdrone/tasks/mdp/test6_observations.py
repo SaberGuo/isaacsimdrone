@@ -317,5 +317,11 @@ def obs_lidar_min_range_grid(
     min_dist = torch.where(torch.isfinite(min_dist), min_dist, max_d_t)
     min_dist = torch.clamp(min_dist, 0.0, max_d_t)
 
-    closeness = 1.0 - torch.clamp(min_dist / max_d_t, 0.0, 1.0)
+    # 采用指数型 Closeness 映射，距离越近上升越快
+    alpha = 3.0
+    norm_dist = min_dist / max_d_t
+    exp_alpha = math.exp(-alpha)
+    closeness = (torch.exp(-alpha * norm_dist) - exp_alpha) / (1.0 - exp_alpha)
+    
     return _clamp_01(closeness.to(torch.float32))
+
