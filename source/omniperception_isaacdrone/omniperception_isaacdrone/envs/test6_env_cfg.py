@@ -55,10 +55,10 @@ class ObstacleCurriculumSettingsCfg:
 
     # Promotion criterion: recent reached_goal ratio
     success_term_name: str = "reached_goal"
-    success_threshold: float = 0.9
+    success_threshold: float = 0.8
 
     # Rolling window over recent terminated episodes
-    window_size: int = 200
+    window_size: int = 100
     min_samples: int = 100
 
     # Avoid jumping multiple levels using stale statistics from an easier stage
@@ -203,25 +203,25 @@ class Test6EventCfg:
 @configclass
 class Test6RewardsCfg:
     # ---- 密集导航奖励（主信号，per-step 量级 O(0.1~1)） ----
-    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=40.0, params={})
-    dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=5.0, params={})
-    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=8.0, params={})
+    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=4.0, params={})
+    dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=1.0, params={})
+    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=1.0, params={})
 
     # ---- 稳定性奖励 ----
-    height = RewTerm(func=my_mdp.reward_height_tracking, weight=8.0, params={})
-    stability = RewTerm(func=my_mdp.reward_stability, weight=0.05, params={})
+    height = RewTerm(func=my_mdp.reward_height_tracking, weight=1.0, params={})
+    stability = RewTerm(func=my_mdp.reward_stability, weight=0.005, params={})
 
     # ---- 安全惩罚 ----
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-1000.0, params={})
-    safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-500.0, params={}) 
-    energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.02, params={})
-    action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.005)
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-10.0, params={})
+    safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-5.0, params={}) 
+    energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.002, params={})
+    action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.0005)
 
     # ---- 终端信号（与密集累计量级可比） ----
-    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=800.0, params={})
-    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-800.0, params={})
-    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-800.0, params={})
-    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-500.0, params={})
+    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=10.0, params={})
+    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-10.0, params={})
+    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-10.0, params={})
+    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-5.0, params={})
 
 
 @configclass
@@ -239,8 +239,8 @@ class Test6CurriculumCfg:
         params={
             "levels": (0, 10, 15, 20, 30, 50),
             "success_term_name": "reached_goal",
-            "success_threshold": 0.9,
-            "window_size": 200,
+            "success_threshold": 0.8,
+            "window_size": 100,
         }
     )
 
@@ -265,7 +265,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 1
         self.sim.dt = 1.0 / 60.0
         self.sim.render_interval = self.decimation
-        self.episode_length_s = 45.0
+        self.episode_length_s = 60.0
 
         self.viewer.eye = (60.0, 60.0, 40.0)
         self.viewer.lookat = (0.0, 0.0, 5.0)
