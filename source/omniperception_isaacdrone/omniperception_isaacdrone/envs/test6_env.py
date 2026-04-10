@@ -1,3 +1,4 @@
+# omniperception_isaacdrone/envs/test6_env.py
 from __future__ import annotations
 
 from collections import deque
@@ -129,7 +130,7 @@ def setup_global_obstacles(max_obstacles: int = 100):
     print(f"[INFO]: 预生成 {max_obstacles} 个 全局 障碍物模板到 /World/Obstacles ...", flush=True)
     for i in range(max_obstacles):
         cfg_obstacle = sim_utils.CuboidCfg(
-            size=(1.0, 1.0, 10.0), # 默认大小
+            size=(1.0, 1.0, 10.0),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 rigid_body_enabled=True,
                 disable_gravity=True,
@@ -143,7 +144,7 @@ def setup_global_obstacles(max_obstacles: int = 100):
 
 
 # =============================================================================
-# Env with goal buffer / energy cache / progress cache
+# Env with goal buffer / energy cache / progress cache / lidar threat cache
 # =============================================================================
 class MyDroneRLEnv(ManagerBasedRLEnv):
     """Custom env with goal buffers."""
@@ -163,6 +164,10 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._energy_prev_lin_vel_w = torch.zeros((1, 3), dtype=torch.float32)
         self._energy_prev_ang_vel_w = torch.zeros((1, 3), dtype=torch.float32)
         self._progress_prev_goal_dist = torch.zeros((1,), dtype=torch.float32)
+
+        # lidar threat gradient buffers (placeholders, resized after super().__init__)
+        self._lidar_threat_prev_min_dist = None
+        self._lidar_threat_reset_mask = None
 
         # goal visualizer settings / cache
         self._goal_vis_enabled = True
@@ -186,6 +191,12 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._energy_prev_lin_vel_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
         self._energy_prev_ang_vel_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
         self._progress_prev_goal_dist = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float32)
+
+        # lidar threat gradient buffers (properly sized)
+        self._lidar_threat_prev_min_dist = None  # lazy-init on first reward call
+        self._lidar_threat_reset_mask = torch.zeros(
+            (self.num_envs,), device=self.device, dtype=torch.bool
+        )
 
         if self._goal_vis_enabled:
             self._create_goal_visualizers()
@@ -260,7 +271,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         lidar_dim = max(single_obs_dim - state_dim, 0)
 
         self.policy_state_dim, self.policy_lidar_dim = int(state_dim), int(lidar_dim)
-        
+
         self._batched_observation_space = getattr(self, "observation_space", None)
         self._batched_action_space = getattr(self, "action_space", None)
 
@@ -320,6 +331,14 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         except Exception:
             self._progress_prev_goal_dist[env_ids] = 0.0
 
+    def _refresh_lidar_threat_prev_dist(self, env_ids: torch.Tensor):
+        """标记 reset 环境，使 lidar_threat 奖励在下一步不产生虚假梯度。"""
+        if self._lidar_threat_reset_mask is None or self._lidar_threat_reset_mask.shape[0] != self.num_envs:
+            self._lidar_threat_reset_mask = torch.zeros(
+                (self.num_envs,), device=self.device, dtype=torch.bool
+            )
+        self._lidar_threat_reset_mask[env_ids] = True
+
     def _build_goal_info(self) -> dict:
         info = {}
         try:
@@ -332,21 +351,22 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
 
     def _reset_idx(self, env_ids: torch.Tensor | None = None):
         env_ids = torch.arange(self.num_envs, device=self.device) if env_ids is None else env_ids
-        
+
         parent = super()
         out = parent._reset_idx(env_ids) if hasattr(parent, "_reset_idx") else parent.reset_idx(env_ids)
 
         self._refresh_energy_prev_buffers(env_ids)
         self._refresh_progress_prev_dist(env_ids)
-        
+        self._refresh_lidar_threat_prev_dist(env_ids)
+
         obs_dict = self.observation_manager.compute()
-        
+
         goal_info = self._build_goal_info()
         if isinstance(out, tuple) and len(out) == 2:
             out = (obs_dict, out[1])
             if isinstance(out[1], dict):
                 out[1].update(goal_info)
-                
+
         return out
 
     def reset_idx(self, env_ids: torch.Tensor | None = None):

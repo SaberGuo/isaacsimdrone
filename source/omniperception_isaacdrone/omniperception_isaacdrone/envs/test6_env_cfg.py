@@ -188,7 +188,7 @@ class Test6EventCfg:
         "square_half_size": 35.0,
         "z_range": (3.0, 7.0),
     })
-    
+
     randomize_obstacles = EventTerm(
         func=my_mdp.randomize_obstacles_on_reset,
         mode="reset",
@@ -213,7 +213,7 @@ class Test6RewardsCfg:
 
     # ---- 安全惩罚 ----
     lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-10.0, params={})
-    safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-5.0, params={}) 
+    safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-5.0, params={})
     energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.002, params={})
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.0005)
 
@@ -345,12 +345,14 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "use_relu": True,
         }
 
+        # ── 梯度型 lidar_threat 参数 ──
         self.rewards.lidar_threat.params = {
             "lidar_name": "lidar",
-            "safe_dist": None,
-            "safe_dist_ratio": 0.16,
-            "exp_scale": 2.0,
-            "cap": 20.0,
+            "safe_dist": None,          # None → 使用 safe_dist_ratio × max_distance
+            "safe_dist_ratio": 0.16,    # 0.16 × 50m = 8m
+            "speed_ref": 6.0,           # 归一化参考速度 (m/s)
+            "clip": 1.0,                # 输出裁剪 [-1, 1]
+            "proximity_boost": True,    # 越近信号越强
             "use_grid": True,
             "theta_min": 30.0,
             "theta_max": 90.0,
@@ -364,8 +366,8 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.rewards.safe_vel_penalty.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "lidar_name": "lidar",
-            "safe_dist": 6.0,          
-            "margin": 2.0,             
+            "safe_dist": 6.0,
+            "margin": 2.0,
             "theta_min": 30.0,
             "theta_max": 90.0,
             "phi_min": 0.0,
