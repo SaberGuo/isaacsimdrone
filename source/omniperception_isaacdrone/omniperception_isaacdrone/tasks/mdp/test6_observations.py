@@ -1,3 +1,4 @@
+# omniperception_isaacdrone/tasks/mdp/test6_observations.py
 from __future__ import annotations
 
 import math
@@ -56,7 +57,6 @@ def _get_workspace_bounds(env: ManagerBasedRLEnv) -> Tuple[Tuple[float, float], 
         if xb is not None and yb is not None and zb is not None:
             return (tuple(xb), tuple(yb), tuple(zb))
     return (-60.0, 60.0), (-60.0, 60.0), (0.0, 10.0)
-
 
 
 def _get_vmax_wmax(env: ManagerBasedRLEnv) -> Tuple[float, float]:
@@ -121,7 +121,7 @@ def _get_downsampled_pc_torch(env, lidar, env_ids: torch.Tensor, max_pts: int | 
 
     E, P, _ = pc.shape
     num_raw = torch.full((E,), P, device=pc.device, dtype=torch.int32)
-    
+
     finite_mask = torch.isfinite(pc).all(dim=-1)
     pc = pc.clone()
     pc[~finite_mask] = float("nan")
@@ -137,7 +137,7 @@ def obs_goal_delta(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.T
     # 获取目标位置与当前位置的误差，并转换到【机体坐标系 (Body Frame)】
     pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
     goal = getattr(env, "goal_pos_w", None)
-    
+
     if goal is None:
         return torch.zeros_like(pos)
 
@@ -151,12 +151,12 @@ def obs_goal_delta(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.T
 
     # 世界坐标系下的距离差
     delta_w = goal - pos
-    
+
     # 将世界系坐标转换到机体坐标系（通过乘以机体四元数的共轭，即逆旋转）
     quat_w = mdp.root_quat_w(env, asset_cfg=asset_cfg)
     quat_inv = quat_w.clone()
-    quat_inv[..., 1:] = -quat_inv[..., 1:] # 共轭即为逆 [w, -x, -y, -z]
-    
+    quat_inv[..., 1:] = -quat_inv[..., 1:]  # 共轭即为逆 [w, -x, -y, -z]
+
     delta_b = quat_apply(quat_inv, delta_w)
     return delta_b
 
@@ -232,11 +232,11 @@ def obs_goal_delta_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> to
     xb, yb, zb = _get_workspace_bounds(env)
 
     # 为了保持机体坐标系下的旋转不变性 (各向同性)，取所有轴的最大范围作为统一缩放系数
-    max_range = max(float(xb[1]) - float(xb[0]), 
-                    float(yb[1]) - float(yb[0]), 
+    max_range = max(float(xb[1]) - float(xb[0]),
+                    float(yb[1]) - float(yb[0]),
                     float(zb[1]) - float(zb[0]))
     max_range = max(max_range, 1e-6)
-    
+
     out = delta_b / max_range
 
     return _clamp_m11(out)
@@ -254,7 +254,170 @@ def obs_state_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.T
 
 
 # =============================================================================
-# 激光雷达网格观测函数
+# 激光雷达网格：批量计算核心
+# =============================================================================
+
+def _compute_lidar_grid_batched(
+    env: ManagerBasedRLEnv,
+    lidar_name: str,
+    theta_min: float,
+    theta_max: float,
+    phi_min: float,
+    phi_max: float,
+    delta_theta: float,
+    delta_phi: float,
+    empty_value: float,
+    max_vis_points: int | None,
+    max_distance: float | None,
+) -> torch.Tensor:
+    """纯计算逻辑（无缓存），使用 batched scatter_reduce 替代逐环境循环。"""
+
+    T = max(int((theta_max - theta_min) / delta_theta), 1)
+    Pn = max(int((phi_max - phi_min) / delta_phi), 1)
+    num_bins = T * Pn
+    E = env.num_envs
+    out_shape = (E, num_bins)
+
+    if not hasattr(env, "scene"):
+        return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
+
+    try:
+        lidar = env.scene[lidar_name]
+    except Exception:
+        return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
+
+    min_r_cfg, max_r_cfg = _get_lidar_ranges(lidar, default_min=0.2, default_max=50.0)
+    max_d = float(max_distance) if max_distance is not None else float(max_r_cfg)
+    min_r = float(min_r_cfg)
+
+    env_ids = torch.arange(E, device=env.device)
+    pc, _ = _get_downsampled_pc_torch(env, lidar, env_ids, max_pts=max_vis_points)
+
+    if pc is None:
+        return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
+
+    # pc shape: (E, P, 3)
+    x, y, z = pc[..., 0], pc[..., 1], pc[..., 2]
+    valid = torch.isfinite(x) & torch.isfinite(y) & torch.isfinite(z)
+    r = torch.sqrt(x * x + y * y + z * z + 1e-12)
+
+    valid = valid & (r > (min_r + 1e-3)) & (r <= (max_d + 1e-3))
+
+    cos_theta = torch.clamp(z / r, -1.0, 1.0)
+    theta = torch.rad2deg(torch.acos(cos_theta))
+    phi = torch.remainder(torch.rad2deg(torch.atan2(y, x)), 360.0)
+
+    in_theta = (theta >= theta_min) & (theta < theta_max)
+    in_phi = (phi >= phi_min) & (phi < phi_max)
+    m = valid & in_theta & in_phi  # (E, P)
+
+    # ── 批量 scatter_reduce（替代逐环境 for 循环） ──
+    flat_min = torch.full(
+        (E * num_bins,), float("inf"), device=env.device, dtype=torch.float32
+    )
+
+    if m.any():
+        t_idx = torch.clamp(
+            torch.floor((theta - theta_min) / delta_theta).to(torch.long), 0, T - 1
+        )
+        p_idx = torch.clamp(
+            torch.floor((phi - phi_min) / delta_phi).to(torch.long), 0, Pn - 1
+        )
+        lin_idx = t_idx * Pn + p_idx  # (E, P)
+
+        # 将 (env_id, bin_id) 映射为一维 flat 索引
+        env_offset = torch.arange(E, device=env.device, dtype=torch.long).unsqueeze(1)  # (E, 1)
+        flat_idx_all = env_offset * num_bins + lin_idx  # (E, P)  — 仅 m=True 处有效
+
+        flat_idx_valid = flat_idx_all[m]               # (num_valid,)
+        r_valid = r[m].to(torch.float32)               # (num_valid,)
+
+        flat_min.scatter_reduce_(
+            0, flat_idx_valid, r_valid, reduce="amin", include_self=True
+        )
+
+    min_dist = flat_min.view(E, num_bins)
+
+    # ── closeness 映射 ──
+    max_d_t = torch.tensor(max_d, device=env.device, dtype=torch.float32)
+    min_dist = torch.where(torch.isfinite(min_dist), min_dist, max_d_t)
+    min_dist = torch.clamp(min_dist, 0.0, max_d_t)
+
+    alpha = 3.0
+    norm_dist = min_dist / max_d_t
+    exp_alpha = math.exp(-alpha)
+    closeness = (torch.exp(-alpha * norm_dist) - exp_alpha) / (1.0 - exp_alpha)
+
+    return _clamp_01(closeness.to(torch.float32))
+
+
+# =============================================================================
+# 激光雷达网格：步内缓存公共接口
+# =============================================================================
+
+def get_lidar_grid_cached(
+    env: ManagerBasedRLEnv,
+    lidar_name: str = "lidar",
+    theta_min: float = 30.0,
+    theta_max: float = 90.0,
+    phi_min: float = 0.0,
+    phi_max: float = 360.0,
+    delta_theta: float = 1.0,
+    delta_phi: float = 5.0,
+    empty_value: float = 0.0,
+    max_vis_points: int | None = None,
+    max_distance: float | None = None,
+) -> torch.Tensor:
+    """每个仿真步内只计算一次 LiDAR 网格，后续调用直接返回缓存。
+
+    缓存键 = (common_step_counter, 全部网格参数)，
+    因此同一步内参数完全相同的调用（obs / reward_threat / reward_safe_vel）
+    仅触发一次实际计算。
+    """
+
+    current_step = getattr(env, "common_step_counter", -1)
+
+    # 预解析 max_distance，使其成为确定值以参与缓存键比较
+    resolved_max_d = max_distance
+    if resolved_max_d is None:
+        try:
+            lidar = env.scene[lidar_name]
+            _, max_r_cfg = _get_lidar_ranges(lidar)
+            resolved_max_d = float(max_r_cfg)
+        except Exception:
+            resolved_max_d = 50.0
+
+    cache_params = (
+        lidar_name, theta_min, theta_max, phi_min, phi_max,
+        delta_theta, delta_phi, max_vis_points, resolved_max_d,
+    )
+
+    cache = getattr(env, "_lidar_grid_cache", None)
+    if (
+        cache is not None
+        and cache.get("step") == current_step
+        and cache.get("params") == cache_params
+    ):
+        return cache["data"]
+
+    # 首次计算或缓存失效 → 重新计算
+    result = _compute_lidar_grid_batched(
+        env, lidar_name,
+        theta_min, theta_max, phi_min, phi_max,
+        delta_theta, delta_phi, empty_value,
+        max_vis_points, resolved_max_d,
+    )
+
+    env._lidar_grid_cache = {
+        "step": current_step,
+        "params": cache_params,
+        "data": result,
+    }
+    return result
+
+
+# =============================================================================
+# 激光雷达网格观测函数（保持原有函数签名，内部走缓存）
 # =============================================================================
 
 def obs_lidar_min_range_grid(
@@ -270,66 +433,13 @@ def obs_lidar_min_range_grid(
     max_vis_points: int | None = None,
     max_distance: float | None = None,
 ) -> torch.Tensor:
-    # 计算激光雷达基于网格过滤的距离逼近度，限制在 [0, 1] 区间
-    T = max(int((theta_max - theta_min) / delta_theta), 1)
-    Pn = max(int((phi_max - phi_min) / delta_phi), 1)
-    out_shape = (env.num_envs, T * Pn)
+    """计算激光雷达基于网格过滤的距离逼近度，限制在 [0, 1] 区间。
 
-    if not hasattr(env, "scene"):
-        return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
-
-    try:
-        lidar = env.scene[lidar_name]
-    except Exception:
-        return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
-
-    min_r_cfg, max_r_cfg = _get_lidar_ranges(lidar, default_min=0.2, default_max=50.0)
-    max_d = float(max_distance) if max_distance is not None else float(max_r_cfg)
-    min_r = float(min_r_cfg)
-
-    env_ids = torch.arange(env.num_envs, device=env.device)
-    pc, _ = _get_downsampled_pc_torch(env, lidar, env_ids, max_pts=max_vis_points)
-    
-    if pc is None:
-        return torch.zeros(out_shape, device=env.device, dtype=torch.float32)
-
-    x, y, z = pc[..., 0], pc[..., 1], pc[..., 2]
-    valid = torch.isfinite(x) & torch.isfinite(y) & torch.isfinite(z)
-    r = torch.sqrt(x * x + y * y + z * z + 1e-12)
-
-    valid = valid & (r > (min_r + 1e-3)) & (r <= (max_d + 1e-3))
-
-    cos_theta = torch.clamp(z / r, -1.0, 1.0)
-    theta = torch.rad2deg(torch.acos(cos_theta))
-    phi = torch.remainder(torch.rad2deg(torch.atan2(y, x)), 360.0)
-
-    in_theta = (theta >= theta_min) & (theta < theta_max)
-    in_phi = (phi >= phi_min) & (phi < phi_max)
-    m = valid & in_theta & in_phi
-
-    num_bins = T * Pn
-    min_dist = torch.full((env.num_envs, num_bins), float("inf"), device=env.device, dtype=torch.float32)
-
-    if m.any():
-        t_idx = torch.clamp(torch.floor((theta - theta_min) / delta_theta).to(torch.long), 0, T - 1)
-        p_idx = torch.clamp(torch.floor((phi - phi_min) / delta_phi).to(torch.long), 0, Pn - 1)
-        lin_idx = t_idx * Pn + p_idx
-
-        for e in range(env.num_envs):
-            me = m[e]
-            if me.any():
-                idx_e = lin_idx[e, me]
-                r_e = r[e, me].to(torch.float32)
-                min_dist[e].scatter_reduce_(0, idx_e, r_e, reduce="amin", include_self=True)
-
-    max_d_t = torch.tensor(max_d, device=env.device, dtype=torch.float32)
-    min_dist = torch.where(torch.isfinite(min_dist), min_dist, max_d_t)
-    min_dist = torch.clamp(min_dist, 0.0, max_d_t)
-
-    # 采用指数型 Closeness 映射，距离越近上升越快
-    alpha = 3.0
-    norm_dist = min_dist / max_d_t
-    exp_alpha = math.exp(-alpha)
-    closeness = (torch.exp(-alpha * norm_dist) - exp_alpha) / (1.0 - exp_alpha)
-    
-    return _clamp_01(closeness.to(torch.float32))
+    内部通过 get_lidar_grid_cached 实现步内缓存 + 批量 scatter_reduce。
+    """
+    return get_lidar_grid_cached(
+        env, lidar_name,
+        theta_min, theta_max, phi_min, phi_max,
+        delta_theta, delta_phi, empty_value,
+        max_vis_points, max_distance,
+    )
