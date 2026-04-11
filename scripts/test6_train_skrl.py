@@ -76,6 +76,8 @@ parser.add_argument("--dist_max_samples", type=int, default=2048)
 parser.add_argument("--checkpoint_interval", type=int, default=50000)
 parser.add_argument("--cuda_clean_interval", type=int, default=2000)
 parser.add_argument("--extra_tb_subdir", type=str, default="extra_tb")
+parser.add_argument("--tb_suffix", type=str, default="",
+                    help="Custom suffix appended to TensorBoard run name (e.g. 'transformer_K4')")
 
 parser.add_argument("--keep_infos", action="store_true", default=False)
 parser.add_argument("--grad_hist_interval", type=int, default=50)
@@ -923,7 +925,8 @@ def main() -> None:
     log_root = project_dir / "logs"
     log_root.mkdir(parents=True, exist_ok=True)
 
-    run_name = datetime.now().strftime("%y-%m-%d_%H-%M-%S-%f") + "_PPO"
+    suffix = f"_{args.tb_suffix}" if args.tb_suffix else ""
+    run_name = datetime.now().strftime("%y-%m-%d_%H-%M-%S-%f") + "_PPO" + suffix
     exp_dir = log_root / run_name
     tb_dir = exp_dir / args.extra_tb_subdir
     tb_dir.mkdir(parents=True, exist_ok=True)
