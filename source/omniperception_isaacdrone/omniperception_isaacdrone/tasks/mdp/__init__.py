@@ -18,6 +18,7 @@ from .test6_observations import (
 )
 from .test6_rewards import (
     penalty_apf_repulsive,
+    penalty_attitude_tilt,
     penalty_collision,
     penalty_energy,
     penalty_lidar_threat,
@@ -71,6 +72,7 @@ __all__ = [
     "reward_dijkstra_progress",
     "reward_apf_attractive",
     "penalty_apf_repulsive",
+    "penalty_attitude_tilt",
     "penalty_lidar_threat",
     "penalty_energy",
     "reward_goal_reached",
