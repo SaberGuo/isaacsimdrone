@@ -61,6 +61,18 @@ parser.add_argument(
 parser.add_argument("--print_every", type=int, default=50)
 parser.add_argument("--show_obs_stats", action="store_true", default=False)
 
+# Transformer architecture parameters (must match training script)
+parser.add_argument("--history_len", type=int, default=4,
+                    help="Number of history frames K for causal transformer encoder")
+parser.add_argument("--d_model", type=int, default=256,
+                    help="Transformer model dimension")
+parser.add_argument("--num_attn_heads", type=int, default=8,
+                    help="Number of attention heads in transformer")
+parser.add_argument("--dim_feedforward", type=int, default=512,
+                    help="Feedforward dimension in transformer layers")
+parser.add_argument("--num_transformer_layers", type=int, default=2,
+                    help="Number of transformer encoder layers")
+
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -239,7 +251,7 @@ def get_state_lidar_dims(base_env: Any, obs_dim: int) -> tuple[int, int]:
     return state_dim, obs_dim - state_dim
 
 
-def build_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int, int, gym.spaces.Dict, Box]:
+def build_spaces(base_env: Any, state_dim: int, lidar_dim: int, K: int = 1) -> tuple[int, int, gym.spaces.Dict, Box]:
     act_space = getattr(base_env, "single_action_space", None)
     if not isinstance(act_space, gym.spaces.Box):
         act_space = getattr(base_env, "action_space", None)
@@ -248,12 +260,15 @@ def build_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int, in
         raise RuntimeError("Action space is not a gym.spaces.Box")
 
     act_dim = infer_single_dim_from_box(act_space)
-    obs_dim = state_dim + lidar_dim
+    single_dim = state_dim + lidar_dim
+    obs_dim = K * single_dim
 
     obs_low = -np.ones((obs_dim,), dtype=np.float32)
     obs_high = np.ones((obs_dim,), dtype=np.float32)
     if lidar_dim > 0:
-        obs_low[state_dim:] = 0.0
+        for k in range(K):
+            base = k * single_dim
+            obs_low[base + state_dim:base + single_dim] = 0.0
 
     obs_box = Box(low=obs_low, high=obs_high, dtype=np.float32)
     act_box = Box(
@@ -266,7 +281,9 @@ def build_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int, in
 
 
 class PlaySpaceAdapter(gym.Wrapper):
-    """Expose stable single-env semantic spaces and sanitized observations."""
+    """Expose stable single-env semantic spaces and sanitized observations.
+    Supports K-frame history for transformer-based policies.
+    """
 
     def __init__(
         self,
@@ -275,11 +292,14 @@ class PlaySpaceAdapter(gym.Wrapper):
         act_space: Box,
         state_dim: int,
         lidar_dim: int,
+        K: int = 1,
     ):
         super().__init__(env)
         self.state_dim = int(state_dim)
         self.lidar_dim = int(lidar_dim)
-        self.obs_dim = self.state_dim + self.lidar_dim
+        self.K = int(K)
+        self.single_dim = state_dim + lidar_dim
+        self.obs_dim = self.K * self.single_dim
 
         self.observation_space = obs_space
         self.single_observation_space = obs_space
@@ -289,19 +309,79 @@ class PlaySpaceAdapter(gym.Wrapper):
         self.num_envs = int(getattr(env, "num_envs", 1))
         self.device = getattr(env, "device", None)
 
-    def _convert_obs(self, raw_obs: Any) -> dict[str, torch.Tensor]:
+        # History buffer: (num_envs, K, single_dim); None until first reset()
+        self._history: torch.Tensor | None = None
+
+    def _sanitize_single_frame(self, raw: torch.Tensor) -> torch.Tensor:
+        """Sanitize a single-frame obs tensor of shape (N, single_dim)."""
+        raw = torch.nan_to_num(raw.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        state = torch.clamp(raw[:, :self.state_dim], -1.0, 1.0)
+        if self.lidar_dim > 0:
+            lidar = torch.clamp(raw[:, self.state_dim:self.single_dim], 0.0, 1.0)
+            return torch.cat([state, lidar], dim=-1)
+        return state
+
+    def _init_history(self, first_obs: torch.Tensor) -> None:
+        """Fill all K history slots with the first observation (no zero-padding artifacts)."""
+        self._history = (
+            first_obs
+            .unsqueeze(1)                   # (N, 1, single_dim)
+            .expand(-1, self.K, -1)         # (N, K, single_dim)
+            .clone()
+        )
+
+    def _update_history(self, next_obs: torch.Tensor, done_mask: torch.Tensor) -> None:
+        """Shift history and append new frame; reset done envs BEFORE shifting.
+
+        In IsaacLab, when terminated[i]=True the returned obs[i] is already the
+        initial obs of the NEW episode. We therefore fill done envs' entire history
+        with that new initial obs before shifting all envs.
+        """
+        # Step 1: reset history for finished episodes
+        if done_mask.any():
+            reset_obs = next_obs[done_mask]   # (D, single_dim)
+            self._history[done_mask] = (
+                reset_obs
+                .unsqueeze(1)               # (D, 1, single_dim)
+                .expand(-1, self.K, -1)     # (D, K, single_dim)
+                .clone()
+            )
+        # Step 2: shift left by 1 and append new frame for all envs
+        self._history = torch.cat(
+            [self._history[:, 1:, :],       # (N, K-1, single_dim)
+             next_obs.unsqueeze(1)],        # (N,   1, single_dim)
+            dim=1                           # → (N, K, single_dim)
+        )
+
+    def _build_stacked_obs(self) -> dict[str, torch.Tensor]:
+        """Flatten (N, K, single_dim) → (N, K*single_dim)."""
+        return {"policy": self._history.reshape(self.num_envs, self.obs_dim)}
+
+    def _get_raw_single_frame(self, raw_obs: Any) -> torch.Tensor:
         x = extract_policy_obs(raw_obs)
-        x = ensure_obs_shape(x, self.num_envs, self.obs_dim)
-        x = sanitize_states(x, state_dim=self.state_dim, lidar_dim=self.lidar_dim)
-        return {"policy": x}
+        x = ensure_obs_shape(x, self.num_envs, self.single_dim)
+        return self._sanitize_single_frame(x)
 
     def reset(self, **kwargs):
         raw_obs, infos = self.env.reset(**kwargs)
-        return self._convert_obs(raw_obs), infos
+        sanitized = self._get_raw_single_frame(raw_obs)
+        if self.K > 1:
+            self._init_history(sanitized)
+            return self._build_stacked_obs(), infos
+        else:
+            return {"policy": sanitized}, infos
 
     def step(self, actions):
         raw_obs, rewards, terminated, truncated, infos = self.env.step(actions)
-        return self._convert_obs(raw_obs), rewards, terminated, truncated, infos
+        sanitized = self._get_raw_single_frame(raw_obs)
+        if self.K > 1:
+            if self._history is None:
+                raise RuntimeError("PlaySpaceAdapter.step() called before reset()")
+            done_mask = (terminated | truncated).reshape(-1).bool()
+            self._update_history(sanitized, done_mask)
+            return self._build_stacked_obs(), rewards, terminated, truncated, infos
+        else:
+            return {"policy": sanitized}, rewards, terminated, truncated, infos
 
 
 def init_hidden(m: nn.Module) -> None:
@@ -361,15 +441,163 @@ class StructuredFeatureExtractor(nn.Module):
         return self.fuse_net(torch.cat([state, lidar], dim=-1))
 
 
+class ModalTransformerEncoder(nn.Module):
+    """Causal multi-modal transformer encoder for K-frame UAV observations.
+
+    Paper: HuaJiarui UAVTT – adapted from SAC to PPO feature extractor.
+
+    Token layout per frame k (3 tokens, interleaved):
+        position 3k+0 : lidar  token  (432D → d_model)
+        position 3k+1 : body   token  (14D  → d_model)
+        position 3k+2 : goal   token  (3D   → d_model)
+
+    Causal mask: token q (frame q//3) may attend to token k only if k//3 ≤ q//3.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        lidar_dim: int,
+        K: int = 4,
+        d_model: int = 256,
+        num_heads: int = 8,
+        dim_feedforward: int = 512,
+        num_layers: int = 2,
+        d_feat: int = 256,
+    ):
+        super().__init__()
+        self.state_dim  = int(state_dim)   # 17
+        self.lidar_dim  = int(lidar_dim)   # 432
+        self.K          = int(K)           # 4
+        self.d_model    = int(d_model)
+        self.T          = 3 * K            # 12 tokens total
+        self.single_dim = state_dim + lidar_dim
+
+        body_dim = state_dim - 3  # 14  (all state dims except last 3 = goal_delta)
+        goal_dim = 3
+
+        # Modality projections (shared across all frames)
+        self.lidar_proj = nn.Linear(lidar_dim, d_model)
+        self.body_proj  = nn.Linear(body_dim, d_model)
+        self.goal_proj  = nn.Linear(goal_dim, d_model)
+
+        # Learned positional embeddings
+        self.frame_pe = nn.Embedding(K, d_model)   # which temporal frame
+        self.token_pe = nn.Embedding(3, d_model)   # which modality (lidar/body/goal)
+
+        # Pre-computed index tensors (registered as buffers → auto .to(device))
+        token_pos = torch.arange(self.T)
+        self.register_buffer("frame_ids",      token_pos // 3)  # [0,0,0,1,1,1,...,3,3,3]
+        self.register_buffer("token_type_ids", token_pos % 3)   # [0,1,2,0,1,2,...,0,1,2]
+
+        # Causal attention mask: (T, T) float, −∞ where key_frame > query_frame
+        frame_idx   = token_pos // 3                               # (T,)
+        blocked     = frame_idx.unsqueeze(0) > frame_idx.unsqueeze(1)  # (T,T) bool
+        causal_mask = torch.zeros(self.T, self.T)
+        causal_mask[blocked] = float("-inf")
+        self.register_buffer("causal_mask", causal_mask)
+
+        # Transformer encoder (Post-Norm = norm_first=False, no dropout for RL)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=0.0,
+            activation="relu",
+            batch_first=True,
+            norm_first=False,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False,  # avoids warning with additive float mask
+        )
+
+        # Output head: global avg-pool → Linear → LayerNorm → LeakyReLU
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_feat),
+            nn.LayerNorm(d_feat),
+            nn.LeakyReLU(),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for proj in (self.lidar_proj, self.body_proj, self.goal_proj):
+            nn.init.orthogonal_(proj.weight, gain=np.sqrt(2.0))
+            nn.init.constant_(proj.bias, 0.0)
+        nn.init.normal_(self.frame_pe.weight, std=0.02)
+        nn.init.normal_(self.token_pe.weight, std=0.02)
+        nn.init.orthogonal_(self.head[0].weight, gain=np.sqrt(2.0))
+        nn.init.constant_(self.head[0].bias, 0.0)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            obs: (B, K * single_dim)  e.g. (B, 1796)
+        Returns:
+            (B, d_feat)  e.g. (B, 256)
+        """
+        B  = obs.shape[0]
+        K  = self.K
+        sd = self.state_dim   # 17
+        ld = self.lidar_dim   # 432
+        dm = self.d_model
+
+        # ── 1. Reshape and split ────────────────────────────────────────────
+        frames    = obs.view(B, K, self.single_dim)      # (B, 4, 449)
+        lidar_all = frames[:, :, sd:]                    # (B, 4, 432)
+        body_all  = frames[:, :, :sd - 3]               # (B, 4, 14)
+        goal_all  = frames[:, :, sd - 3:sd]             # (B, 4, 3)
+
+        # ── 2. Project modalities (batch K frames together) ─────────────────
+        lidar_tok = self.lidar_proj(lidar_all.reshape(B * K, ld)).view(B, K, dm)
+        body_tok  = self.body_proj(body_all.reshape(B * K, sd - 3)).view(B, K, dm)
+        goal_tok  = self.goal_proj(goal_all.reshape(B * K, 3)).view(B, K, dm)
+
+        # ── 3. Interleave: [lidar_0, body_0, goal_0, lidar_1, ...] ─────────
+        tokens = torch.stack([lidar_tok, body_tok, goal_tok], dim=2)  # (B, K, 3, dm)
+        tokens = tokens.reshape(B, self.T, dm)                         # (B, 12, 256)
+
+        # ── 4. Add positional embeddings ────────────────────────────────────
+        tokens = (
+            tokens
+            + self.frame_pe(self.frame_ids).unsqueeze(0)       # (1, 12, 256)
+            + self.token_pe(self.token_type_ids).unsqueeze(0)  # (1, 12, 256)
+        )
+
+        # ── 5. Causal transformer encoder ───────────────────────────────────
+        encoded = self.transformer(tokens, mask=self.causal_mask)  # (B, 12, 256)
+
+        # ── 6. Global average pooling + output head ─────────────────────────
+        return self.head(encoded.mean(dim=1))                      # (B, d_feat)
+
+
 class Policy(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, state_dim: int, lidar_dim: int, feat_dim: int = 256):
+    def __init__(self, obs_dim: int, act_dim: int, state_dim: int, lidar_dim: int,
+                 feat_dim: int = 256, K: int = 1,
+                 d_model: int = 256, num_heads: int = 8,
+                 dim_feedforward: int = 512, num_layers: int = 2):
         super().__init__()
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
         self.state_dim = int(state_dim)
         self.lidar_dim = int(lidar_dim)
+        self.K = int(K)
+        self.single_dim = state_dim + lidar_dim
+        self.expected_obs = K * self.single_dim
 
-        self.fe = StructuredFeatureExtractor(state_dim, lidar_dim, feat_dim)
+        # Use transformer for K > 1, legacy for K == 1
+        if K > 1:
+            self.fe = ModalTransformerEncoder(
+                state_dim=state_dim, lidar_dim=lidar_dim, K=K,
+                d_model=d_model, num_heads=num_heads,
+                dim_feedforward=dim_feedforward, num_layers=num_layers,
+                d_feat=feat_dim,
+            )
+        else:
+            self.fe = StructuredFeatureExtractor(state_dim, lidar_dim, feat_dim)
+
         self.mean = nn.Linear(feat_dim, self.act_dim)
         self.log_std_parameter = nn.Parameter(torch.full((self.act_dim,), -1.0))
         init_policy_head(self.mean)
@@ -562,7 +790,8 @@ def main() -> None:
 
     obs_dim_raw = int(np.prod(policy_space.shape))
     state_dim, lidar_dim = get_state_lidar_dims(base_env, obs_dim_raw)
-    obs_dim, act_dim, obs_space, act_space = build_spaces(base_env, state_dim, lidar_dim)
+    K = int(args.history_len)
+    obs_dim, act_dim, obs_space, act_space = build_spaces(base_env, state_dim, lidar_dim, K=K)
 
     print_space_bounds("play_obs_space", obs_space)
     print_space_bounds("play_act_space", act_space)
@@ -573,13 +802,14 @@ def main() -> None:
         act_space=act_space,
         state_dim=state_dim,
         lidar_dim=lidar_dim,
+        K=K,
     )
 
     num_envs = int(getattr(env, "num_envs", args.num_envs))
     device = torch.device(getattr(env, "device", args.device))
 
     print(
-        f"[INFO] play spaces -> obs={obs_dim} (state={state_dim}, lidar={lidar_dim}), act={act_dim}",
+        f"[INFO] play spaces -> obs={obs_dim} (K={K} x state={state_dim} + lidar={lidar_dim}), act={act_dim}",
         flush=True,
     )
     print(f"[INFO] num_envs={num_envs}, device={device}", flush=True)
@@ -590,6 +820,11 @@ def main() -> None:
         state_dim=state_dim,
         lidar_dim=lidar_dim,
         feat_dim=args.feat_dim,
+        K=K,
+        d_model=args.d_model,
+        num_heads=args.num_attn_heads,
+        dim_feedforward=args.dim_feedforward,
+        num_layers=args.num_transformer_layers,
     ).to(device)
     policy.eval()
 
@@ -608,11 +843,8 @@ def main() -> None:
     load_policy_checkpoint(policy, checkpoint_path, device=device)
 
     obs, infos = env.reset()
-    states = sanitize_states(
-        ensure_obs_shape(extract_policy_obs(obs), num_envs, obs_dim),
-        state_dim=state_dim,
-        lidar_dim=lidar_dim,
-    )
+    # obs["policy"] already has shape (num_envs, K*single_dim) from PlaySpaceAdapter
+    states = extract_policy_obs(obs)
 
     maybe_print_goal(base_env)
 
@@ -642,11 +874,8 @@ def main() -> None:
 
             next_obs, rewards, terminated, truncated, infos = env.step(actions)
 
-            next_states = sanitize_states(
-                ensure_obs_shape(extract_policy_obs(next_obs), num_envs, obs_dim),
-                state_dim=state_dim,
-                lidar_dim=lidar_dim,
-            )
+            # next_obs["policy"] already has shape (num_envs, K*single_dim) from PlaySpaceAdapter
+            next_states = extract_policy_obs(next_obs)
             rewards = ensure_vec_shape(
                 torch.nan_to_num(rewards.float(), nan=0.0, posinf=0.0, neginf=0.0),
                 num_envs,
@@ -711,11 +940,8 @@ def main() -> None:
                 if args.reset_on_done:
                     # 避免对整个环境重复 reset，只刷新状态
                     reset_obs, reset_infos = env.reset(env_ids=done_ids)
-                    reset_states = sanitize_states(
-                        ensure_obs_shape(extract_policy_obs(reset_obs), num_envs, obs_dim),
-                        state_dim=state_dim,
-                        lidar_dim=lidar_dim,
-                    )
+                    # reset_obs["policy"] already has shape (num_envs, K*single_dim)
+                    reset_states = extract_policy_obs(reset_obs)
 
                     next_states[done_ids] = reset_states[done_ids]
 

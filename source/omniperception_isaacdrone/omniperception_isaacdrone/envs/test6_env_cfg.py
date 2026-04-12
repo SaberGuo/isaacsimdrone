@@ -225,6 +225,15 @@ class Test6RewardsCfg:
     # ---- 稳定性奖励 ----
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=8.0, params={})
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.05, params={})
+    attitude_tilt = RewTerm(
+        func=my_mdp.penalty_attitude_tilt,
+        weight=-5.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "max_tilt_deg": 20.0,
+            "std_deg": 20.0,
+        },
+    )
 
     # ---- 安全惩罚 ----
     lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-200.0, params={})

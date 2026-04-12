@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 
 import isaaclab.envs.mdp as mdp
@@ -810,4 +811,47 @@ def penalty_apf_repulsive(
     _tb_store_reward(env, "apf_repulsive", penalty)
     _tb_store_aux(env, "apf_min_obs_dist", dist.min(dim=1).values)
     return penalty
+
+
+# -----------------------------------------------------------------------------
+# Attitude tilt penalty (penalize large roll/pitch angles)
+# -----------------------------------------------------------------------------
+def penalty_attitude_tilt(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    max_tilt_deg: float = 20.0,
+    std_deg: float = 20.0,
+) -> torch.Tensor:
+    """Penalize tilt angle (combined roll/pitch) exceeding max_tilt_deg.
+
+    Uses an exponential-shaped penalty that starts at 0 and grows rapidly:
+        excess = max(tilt_rad - max_tilt_rad, 0)
+        penalty = expm1( (excess / std_rad)^2 )   [= exp(...) - 1, so zero at threshold]
+
+    cos_tilt = 1 - 2*(qx^2 + qy^2) gives the world-Z component of the body-Z axis,
+    which is equivalent to the cosine of the combined roll/pitch tilt angle.
+
+    Args:
+        max_tilt_deg: Free zone upper limit in degrees. No penalty below this.
+        std_deg: Penalty growth rate beyond the threshold (degrees).
+
+    Returns:
+        (N,) penalty tensor (positive values; apply with negative weight in cfg).
+    """
+    quat = mdp.root_quat_w(env, asset_cfg=asset_cfg)  # (N, 4) [w, x, y, z]
+    qx = quat[:, 1]
+    qy = quat[:, 2]
+    cos_tilt = torch.clamp(1.0 - 2.0 * (qx * qx + qy * qy), -1.0, 1.0)
+    tilt_rad = torch.acos(cos_tilt)  # (N,) in [0, pi]
+
+    max_tilt_rad = math.radians(float(max_tilt_deg))
+    std_rad = max(math.radians(float(std_deg)), 1e-6)
+
+    excess = torch.clamp(tilt_rad - max_tilt_rad, min=0.0)
+    pen = torch.expm1((excess / std_rad) ** 2)
+
+    pen = pen.to(torch.float32)
+    _tb_store_reward(env, "attitude_tilt", pen)
+    _tb_store_aux(env, "tilt_angle_deg", torch.rad2deg(tilt_rad))
+    return pen
 
