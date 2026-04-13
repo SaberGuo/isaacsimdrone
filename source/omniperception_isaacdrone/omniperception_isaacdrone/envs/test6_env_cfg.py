@@ -55,11 +55,11 @@ class ObstacleCurriculumSettingsCfg:
 
     # Promotion criterion: recent reached_goal ratio
     success_term_name: str = "reached_goal"
-    success_threshold: float = 0.8
+    success_threshold: float = 0.85
 
     # Rolling window over recent terminated episodes
-    window_size: int = 100
-    min_samples: int = 100
+    window_size: int = 256
+    min_samples: int = 512
 
     # Avoid jumping multiple levels using stale statistics from an easier stage
     clear_history_on_promotion: bool = True
@@ -239,8 +239,8 @@ class Test6CurriculumCfg:
         params={
             "levels": (0, 10, 15, 20, 30, 50),
             "success_term_name": "reached_goal",
-            "success_threshold": 0.8,
-            "window_size": 100,
+            "success_threshold": 0.85,
+            "window_size": 256,
         }
     )
 
