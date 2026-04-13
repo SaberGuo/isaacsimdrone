@@ -18,33 +18,22 @@ os.environ.setdefault(
     "max_split_size_mb:128,garbage_collection_threshold:0.8",
 )
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
 parser = argparse.ArgumentParser("Stable skrl PPO trainer for IsaacLab drone lidar task")
 parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lidar-v0")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 parser.add_argument("--num_envs", type=int, default=32)
-parser.add_argument(
-    "--num_obstacles",
-    type=int,
-    default=100,
-    help="Maximum number of per-env obstacles to spawn.",
-)
+parser.add_argument("--num_obstacles", type=int, default=100)
 parser.add_argument("--timesteps", type=int, default=2_000_000)
 parser.add_argument("--seed", type=int, default=42)
-
 parser.add_argument("--state_dim", type=int, default=17)
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
-
 parser.add_argument("--rollouts", type=int, default=256)
 parser.add_argument("--learning_epochs", type=int, default=8)
 parser.add_argument("--mini_batches", type=int, default=8)
 parser.add_argument("--learning_rate", type=float, default=1e-4)
 parser.add_argument("--_lambda", type=float, default=0.97)
 parser.add_argument("--discount_factor", type=float, default=0.99)
-
 parser.add_argument("--ratio_clip", type=float, default=0.2)
 parser.add_argument("--value_clip", type=float, default=0.2)
 parser.add_argument("--value_loss_scale", type=float, default=0.5)
@@ -54,10 +43,8 @@ parser.add_argument("--kl_threshold", type=float, default=0.01)
 parser.add_argument("--clip_predicted_values", action="store_true")
 parser.add_argument("--no_clip_predicted_values", dest="clip_predicted_values", action="store_false")
 parser.set_defaults(clip_predicted_values=True)
-
 parser.add_argument("--reward_scale", type=float, default=1.0)
 parser.add_argument("--reward_clip", type=float, default=500.0)
-
 parser.add_argument("--tb_interval", type=int, default=500)
 parser.add_argument("--dist_interval", type=int, default=500)
 parser.add_argument("--dist_window", type=int, default=10)
@@ -65,7 +52,6 @@ parser.add_argument("--dist_max_samples", type=int, default=2048)
 parser.add_argument("--checkpoint_interval", type=int, default=50000)
 parser.add_argument("--cuda_clean_interval", type=int, default=2000)
 parser.add_argument("--extra_tb_subdir", type=str, default="extra_tb")
-
 parser.add_argument("--keep_infos", action="store_true", default=False)
 parser.add_argument("--grad_hist_interval", type=int, default=50)
 parser.add_argument("--grad_hist_samples", type=int, default=65536)
@@ -74,9 +60,6 @@ parser.add_argument("--debug_act", action="store_true", default=False)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
-# -----------------------------------------------------------------------------
-# Launch Isaac Sim, then import runtime deps
-# -----------------------------------------------------------------------------
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
@@ -113,9 +96,9 @@ import isaacsim.core.utils.bounds as bounds_utils
 
 
 def scale_robot_visual_only(num_envs: int, visual_scale=(20.0, 20.0, 10.0)) -> None:
+    """仅缩放机器人视觉网格，不影响碰撞体。"""
     stage = prim_utils.get_prim_at_path("/World").GetStage()
     sx, sy, sz = map(float, visual_scale)
-
     for i in range(int(num_envs)):
         visual_path = f"/World/envs/env_{i}/Robot/body/body_visual"
         prim = stage.GetPrimAtPath(visual_path)
@@ -155,14 +138,14 @@ def _read_collision_geom_world_size(prim) -> dict:
     return info
 
 def print_robot_collision_shapes(env_index: int = 0, robot_rel_path: str = "Robot") -> None:
-    pass 
+    pass
 
 def debug_print(msg: str) -> None:
     if DEBUG_PRINT:
         print(msg, flush=True)
 
 def print_env0_transition(step, states, actions, rewards, terminated, truncated, next_states, state_dim, lidar_dim):
-    pass 
+    pass
 
 def format_array_preview(x: np.ndarray, max_items: int = 16) -> str:
     x = np.asarray(x).reshape(-1)
@@ -174,17 +157,20 @@ def print_space_bounds(name: str, space: gym.Space) -> None:
     print(f"\n[SPACE] {name}: type={type(space).__name__}", flush=True)
 
 def init_hidden(m: nn.Module) -> None:
+    """正交初始化线性层权重。"""
     if isinstance(m, nn.Linear):
         nn.init.orthogonal_(m.weight, gain=np.sqrt(2.0))
         if m.bias is not None:
             nn.init.constant_(m.bias, 0.0)
 
 def init_policy_head(m: nn.Linear) -> None:
+    """小增益初始化策略输出层。"""
     nn.init.orthogonal_(m.weight, gain=0.01)
     if m.bias is not None:
         nn.init.constant_(m.bias, 0.0)
 
 def init_value_head(m: nn.Linear) -> None:
+    """单位增益初始化价值输出层。"""
     nn.init.orthogonal_(m.weight, gain=1.0)
     if m.bias is not None:
         nn.init.constant_(m.bias, 0.0)
@@ -274,7 +260,9 @@ def build_skrl_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[in
     if lidar_dim > 0: obs_low[state_dim:] = 0.0
     return obs_dim, act_dim, gym.spaces.Dict({"policy": Box(low=obs_low, high=obs_high, dtype=np.float32)}), Box(low=-np.ones((act_dim,), dtype=np.float32), high=np.ones((act_dim,), dtype=np.float32), dtype=np.float32)
 
+
 class SkrlSpaceAdapter(gym.Wrapper):
+    """将原始环境观测/动作空间适配为 skrl 所需格式。"""
     def __init__(self, env: gym.Env, obs_space: gym.spaces.Dict, act_space: Box, state_dim: int, lidar_dim: int):
         super().__init__(env)
         self.state_dim, self.lidar_dim, self.obs_dim = int(state_dim), int(lidar_dim), int(state_dim) + int(lidar_dim)
@@ -293,6 +281,7 @@ class SkrlSpaceAdapter(gym.Wrapper):
     def step(self, actions):
         raw_obs, rewards, terminated, truncated, infos = self.env.step(actions)
         return self._convert_obs(raw_obs), rewards, terminated, truncated, infos
+
 
 def models_are_finite(models: dict[str, nn.Module]) -> bool:
     for model in models.values():
@@ -357,7 +346,6 @@ def build_reward_term_views(base_env: Any, reward_weights: Dict[str, float], rew
     raw_cache, weighted_terms = extract_tb_reward_terms(base_env), extract_reward_manager_weighted_terms(base_env)
     term_names = set(reward_weights.keys()) | set(raw_cache.keys()) | set(weighted_terms.keys())
     if len(term_names) == 0: return {}, {}, {}
-
     raw_terms, weighted_out = {}, {}
     for name in sorted(term_names):
         w = float(reward_weights.get(name, 1.0))
@@ -368,19 +356,19 @@ def build_reward_term_views(base_env: Any, reward_weights: Dict[str, float], rew
         if name in raw_cache: raw_terms[name] = torch.nan_to_num(raw_cache[name].detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
         elif abs(w) > 1e-12: raw_terms[name] = weighted / w
         else: raw_terms[name] = torch.zeros_like(weighted)
-
     if len(weighted_out) == 0: return raw_terms, weighted_out, {}
     dt, total_preclip = float(get_env_step_dt(base_env)), None
     for value in weighted_out.values(): total_preclip = (value * dt * reward_scale) if total_preclip is None else (total_preclip + value * dt * reward_scale)
     if total_preclip is None: return raw_terms, weighted_out, {}
-
     total_clipped = torch.clamp(total_preclip, -float(reward_clip), float(reward_clip)) if reward_clip > 0.0 else total_preclip
     clip_factor = torch.ones_like(total_preclip)
     nz = total_preclip.abs() > 1e-8
     clip_factor[nz] = total_clipped[nz] / total_preclip[nz]
     return raw_terms, weighted_out, {name: value * dt * reward_scale * clip_factor for name, value in weighted_out.items()}
 
+
 class TensorDictStats:
+    """按步累积张量字典统计量（均值/最小/最大）。"""
     def __init__(self): self.reset()
     def reset(self): self.window_steps, self.sum, self.min, self.max = 0, {}, {}, {}
     def update(self, values: Dict[str, torch.Tensor]):
@@ -401,13 +389,17 @@ class TensorDictStats:
             writer.add_scalar(f"{prefix}/{tag}/min", self.min[name], step)
             writer.add_scalar(f"{prefix}/{tag}/max", self.max[name], step)
 
+
 class RewardBreakdownAccumulator:
+    """分项累积原始/加权/缩放奖励统计。"""
     def __init__(self): self.raw, self.weighted, self.scaled = TensorDictStats(), TensorDictStats(), TensorDictStats()
     def reset(self): self.raw.reset(); self.weighted.reset(); self.scaled.reset()
     def update(self, raw_terms, weighted_terms, scaled_terms): self.raw.update(raw_terms); self.weighted.update(weighted_terms); self.scaled.update(scaled_terms)
     def flush(self, writer, step): self.raw.flush(writer, "RewardRaw", step); self.weighted.flush(writer, "RewardWeighted", step); self.scaled.flush(writer, "RewardScaled", step)
 
+
 class InfoTerminationRatioAccumulator:
+    """累积各终止原因的比率统计。"""
     def __init__(self): self.reset()
     def reset(self): self.update_steps, self.sum_ratios, self.last_ratios = 0, {}, {}
     def update(self, infos, done_count):
@@ -423,7 +415,9 @@ class InfoTerminationRatioAccumulator:
             writer.add_scalar(f"TerminationInfoRatio/{sanitize_tb_tag(name)}/mean", self.sum_ratios[name] / float(self.update_steps), step)
             writer.add_scalar(f"TerminationInfoRatio/{sanitize_tb_tag(name)}/latest", self.last_ratios.get(name, 0.0), step)
 
+
 class RollingHistogramLogger:
+    """滑动窗口内观测与动作的直方图记录器。"""
     def __init__(self, obs_names, action_names, window, max_samples=0):
         self.obs_names, self.action_names, self.window, self.max_samples = list(obs_names), list(action_names), max(int(window), 1), int(max_samples)
         self.obs_buffers = [deque(maxlen=self.window) for _ in self.obs_names]
@@ -440,7 +434,9 @@ class RollingHistogramLogger:
         for name, buffer in zip(self.action_names, self.action_buffers):
             if len(buffer) > 0: writer.add_histogram(f"ActionDist/{sanitize_tb_tag(name)}", torch.cat(list(buffer), dim=0), step)
 
+
 class SkrlLossMirror:
+    """拦截 skrl agent.track_data 以记录策略/价值损失。"""
     def __init__(self): self.reset()
     def reset(self): self.policy_losses, self.value_losses = [], []
     def bind(self, agent: PPO):
@@ -453,7 +449,9 @@ class SkrlLossMirror:
         if len(self.value_losses) > 0: writer.add_scalar("Loss/value", float(np.mean(self.value_losses)), step)
         self.reset()
 
+
 def log_gradients(writer, models, step, max_samples):
+    """记录各模型参数梯度的范数、有限比率与直方图。"""
     for model_key, model in models.items():
         for name, p in model.named_parameters():
             if p.grad is None or (g := p.grad.detach()).numel() == 0: continue
@@ -465,7 +463,9 @@ def log_gradients(writer, models, step, max_samples):
                 try: writer.add_histogram(f"Gradients/{model_key}/hist/{sanitize_tb_tag(name)}", g_f, step)
                 except Exception: pass
 
+
 class StructuredFeatureExtractor(nn.Module):
+    """分别提取状态和激光雷达特征后融合。"""
     def __init__(self, state_dim, lidar_dim, feat_dim=256):
         super().__init__()
         self.state_dim, self.lidar_dim = int(state_dim), int(lidar_dim)
@@ -482,12 +482,15 @@ class StructuredFeatureExtractor(nn.Module):
         if self.lidar_dim <= 0: return self.fuse_net(state)
         return self.fuse_net(torch.cat([state, self.lidar_net(self.lidar_ln(torch.clamp(obs[:, self.state_dim:self.state_dim + self.lidar_dim], 0.0, 1.0) * 2.0 - 1.0))], dim=-1))
 
+
 def gaussian_mixin_kwargs():
     kwargs = {"clip_actions": True}
     if "clip_mean_actions" in inspect.signature(GaussianMixin.__init__).parameters: kwargs["clip_mean_actions"] = True
     return kwargs
 
+
 class Policy(GaussianMixin, Model):
+    """PPO 策略网络。"""
     def __init__(self, observation_space, action_space, device, state_dim, lidar_dim, feat_dim=256):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(self, **gaussian_mixin_kwargs())
@@ -499,7 +502,9 @@ class Policy(GaussianMixin, Model):
         mean = torch.tanh(self.mean(self.fe(inputs["states"])))
         return mean, torch.clamp(self.log_std_parameter, min=-5.0, max=0.0).expand_as(mean), {}
 
+
 class Value(DeterministicMixin, Model):
+    """PPO 价值网络。"""
     def __init__(self, observation_space, action_space, device, state_dim, lidar_dim, feat_dim=256):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self)
@@ -508,6 +513,7 @@ class Value(DeterministicMixin, Model):
         init_value_head(self.value)
     def compute(self, inputs, role):
         return self.value(self.fe(inputs["states"])), {}
+
 
 def build_state_names(state_dim: int) -> List[str]:
     return list(STATE_OBS_NAMES_17) if int(state_dim) == len(STATE_OBS_NAMES_17) else [f"state_{i}" for i in range(int(state_dim))]
@@ -518,7 +524,6 @@ def build_action_names(act_dim: int) -> List[str]:
 
 def main() -> None:
     print(f"[INFO] task={args.task}, num_envs={args.num_envs}, device={args.device}", flush=True)
-
     env_cfg = parse_env_cfg(
         args.task,
         device=args.device,
@@ -527,17 +532,14 @@ def main() -> None:
     )
     env_cfg.scene.replicate_physics = True
     env_cfg.scene.filter_collisions = True
-
     try:
         setattr(env_cfg, "seed", int(args.seed))
     except Exception:
         pass
-
     np.random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(args.seed))
-
     print("[INFO] Spawning workspace walls...", flush=True)
     WallSpawner(
         x_bounds=(-80.0, 80.0),
@@ -546,47 +548,35 @@ def main() -> None:
         wall_thickness=0.5,
         color=(0.7, 0.7, 0.2),
         wall_colors={
-            "Wall_XMin": (0.5, 1.0, 1.0),  
-            "Wall_XMax": (1.0, 1.0, 0.5),  
-            "Wall_YMin": (0.0, 1.0, 1.0),  
-            "Wall_YMax": (1.0, 1.0, 0.0),  
-            "Wall_ZMin": (1.0, 1.0, 1.0),  
-            "Wall_ZMax": (0.0, 0.0, 0.0),  
+            "Wall_XMin": (0.5, 1.0, 1.0),
+            "Wall_XMax": (1.0, 1.0, 0.5),
+            "Wall_YMin": (0.0, 1.0, 1.0),
+            "Wall_YMax": (1.0, 1.0, 0.0),
+            "Wall_ZMin": (1.0, 1.0, 1.0),
+            "Wall_ZMax": (0.0, 0.0, 0.0),
         },
     ).spawn_walls()
-
-    # 在 gym.make 之前，先将障碍物模板写入全局路径
     print("[INFO] Setting up global obstacles template...", flush=True)
     setup_global_obstacles(int(args.num_obstacles))
-
     print("[INFO] Creating env...", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
-    scale_robot_visual_only(
-        num_envs=base_env.num_envs,
-        visual_scale=(20.0, 20.0, 10.0),
-    )
-
+    scale_robot_visual_only(num_envs=base_env.num_envs, visual_scale=(20.0, 20.0, 10.0))
     space = getattr(base_env, "single_observation_space", None)
     policy_space = space.spaces.get("policy", None) if isinstance(space, gym.spaces.Dict) else getattr(base_env, "observation_space", None)
     if policy_space is None:
         raise RuntimeError("policy observation space not found")
-
     obs_dim_raw = int(np.prod(policy_space.shape))
     state_dim, lidar_dim = get_state_lidar_dims(base_env, obs_dim_raw)
     obs_dim, act_dim, obs_space, act_space = build_skrl_spaces(base_env, state_dim, lidar_dim)
-
     adapted_env = SkrlSpaceAdapter(base_env, obs_space=obs_space, act_space=act_space, state_dim=state_dim, lidar_dim=lidar_dim)
     env = wrap_env(adapted_env, wrapper="isaaclab")
-
     num_envs = int(getattr(env, "num_envs", args.num_envs))
     device = torch.device(getattr(env, "device", args.device))
     step_dt = get_env_step_dt(base_env)
-
     models = {
         "policy": Policy(obs_space, act_space, device, state_dim, lidar_dim, args.feat_dim),
         "value": Value(obs_space, act_space, device, state_dim, lidar_dim, args.feat_dim),
     }
-
     cfg = copy.deepcopy(PPO_DEFAULT_CONFIG)
     cfg["rollouts"] = int(args.rollouts)
     cfg["learning_epochs"] = int(args.learning_epochs)
@@ -601,27 +591,22 @@ def main() -> None:
     cfg["grad_norm_clip"] = float(args.grad_norm_clip)
     cfg["clip_predicted_values"] = bool(args.clip_predicted_values)
     cfg["kl_threshold"] = float(args.kl_threshold)
-
     script_dir = Path(__file__).resolve().parent
     project_dir = script_dir.parent
     log_root = project_dir / "logs"
     log_root.mkdir(parents=True, exist_ok=True)
-
     run_name = datetime.now().strftime("%y-%m-%d_%H-%M-%S-%f") + "_PPO"
     exp_dir = log_root / run_name
     tb_dir = exp_dir / args.extra_tb_subdir
     tb_dir.mkdir(parents=True, exist_ok=True)
-
     cfg["experiment"]["directory"] = str(log_root)
     cfg["experiment"]["experiment_name"] = run_name
     cfg["experiment"]["write_interval"] = int(args.tb_interval)
     cfg["experiment"]["checkpoint_interval"] = int(args.checkpoint_interval)
-
     writer = SummaryWriter(log_dir=str(tb_dir))
     writer.add_text("run/args", str(vars(args)), 0)
     writer.add_text("run/dims", f"obs={obs_dim}, state={state_dim}, lidar={lidar_dim}, act={act_dim}", 0)
     writer.add_text("run/step_dt", f"{step_dt:.8f}", 0)
-
     memory = RandomMemory(memory_size=int(args.rollouts), num_envs=num_envs, device=device)
     agent = PPO(
         models=models,
@@ -632,14 +617,11 @@ def main() -> None:
         device=device,
     )
     agent.init()
-
     loss_mirror = SkrlLossMirror()
     loss_mirror.bind(agent)
-
     raw_obs, infos = env.reset()
     states = sanitize_states(ensure_obs_shape(extract_policy_obs(raw_obs), num_envs, obs_dim), state_dim=state_dim, lidar_dim=lidar_dim)
     last_good_snapshot = snapshot_models(models)
-
     reward_weights = extract_reward_weights(base_env)
     reward_window = RewardBreakdownAccumulator()
     termination_ratio_window = InfoTerminationRatioAccumulator()
@@ -649,68 +631,51 @@ def main() -> None:
         window=int(args.dist_window),
         max_samples=int(args.dist_max_samples),
     )
-
     latest_curriculum_log: Dict[str, float] = {}
     pbar = tqdm(range(int(args.timesteps)), ncols=110)
-
     try:
         for t in pbar:
             global_step = t + 1
             agent.pre_interaction(timestep=t, timesteps=int(args.timesteps))
-
             with torch.no_grad():
                 act_output = agent.act(states, timestep=t, timesteps=int(args.timesteps))
-
             actions = ensure_action_shape(extract_actions(act_output, act_dim), num_envs, act_dim).float()
             if not torch.isfinite(actions).all(): raise RuntimeError(f"Non-finite actions detected at t={t}")
             actions = sanitize_actions(actions)
-
             rollout_boundary = (global_step % int(args.rollouts) == 0)
             if rollout_boundary: last_good_snapshot = snapshot_models(models)
-
             next_obs, rewards, terminated, truncated, infos = env.step(actions)
-
             next_states = sanitize_states(ensure_obs_shape(extract_policy_obs(next_obs), num_envs, obs_dim), state_dim=state_dim, lidar_dim=lidar_dim)
             rewards = ensure_vec_shape(torch.nan_to_num(rewards.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "rewards")
             terminated = ensure_vec_shape(torch.nan_to_num(terminated.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "terminated").bool()
             truncated = ensure_vec_shape(torch.nan_to_num(truncated.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "truncated").bool()
             train_rewards = scale_rewards(rewards, scale=args.reward_scale, clip=args.reward_clip)
-
             raw_terms, weighted_terms, scaled_terms = build_reward_term_views(base_env, reward_weights=reward_weights, reward_scale=float(args.reward_scale), reward_clip=float(args.reward_clip))
             reward_window.update(raw_terms=raw_terms, weighted_terms=weighted_terms, scaled_terms=scaled_terms)
             clear_tb_caches(base_env)
-
             done_count = int((terminated | truncated).sum().item())
             termination_ratio_window.update(infos, done_count=done_count)
-
             if done_count > 0:
                 if len(curriculum_log_dict := extract_prefixed_log_scalars(infos, "Curriculum/")) > 0:
                     latest_curriculum_log.update(curriculum_log_dict)
-
             with torch.no_grad():
                 agent.record_transition(states=states, actions=actions, rewards=train_rewards, next_states=next_states, terminated=terminated, truncated=truncated, infos=infos if args.keep_infos else {}, timestep=t, timesteps=int(args.timesteps))
-
             agent.post_interaction(timestep=t, timesteps=int(args.timesteps))
             if rollout_boundary: loss_mirror.flush(writer, global_step)
-
             if rollout_boundary and not models_are_finite(models):
                 debug_dir = exp_dir / "debug"
                 debug_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(last_good_snapshot, debug_dir / f"last_good_before_nan_t{t}.pt")
                 raise RuntimeError(f"Non-finite model parameters detected at t={t}")
-
             if not args.headless:
                 try: env.render()
                 except Exception: pass
-
             should_log_dist = int(args.dist_interval) > 0 and ((global_step % int(args.dist_interval) == 0) or (global_step == int(args.timesteps)))
             should_log_scalars = int(args.tb_interval) > 0 and ((global_step % int(args.tb_interval) == 0) or (global_step == int(args.timesteps)))
-
             if should_log_dist:
                 hist_logger.update(states=states, actions=actions, state_dim=state_dim)
                 hist_logger.flush(writer, global_step)
                 if not should_log_scalars: writer.flush()
-
             if should_log_scalars:
                 for key, value in sorted(latest_curriculum_log.items()): writer.add_scalar(sanitize_tb_tag(key), value, global_step)
                 reward_window.flush(writer, global_step)
@@ -718,23 +683,18 @@ def main() -> None:
                 writer.flush()
                 reward_window.reset()
                 termination_ratio_window.reset()
-
             if int(args.grad_hist_interval) > 0 and rollout_boundary and (global_step // int(args.rollouts)) % int(args.grad_hist_interval) == 0:
                 log_gradients(writer, models, global_step, int(args.grad_hist_samples))
                 writer.flush()
-
             if int(args.checkpoint_interval) > 0 and (global_step % int(args.checkpoint_interval) == 0):
                 ckpt_dir = exp_dir / "manual_checkpoints"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 torch.save({name: model.state_dict() for name, model in models.items()}, ckpt_dir / f"models_t{global_step}.pt")
-
             if int(args.cuda_clean_interval) > 0 and (global_step % int(args.cuda_clean_interval) == 0):
                 gc.collect()
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
-
             pbar.set_description(f"t={t} envR={rewards.mean().item():+.3f} trainR={train_rewards.mean().item():+.3f} done={done_count}")
             states = next_states
-
     except KeyboardInterrupt:
         print("\n[WARN] KeyboardInterrupt: stopping training early", flush=True)
     finally:
@@ -743,6 +703,7 @@ def main() -> None:
         except: pass
         try: env.close()
         except: pass
+
 
 if __name__ == "__main__":
     try: main()

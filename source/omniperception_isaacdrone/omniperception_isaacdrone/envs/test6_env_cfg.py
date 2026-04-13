@@ -1,4 +1,3 @@
-# omniperception_isaacdrone/envs/test6_env_cfg.py
 from __future__ import annotations
 
 import isaaclab.envs.mdp as mdp
@@ -20,7 +19,6 @@ from isaaclab.sensors import ContactSensorCfg, LidarSensorCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.assets import RigidObjectCfg
-
 from omniperception_isaacdrone.assets.robots.drone_cfg import DRONE_CFG, DRONE_MASS
 
 try:
@@ -31,45 +29,33 @@ except Exception:
 from omniperception_isaacdrone.tasks import mdp as my_mdp
 
 
-# -----------------------------------------------------------------------------
-# Normalization hyper-params
-# -----------------------------------------------------------------------------
 @configclass
 class NormalizationCfg:
+    """观测归一化超参数。"""
     x_bounds: tuple[float, float] = (-80.0, 80.0)
     y_bounds: tuple[float, float] = (-80.0, 80.0)
     z_bounds: tuple[float, float] = (0.0, 10.0)
-
     lin_vel_max: float = 6.0
     ang_vel_max: float = 31.4
-
     quat_hemisphere: bool = True
     state_dim: int = 17
 
 
 @configclass
 class ObstacleCurriculumSettingsCfg:
+    """障碍物课程学习配置。"""
     enabled: bool = True
     levels: tuple[int, ...] = (0, 10, 15, 20, 30, 50)
     initial_level: int = 0
-
-    # Promotion criterion: recent reached_goal ratio
     success_term_name: str = "reached_goal"
     success_threshold: float = 0.85
-
-    # Rolling window over recent terminated episodes
-    window_size: int = 256
-    min_samples: int = 512
-
-    # Avoid jumping multiple levels using stale statistics from an easier stage
+    k_roll: int = 2
     clear_history_on_promotion: bool = True
 
 
-# -----------------------------------------------------------------------------
-# SceneCfg
-# -----------------------------------------------------------------------------
 @configclass
 class Test6SceneCfg(InteractiveSceneCfg):
+    """场景配置。"""
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="plane",
@@ -83,11 +69,9 @@ class Test6SceneCfg(InteractiveSceneCfg):
         ),
         debug_vis=True,
     )
-
     robot: ArticulationCfg = DRONE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-
     robot.spawn = DRONE_CFG.spawn.replace(
-        scale=(1,1,1),
+        scale=(1, 1, 1),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,
@@ -100,20 +84,17 @@ class Test6SceneCfg(InteractiveSceneCfg):
         ),
         activate_contact_sensors=True,
     )
-
     robot.init_state = ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 5.0),
         rot=(1.0, 0.0, 0.0, 0.0),
         joint_pos={".*": 0.0},
     )
-
     contact_sensor: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/body",
         update_period=0.0,
         history_length=1,
         debug_vis=False,
     )
-
     dome_light = AssetBaseCfg(
         prim_path="/World/DomeLight",
         spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75)),
@@ -126,22 +107,20 @@ class Test6SceneCfg(InteractiveSceneCfg):
     obstacles: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/Obstacles/obj_.*",
         spawn=None,
-        init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(1000.0, 1000.0, -1000.0)
-        )
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(1000.0, 1000.0, -1000.0)),
     )
+
 
 @configclass
 class Test6SceneWithLidarCfg(Test6SceneCfg):
+    """带激光雷达的场景配置。"""
     if LIDAR_CFG is not None:
         lidar: LidarSensorCfg = LIDAR_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot/body")
 
 
-# -----------------------------------------------------------------------------
-# Actions / Obs / Events / Rewards / Terminations / Curriculum
-# -----------------------------------------------------------------------------
 @configclass
 class Test6ActionsCfg:
+    """动作配置。"""
     root_twist = ActionTermCfg(
         class_type=my_mdp.RootTwistVelocityActionTerm,
         asset_name="robot",
@@ -150,15 +129,16 @@ class Test6ActionsCfg:
 
 @configclass
 class Test6ObservationsCfg:
+    """观测配置。"""
     @configclass
     class PolicyCfg(ObsGroup):
+        """策略观测组。"""
         root_pos_z = ObsTerm(func=my_mdp.obs_root_pos_z_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_quat = ObsTerm(func=my_mdp.obs_root_quat_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_lin_vel = ObsTerm(func=my_mdp.obs_root_lin_vel_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_ang_vel = ObsTerm(func=my_mdp.obs_root_ang_vel_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         projected_gravity = ObsTerm(func=my_mdp.obs_projected_gravity_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         goal_delta = ObsTerm(func=my_mdp.obs_goal_delta_norm, params={"asset_cfg": SceneEntityCfg("robot")})
-
         lidar_grid = ObsTerm(
             func=my_mdp.obs_lidar_min_range_grid,
             params=dict(
@@ -173,22 +153,24 @@ class Test6ObservationsCfg:
                 max_vis_points=12000,
             ),
         )
-
         def __post_init__(self):
             self.enable_corruption = False
             self.concatenate_terms = True
-
     policy: PolicyCfg = PolicyCfg()
 
 
 @configclass
 class Test6EventCfg:
-    reset_robot_base = EventTerm(func=my_mdp.reset_root_state_on_square_edge, mode="reset", params={
-        "asset_cfg": SceneEntityCfg("robot"),
-        "square_half_size": 35.0,
-        "z_range": (3.0, 7.0),
-    })
-
+    """事件配置。"""
+    reset_robot_base = EventTerm(
+        func=my_mdp.reset_root_state_on_square_edge,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "square_half_size": 35.0,
+            "z_range": (3.0, 7.0),
+        },
+    )
     randomize_obstacles = EventTerm(
         func=my_mdp.randomize_obstacles_on_reset,
         mode="reset",
@@ -197,27 +179,22 @@ class Test6EventCfg:
             "x_range": (-33.0, 33.0),
             "y_range": (-33.0, 33.0),
             "z_height": 10.0,
-        }
+        },
     )
+
 
 @configclass
 class Test6RewardsCfg:
-    # ---- 密集导航奖励（主信号，per-step 量级 O(0.1~1)） ----
+    """奖励配置。"""
     progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=4.0, params={})
     dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=1.0, params={})
     vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=1.0, params={})
-
-    # ---- 稳定性奖励 ----
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=1.0, params={})
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.005, params={})
-
-    # ---- 安全惩罚 ----
     lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-10.0, params={})
     safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-5.0, params={})
     energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.002, params={})
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.0005)
-
-    # ---- 终端信号（与密集累计量级可比） ----
     success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=10.0, params={})
     collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-10.0, params={})
     oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-10.0, params={})
@@ -226,6 +203,7 @@ class Test6RewardsCfg:
 
 @configclass
 class Test6TerminationsCfg:
+    """终止条件配置。"""
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     reached_goal = DoneTerm(func=my_mdp.termination_reached_goal, params={})
     oob = DoneTerm(func=my_mdp.termination_out_of_workspace, params={})
@@ -234,23 +212,23 @@ class Test6TerminationsCfg:
 
 @configclass
 class Test6CurriculumCfg:
+    """课程学习配置。"""
     obstacle_count = CurrTerm(
         func=my_mdp.update_obstacle_curriculum,
         params={
             "levels": (0, 10, 15, 20, 30, 50),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
-            "window_size": 256,
-        }
+            "k_roll": 2,
+        },
     )
-
 
 
 @configclass
 class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
+    """无人机环境主配置。"""
     normalization: NormalizationCfg = NormalizationCfg()
     obstacle_curriculum: ObstacleCurriculumSettingsCfg = ObstacleCurriculumSettingsCfg()
-
     scene: Test6SceneCfg = Test6SceneCfg(num_envs=1, env_spacing=0.0)
     observations: Test6ObservationsCfg = Test6ObservationsCfg()
     actions: Test6ActionsCfg = Test6ActionsCfg()
@@ -261,24 +239,19 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-
         self.decimation = 1
         self.sim.dt = 1.0 / 60.0
         self.sim.render_interval = self.decimation
         self.episode_length_s = 60.0
-
         self.viewer.eye = (60.0, 60.0, 40.0)
         self.viewer.lookat = (0.0, 0.0, 5.0)
-
         WORKSPACE_X = (-80.0, 80.0)
         WORKSPACE_Y = (-80.0, 80.0)
         WORKSPACE_Z = (0.0, 10.0)
         GOAL_RADIUS = 2.5
-
         self.normalization.x_bounds = WORKSPACE_X
         self.normalization.y_bounds = WORKSPACE_Y
         self.normalization.z_bounds = WORKSPACE_Z
-
         self.actions.root_twist.params = {
             "mass": DRONE_MASS,
             "use_sim_total_mass": True,
@@ -297,13 +270,11 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "torque_limit": (0.2, 0.2, 0.1),
             "inertia_diag": (0.02, 0.02, 0.04),
         }
-
         self.events.reset_robot_base.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "square_half_size": 35.0,
             "z_range": (3.0, 7.0),
         }
-
         self.terminations.reached_goal.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "threshold": GOAL_RADIUS,
@@ -318,7 +289,6 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "sensor_cfg": SceneEntityCfg("contact_sensor"),
             "threshold": 1.0,
         }
-
         self.rewards.progress_to_goal.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "speed_ref": 4.0,
@@ -344,15 +314,13 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "speed_ref": 3.0,
             "use_relu": True,
         }
-
-        # ── 梯度型 lidar_threat 参数 ──
         self.rewards.lidar_threat.params = {
             "lidar_name": "lidar",
-            "safe_dist": None,          # None → 使用 safe_dist_ratio × max_distance
-            "safe_dist_ratio": 0.16,    # 0.16 × 50m = 8m
-            "speed_ref": 6.0,           # 归一化参考速度 (m/s)
-            "clip": 1.0,                # 输出裁剪 [-1, 1]
-            "proximity_boost": True,    # 越近信号越强
+            "safe_dist": None,
+            "safe_dist_ratio": 0.16,
+            "speed_ref": 6.0,
+            "clip": 1.0,
+            "proximity_boost": True,
             "use_grid": True,
             "theta_min": 30.0,
             "theta_max": 90.0,
@@ -362,7 +330,6 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "delta_phi": 5.0,
             "max_vis_points": 12000,
         }
-
         self.rewards.safe_vel_penalty.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "lidar_name": "lidar",
@@ -376,7 +343,6 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "delta_phi": 5.0,
             "max_vis_points": 12000,
         }
-
         self.rewards.energy.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "lin_vel_scale": 100.0,
@@ -387,7 +353,6 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "acc_weight": 0.2,
             "max_penalty": 1.0,
         }
-
         self.rewards.success_bonus.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "threshold": GOAL_RADIUS,
@@ -402,10 +367,11 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "sensor_cfg": SceneEntityCfg("contact_sensor"),
             "threshold": 1.0,
         }
-
         self.scene.replicate_physics = True
         self.scene.filter_collisions = True
 
+
 @configclass
 class Test6DroneLidarEnvCfg(Test6DroneEnvCfg):
+    """带激光雷达的无人机环境配置。"""
     scene: Test6SceneWithLidarCfg = Test6SceneWithLidarCfg(num_envs=1, env_spacing=0.0)
