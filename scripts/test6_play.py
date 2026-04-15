@@ -22,7 +22,7 @@ parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lida
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 
 parser.add_argument("--num_envs", type=int, default=1)
-parser.add_argument("--num_obstacles", type=int, default=100)
+parser.add_argument("--num_obstacles", type=int, default=20)
 parser.add_argument("--seed", type=int, default=42)
 
 parser.add_argument("--state_dim", type=int, default=17)
@@ -61,6 +61,17 @@ parser.add_argument(
 
 parser.add_argument("--print_every", type=int, default=50)
 parser.add_argument("--show_obs_stats", action="store_true", default=False)
+
+# ← 新增：play 模式下直接指定障碍物数量，不走课程学习
+parser.add_argument(
+    "--play_obstacle_count",
+    type=int,
+    default=-1,
+    help=(
+        "Override obstacle count for play mode, bypassing curriculum. "
+        "Defaults to --num_obstacles if not set (i.e. -1)."
+    ),
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -540,14 +551,70 @@ def maybe_print_goal(base_env: Any, env_ids: list[int] | None = None) -> None:
         pass
 
 
+# ← 新增：play 模式直接固定障碍物数量，绕过课程学习晋级逻辑
+def freeze_obstacle_count_for_play(base_env: Any, obstacle_count: int) -> None:
+    """
+    在 play 模式下直接设置障碍物数量，并锁定课程学习使其不再晋级。
+
+    做法：
+    1. 强制写入 curr_obstacle_count，使 randomize_obstacles_on_reset
+       读取到正确数量。
+    2. 将 curr_level_idx 设为最大值，使晋级条件永远不满足。
+    3. 同步初始化 curr_history / curr_levels 等字段，避免首次调用
+       update_obstacle_curriculum 时报 AttributeError。
+    """
+    u = base_env.unwrapped if hasattr(base_env, "unwrapped") else base_env
+    count = max(0, int(obstacle_count))
+
+    # 直接覆盖/写入目标字段
+    u.curr_obstacle_count   = count
+    u.obstacle_level_changed = True  # 触发首次重排
+
+    # 如果课程学习状态尚未初始化，构造一个"单级别"的假状态
+    # 使后续任何 update_obstacle_curriculum 调用直接返回而不晋级
+    if not hasattr(u, "curr_history"):
+        device = torch.device(getattr(u, "device", "cpu"))
+        num_envs = int(getattr(u, "num_envs", 1))
+        # 单一等级列表，idx 永远停在 0，无法晋级
+        u.curr_levels      = [count]
+        u.curr_num_envs    = num_envs
+        u.curr_k_roll      = 1
+        u.curr_window_size = num_envs
+        u.curr_history     = torch.full(
+            (num_envs,), -1.0, dtype=torch.float32, device=device
+        )
+        u.curr_write_round = torch.zeros(num_envs, dtype=torch.long, device=device)
+        u.curr_level_idx   = 0          # 已是末尾，不会晋级
+        u.curr_device      = device
+    else:
+        # 课程学习状态已存在：把 level_idx 推到末尾使其无法晋级
+        u.curr_levels      = [count]   # 重写为单级别
+        u.curr_level_idx   = 0         # 已是末尾
+        # 清空历史，防止残留脏数据触发晋级
+        u.curr_history.fill_(-1.0)
+
+    print(
+        f"[PLAY] 障碍物数量已固定为 {count}，课程学习晋级已禁用。",
+        flush=True,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 
 def main() -> None:
+    # 确定实际障碍物数量：--play_obstacle_count 优先，否则回退到 --num_obstacles
+    play_obstacle_count = (
+        int(args.num_obstacles)
+        if args.play_obstacle_count < 0
+        else int(args.play_obstacle_count)
+    )
+
     print(
         f"[INFO] task={args.task}, num_envs={args.num_envs}, "
-        f"device={args.device}, headless={args.headless}",
+        f"device={args.device}, headless={args.headless}, "
+        f"play_obstacle_count={play_obstacle_count}",
         flush=True,
     )
 
@@ -590,11 +657,15 @@ def main() -> None:
     ).spawn_walls()
 
     print("[INFO] Setting up global obstacles template...", flush=True)
+    # ← 全局预生成的上限仍用 num_obstacles，保证模板池足够大
     setup_global_obstacles(int(args.num_obstacles))
 
     print("[INFO] Creating env...", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
     scale_robot_visual_only(num_envs=base_env.num_envs, visual_scale=(20.0, 20.0, 10.0))
+
+    # ← 新增：环境创建后立即固定障碍物数量，绕过课程学习
+    freeze_obstacle_count_for_play(base_env, play_obstacle_count)
 
     # ------------------------------------------------------------------
     # 推断观测 / 动作空间
