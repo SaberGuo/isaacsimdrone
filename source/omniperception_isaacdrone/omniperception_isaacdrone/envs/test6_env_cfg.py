@@ -19,7 +19,7 @@ from isaaclab.sensors import ContactSensorCfg, LidarSensorCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.assets import RigidObjectCfg
-from omniperception_isaacdrone.assets.robots.drone_cfg import DRONE_CFG, DRONE_MASS
+from omniperception_isaacdrone.assets.robots.drone_cfg import DRONE_CFG, DRONE_MASS, DRONE_PARAMS
 
 try:
     from omniperception_isaacdrone.assets.sensors.lidar_cfg import LIDAR_CFG
@@ -45,11 +45,12 @@ class NormalizationCfg:
 class ObstacleCurriculumSettingsCfg:
     """障碍物课程学习配置。"""
     enabled: bool = True
-    levels: tuple[int, ...] = (0, 10, 15, 20, 30, 50)
+    # ← 从 OLD 迁移
+    levels: tuple[int, ...] = (0, 10, 20, 30, 50, 100)
     initial_level: int = 0
     success_term_name: str = "reached_goal"
     success_threshold: float = 0.85
-    k_roll: int = 2
+    k_roll: int = 4
     clear_history_on_promotion: bool = True
 
 
@@ -89,8 +90,9 @@ class Test6SceneCfg(InteractiveSceneCfg):
         rot=(1.0, 0.0, 0.0, 0.0),
         joint_pos={".*": 0.0},
     )
+    # ← 保留 NEW：prim_path 改为 base_link
     contact_sensor: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/body",
+        prim_path="{ENV_REGEX_NS}/Robot/base_link",
         update_period=0.0,
         history_length=1,
         debug_vis=False,
@@ -115,7 +117,8 @@ class Test6SceneCfg(InteractiveSceneCfg):
 class Test6SceneWithLidarCfg(Test6SceneCfg):
     """带激光雷达的场景配置。"""
     if LIDAR_CFG is not None:
-        lidar: LidarSensorCfg = LIDAR_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot/body")
+        # ← 保留 NEW：prim_path 改为 base_link
+        lidar: LidarSensorCfg = LIDAR_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot/base_link")
 
 
 @configclass
@@ -191,7 +194,8 @@ class Test6RewardsCfg:
     vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=1.0, params={})
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=1.0, params={})
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.005, params={})
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-10.0, params={})
+    # ← 从 OLD 迁移：权重恢复为 -20.0
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-20.0, params={})
     safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-5.0, params={})
     energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.002, params={})
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.0005)
@@ -216,10 +220,11 @@ class Test6CurriculumCfg:
     obstacle_count = CurrTerm(
         func=my_mdp.update_obstacle_curriculum,
         params={
-            "levels": (0, 10, 15, 20, 30, 50),
+            # ← 从 OLD 迁移
+            "levels": (0, 10, 20, 30, 50, 100),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
-            "k_roll": 2,
+            "k_roll": 4,
         },
     )
 
@@ -242,6 +247,11 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 1
         self.sim.dt = 1.0 / 60.0
         self.sim.render_interval = self.decimation
+        # ← 保留 NEW：改善力/速度积分一致性
+        try:
+            self.sim.physx.enable_external_forces_every_iteration = True
+        except Exception:
+            pass
         self.episode_length_s = 60.0
         self.viewer.eye = (60.0, 60.0, 40.0)
         self.viewer.lookat = (0.0, 0.0, 5.0)
@@ -252,23 +262,19 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.normalization.x_bounds = WORKSPACE_X
         self.normalization.y_bounds = WORKSPACE_Y
         self.normalization.z_bounds = WORKSPACE_Z
+        # ← 保留 NEW：新控制器参数体系
         self.actions.root_twist.params = {
+            "uav_params": DRONE_PARAMS,
             "mass": DRONE_MASS,
-            "use_sim_total_mass": True,
-            "prevent_negative_thrust": True,
-            "vel_scale": 6.0,
-            "vel_clip": 8.0,
-            "yaw_rate_scale": 3.14,
-            "yaw_rate_clip": 6.28,
+            "vel_scale": 3.0,
+            "vel_clip": 4.0,
+            "yaw_clip": 0.5,
             "thrust_sign": 1.0,
             "g": 9.81,
-            "vel_gain": (3.0, 3.0, 4.0),
-            "pos_gain": (0.0, 0.0, 0.0),
-            "attitude_gain": (6.0, 6.0, 1.5),
-            "ang_rate_gain": (0.25, 0.25, 0.18),
-            "thrust_limit_factor": 3,
-            "torque_limit": (0.2, 0.2, 0.1),
-            "inertia_diag": (0.02, 0.02, 0.04),
+            "debug_print": True,
+            "debug_interval": 100,
+            "debug_env_id": 0,
+            "debug_cmd_sat_eps": 0.995,
         }
         self.events.reset_robot_base.params = {
             "asset_cfg": SceneEntityCfg("robot"),

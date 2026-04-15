@@ -7,43 +7,41 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 from isaaclab.utils import configclass
 
+try:
+    import yaml
+except Exception as exc:  # pragma: no cover
+    raise RuntimeError(
+        "PyYAML is required to load iris.yaml parameters for omniperception_isaacdrone."
+    ) from exc
+
 _THIS_DIR = Path(__file__).resolve().parent
-_USD_PATH = str(_THIS_DIR / "cf2x.usd")
+_IRIS_USD_PATH = str(_THIS_DIR / "iris.usd")
+_IRIS_PARAM_PATH = _THIS_DIR / "iris.yaml"
 
-# =============================================================================
-# IMPORTANT: Mass convention for articulations (multi-body)
-# -----------------------------------------------------------------------------
-# IsaacLab applies UsdFileCfg.mass_props using `modify_mass_properties` decorated
-# with `apply_nested`, which sets the mass on *every* child prim (link) that has
-# MassAPI under the spawned prim path.
-#
-# Your cf2x.usd has multiple bodies (e.g., body + 4 props). If you set mass=0.25
-# directly, each body becomes 0.25 kg -> total mass becomes ~1.25 kg.
-# Then your controller (assuming 0.25 kg total) will output ~5x too little thrust.
-#
-# We keep DRONE_MASS as the desired TOTAL mass, and apply DRONE_LINK_MASS per link.
-# =============================================================================
+with _IRIS_PARAM_PATH.open("r", encoding="utf-8") as f:
+    IRIS_PARAMS = yaml.safe_load(f)
 
-DRONE_MASS: float = 0.25  # kg (desired TOTAL mass of the whole drone)
-
-# NOTE: Based on your runtime print:
-# body names: ['body', 'm1_prop', 'm2_prop', 'm3_prop', 'm4_prop']  -> 5 bodies
-CF2X_NUM_BODIES: int = 5
-
-# Per-link mass written to USD (so total ≈ DRONE_MASS)
-DRONE_LINK_MASS: float = DRONE_MASS / CF2X_NUM_BODIES
+DRONE_NAME: str = str(IRIS_PARAMS.get("name", "iris"))
+DRONE_MASS: float = float(IRIS_PARAMS["mass"])
+DRONE_INERTIA_DIAG: tuple[float, float, float] = (
+    float(IRIS_PARAMS["inertia"]["xx"]),
+    float(IRIS_PARAMS["inertia"]["yy"]),
+    float(IRIS_PARAMS["inertia"]["zz"]),
+)
 
 
 @configclass
-class Cf2xDroneCfg(ArticulationCfg):
-    """Crazyflie 2.x like drone config"""
+class IrisDroneCfg(ArticulationCfg):
+    """Iris drone articulation config.
+
+    Note:
+        We do NOT overwrite mass_props here. The Iris USD already contains per-link
+        physical parameters; overriding mass_props at articulation level can duplicate
+        mass across links and break total mass.
+    """
 
     spawn = sim_utils.UsdFileCfg(
-        usd_path=_USD_PATH,
-
-        # Apply per-link mass (NOT total mass) to avoid multiplying by link count
-        mass_props=sim_utils.MassPropertiesCfg(mass=DRONE_LINK_MASS),
-
+        usd_path=_IRIS_USD_PATH,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,
@@ -70,15 +68,15 @@ class Cf2xDroneCfg(ArticulationCfg):
 
     actuators = {
         "rotors": ImplicitActuatorCfg(
-            joint_names_expr=[".*"],
-            effort_limit=1.0e5,
-            velocity_limit=1.0e5,
+            joint_names_expr=["rotor_.*"],
+            effort_limit_sim=1.0e5,
+            velocity_limit_sim=1.0e5,
             stiffness=0.0,
             damping=0.0,
         )
     }
 
 
-CF2X_CFG = Cf2xDroneCfg()
-CRAZYFLIE_CFG = CF2X_CFG
-DRONE_CFG = CF2X_CFG
+IRIS_CFG = IrisDroneCfg()
+DRONE_CFG = IRIS_CFG
+DRONE_PARAMS = IRIS_PARAMS

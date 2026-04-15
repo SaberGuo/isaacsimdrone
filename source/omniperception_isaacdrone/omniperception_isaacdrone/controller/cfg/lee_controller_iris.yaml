@@ -1,0 +1,6 @@
+# Lee position controller parameters for Iris
+# Defaults follow OmniPerception/OmniDrones style gains.
+position_gain: [6, 6, 6]
+velocity_gain: [4.7, 4.7, 4.7]
+attitude_gain: [2.5, 2.5, 0.12]
+angular_rate_gain: [0.35, 0.35, 0.12]

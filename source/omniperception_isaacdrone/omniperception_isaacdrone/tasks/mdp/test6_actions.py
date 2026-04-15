@@ -1,49 +1,39 @@
 from __future__ import annotations
 
 import math
+
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import ActionTermCfg as ActionTermCfg
 from isaaclab.managers.action_manager import ActionTerm
 
-from omniperception_isaacdrone.controller import LeeVelocityYawRateController
-
-
-def _wrap_to_pi(x: torch.Tensor) -> torch.Tensor:
-    return (x + math.pi) % (2 * math.pi) - math.pi
-
-
-def _quat_to_yaw(quat: torch.Tensor) -> torch.Tensor:
-    """quat: (N,4) [w,x,y,z] -> yaw (N,)"""
-    w, x, y, z = quat.unbind(-1)
-    r00 = w * w + x * x - y * y - z * z
-    r10 = 2.0 * (x * y + w * z)
-    return torch.atan2(r10, r00)
+from omniperception_isaacdrone.actuator import RotorGroup
+from omniperception_isaacdrone.assets.robots.drone_cfg import DRONE_PARAMS
+from omniperception_isaacdrone.controller import LeePositionController
 
 
 def _get_step_dt(env: ManagerBasedRLEnv) -> float:
-    """Return RL step dt (sim.dt * decimation), robustly."""
     if hasattr(env, "step_dt"):
         try:
             return float(env.step_dt)
         except Exception:
             pass
     try:
-        dt = float(env.cfg.sim.dt)
-        dec = float(getattr(env.cfg, "decimation", 1))
-        return dt * dec
+        return float(env.cfg.sim.dt) * float(getattr(env.cfg, "decimation", 1))
     except Exception:
         return 1.0 / 60.0
 
 
 class RootTwistVelocityActionTerm(ActionTerm):
-    """4D 动作: [vx, vy, vz, yaw_rate]
-    - vx,vy,vz: world frame desired velocity (m/s)
-    - yaw_rate: desired yaw rate in body frame (rad/s)
+    """OmniPerception-style controller + actuator chain.
 
-    修复点：
-    - 强制 raw action clip 到 [-1, 1]，保证 action_space 有意义且 PPO 稳定
+    4D action: [vx_cmd, vy_cmd, vz_cmd, yaw_cmd]
+      - velocity command is mapped to target velocity in world frame
+      - yaw command is mapped to target yaw angle in [-pi, pi]
+
+    Pipeline:
+      rl action -> LeePositionController (rotor cmds) -> RotorGroup -> body wrench
     """
 
     def __init__(self, cfg: ActionTermCfg, env: ManagerBasedRLEnv):
@@ -51,118 +41,59 @@ class RootTwistVelocityActionTerm(ActionTerm):
 
         self._asset = env.scene[cfg.asset_name]
         self._device = env.device
-        self._num_envs = env.num_envs
-
+        self._num_envs = int(env.num_envs)
         self._dt = _get_step_dt(env)
 
         self._raw_actions = torch.zeros((self._num_envs, 4), device=self._device, dtype=torch.float32)
         self._processed_actions = torch.zeros((self._num_envs, 4), device=self._device, dtype=torch.float32)
 
-        self._forces = torch.zeros((self._num_envs, 1, 3), device=self._device, dtype=torch.float32)
-        self._torques = torch.zeros((self._num_envs, 1, 3), device=self._device, dtype=torch.float32)
-
-        self._yaw_target = torch.zeros((self._num_envs,), device=self._device, dtype=torch.float32)
-
         params = getattr(cfg, "params", None) or {}
         p_get = params.get if isinstance(params, dict) else lambda k, d=None: getattr(params, k, d)
 
-        self._vel_scale = float(p_get("vel_scale", 4.0))
-        self._vel_clip = float(p_get("vel_clip", 5.0))
-        self._yaw_rate_scale = float(p_get("yaw_rate_scale", 2.0))
-        self._yaw_rate_clip = float(p_get("yaw_rate_clip", 3.0))
+        self._vel_scale = float(p_get("vel_scale", 1.0))
+        self._vel_clip = float(p_get("vel_clip", 6.0))
+        self._yaw_clip = float(p_get("yaw_clip", 1.0))
         self._thrust_sign = float(p_get("thrust_sign", 1.0))
-
         self._g = float(p_get("g", 9.81))
-        self._vel_gain = tuple(p_get("vel_gain", (3.0, 3.0, 4.0)))
-        self._pos_gain = tuple(p_get("pos_gain", (0.0, 0.0, 0.0)))
-        self._attitude_gain = tuple(p_get("attitude_gain", (6.0, 6.0, 1.5)))
-        self._ang_rate_gain = tuple(p_get("ang_rate_gain", (0.25, 0.25, 0.18)))
-        self._thrust_limit_factor = float(p_get("thrust_limit_factor", 3.0))
-        self._torque_limit = tuple(p_get("torque_limit", (200.0, 200.0, 200.0)))
+        self._debug_print = bool(p_get("debug_print", False))
+        self._debug_interval = max(int(p_get("debug_interval", 100)), 1)
+        self._debug_env_id = max(int(p_get("debug_env_id", 0)), 0)
+        self._debug_cmd_sat_eps = float(p_get("debug_cmd_sat_eps", 0.995))
+        self._debug_counter = 0
 
-        self._use_sim_total_mass = bool(p_get("use_sim_total_mass", True))
-        self._prevent_negative_thrust = bool(p_get("prevent_negative_thrust", True))
+        uav_params = p_get("uav_params", None)
+        if not isinstance(uav_params, dict):
+            uav_params = DRONE_PARAMS
+        self._uav_mass = float(uav_params.get("mass", 1.0))
 
-        desired_total_mass = float(p_get("mass", 0.29))
+        rotor_cfg = uav_params["rotor_configuration"]
+        self._num_rotors = int(rotor_cfg["num_rotors"])
 
-        inertia_diag = tuple(p_get("inertia_diag", (0.02, 0.02, 0.04)))
-        self._inertia_diag = (
-            torch.tensor(inertia_diag, device=self._device, dtype=torch.float32)
-            .view(1, 3)
-            .expand(self._num_envs, 3)
-            .contiguous()
-        )
+        arm_lengths = torch.as_tensor(rotor_cfg["arm_lengths"], device=self._device, dtype=torch.float32)
+        rotor_angles = torch.as_tensor(rotor_cfg["rotor_angles"], device=self._device, dtype=torch.float32)
+        self._mix_tau_x = torch.sin(rotor_angles) * arm_lengths
+        self._mix_tau_y = -torch.cos(rotor_angles) * arm_lengths
+
+        self._controller = LeePositionController(g=self._g, uav_params=uav_params).to(self._device)
+        self._controller.eval()
+
+        self._actuator = RotorGroup(rotor_cfg, dt=self._dt).to(self._device)
+        self._actuator.eval()
+
+        self._forces = torch.zeros((self._num_envs, 1, 3), device=self._device, dtype=torch.float32)
+        self._torques = torch.zeros((self._num_envs, 1, 3), device=self._device, dtype=torch.float32)
+        self._rotor_cmds = torch.zeros((self._num_envs, self._num_rotors), device=self._device, dtype=torch.float32)
 
         body_id = 0
         try:
-            ids, _ = self._asset.find_bodies(["base", "base_link", ".*base.*", "body", ".*body.*"], preserve_order=True)
+            ids, _ = self._asset.find_bodies(
+                ["base_link", ".*base.*", "body", ".*body.*"], preserve_order=True
+            )
             if len(ids) > 0:
                 body_id = int(ids[0])
         except Exception:
             pass
         self._body_ids = [body_id]
-
-        print("body names:", self._asset.body_names)
-        print("selected body_id:", self._body_ids[0], "name:", self._asset.body_names[self._body_ids[0]])
-
-        sim_total_mass = None
-        sim_body_masses = None
-        try:
-            sim_body_masses = getattr(self._asset.data, "default_mass", None)
-            if sim_body_masses is not None:
-                sim_total_mass = sim_body_masses.sum(dim=1, keepdim=True).to(torch.float32)
-                if sim_total_mass.device != self._device:
-                    sim_total_mass = sim_total_mass.to(self._device)
-        except Exception:
-            sim_total_mass = None
-
-        if sim_total_mass is None:
-            sim_total_mass = torch.full((self._num_envs, 1), desired_total_mass, device=self._device, dtype=torch.float32)
-
-        sim_total0 = float(sim_total_mass[0, 0].item())
-
-        try:
-            if sim_body_masses is not None:
-                masses0 = sim_body_masses[0].detach().cpu().numpy().tolist()
-                pairs = [f"{n}:{m:.4f}" for n, m in zip(self._asset.body_names, masses0)]
-                print(f"[root_twist] Sim body masses (kg): {', '.join(pairs)}", flush=True)
-        except Exception:
-            pass
-
-        print(f"[root_twist] Desired TOTAL mass (cfg.params.mass): {desired_total_mass:.4f} kg", flush=True)
-        print(f"[root_twist] Sim TOTAL mass (sum bodies):         {sim_total0:.4f} kg", flush=True)
-        print(f"[root_twist] Hover thrust needed (sim):          {sim_total0 * self._g:.3f} N", flush=True)
-        print(f"[root_twist] RL step_dt used for yaw integration: {self._dt:.6f} s", flush=True)
-
-        rel_err = abs(sim_total0 - desired_total_mass) / max(abs(desired_total_mass), 1e-6)
-        if rel_err > 0.05:
-            print(
-                f"[WARN][root_twist] Mass mismatch detected! cfg.mass={desired_total_mass:.4f} kg "
-                f"but sim total mass={sim_total0:.4f} kg. "
-                "This is commonly caused by UsdFileCfg.mass_props being applied to EVERY link of an articulation.",
-                flush=True,
-            )
-
-        if self._use_sim_total_mass:
-            self._mass = sim_total_mass
-        else:
-            self._mass = torch.full((self._num_envs, 1), desired_total_mass, device=self._device, dtype=torch.float32)
-
-        self._controller = LeeVelocityYawRateController(
-            g=self._g,
-            vel_gain=self._vel_gain,
-            pos_gain=self._pos_gain,
-            attitude_gain=self._attitude_gain,
-            ang_rate_gain=self._ang_rate_gain,
-            mass=self._mass.squeeze(-1),
-            inertia_diag=self._inertia_diag,
-            thrust_limit_factor=self._thrust_limit_factor,
-            torque_limit=self._torque_limit,
-            device=self._device,
-        ).to(self._device)
-        self._controller.eval()
-
-        self._init_yaw_target_all()
 
     @property
     def action_dim(self) -> int:
@@ -176,83 +107,64 @@ class RootTwistVelocityActionTerm(ActionTerm):
     def processed_actions(self) -> torch.Tensor:
         return self._processed_actions
 
-    def _init_yaw_target_all(self):
-        try:
-            quat = self._asset.data.root_link_state_w[:, 3:7]
-            self._yaw_target.copy_(_quat_to_yaw(quat))
-        except Exception:
-            self._yaw_target.zero_()
-
     def reset(self, env_ids: torch.Tensor | None = None):
         if env_ids is None:
             self._raw_actions.zero_()
             self._processed_actions.zero_()
             self._forces.zero_()
             self._torques.zero_()
-            self._init_yaw_target_all()
+            self._rotor_cmds.zero_()
+            self._actuator.reset(None)
         else:
             self._raw_actions[env_ids] = 0.0
             self._processed_actions[env_ids] = 0.0
             self._forces[env_ids] = 0.0
             self._torques[env_ids] = 0.0
-            try:
-                quat = self._asset.data.root_link_state_w[env_ids, 3:7]
-                self._yaw_target[env_ids] = _quat_to_yaw(quat)
-            except Exception:
-                self._yaw_target[env_ids] = 0.0
+            self._rotor_cmds[env_ids] = 0.0
+            self._actuator.reset(env_ids)
 
     def process_actions(self, actions: torch.Tensor):
-        # --- enforce raw action normalization strictly ---
-        if actions.device != self._device:
-            actions = actions.to(self._device)
-        actions = actions.to(torch.float32)
-
-        # IMPORTANT: clamp raw action into [-1, 1]
+        actions = actions.to(self._device, dtype=torch.float32)
         actions = torch.clamp(actions, -1.0, 1.0)
-
-        # store clipped raw actions
         self._raw_actions.copy_(actions)
 
-        v_cmd = actions[:, 0:3] * self._vel_scale
-        yaw_rate_cmd = actions[:, 3:4] * self._yaw_rate_scale
+        target_vel = actions[:, 0:3] * self._vel_scale
+        if self._vel_clip > 0.0:
+            target_vel = torch.clamp(target_vel, -self._vel_clip, self._vel_clip)
 
-        if self._vel_clip > 0:
-            v_cmd = torch.clamp(v_cmd, -self._vel_clip, self._vel_clip)
-        if self._yaw_rate_clip > 0:
-            yaw_rate_cmd = torch.clamp(yaw_rate_cmd, -self._yaw_rate_clip, self._yaw_rate_clip)
+        target_yaw = torch.clamp(actions[:, 3:4], -self._yaw_clip, self._yaw_clip)
 
-        self._processed_actions[:, 0:3] = v_cmd
-        self._processed_actions[:, 3:4] = yaw_rate_cmd
+        self._processed_actions[:, 0:3] = target_vel
+        self._processed_actions[:, 3:4] = target_yaw
 
     def apply_actions(self):
-        yaw_rate_cmd = self._processed_actions[:, 3]
-        self._yaw_target = _wrap_to_pi(self._yaw_target + yaw_rate_cmd * self._dt)
-
         root = self._asset.data.root_link_state_w
-        v_cmd = self._processed_actions[:, 0:3]
 
-        if self._prevent_negative_thrust:
-            kv_z = float(self._vel_gain[2])
-            if kv_z > 1e-6:
-                vz = root[:, 9]
-                min_target_vz = vz - (self._g / kv_z)
-                if torch.any(v_cmd[:, 2] < min_target_vz):
-                    v_cmd = v_cmd.clone()
-                    v_cmd[:, 2] = torch.maximum(v_cmd[:, 2], min_target_vz)
-
-        thrust, torque_body = self._controller(
-            root_state_w=root,
-            target_vel_w=v_cmd,
-            target_yaw=self._yaw_target,
-            target_yaw_rate=yaw_rate_cmd,
-            target_pos_w=None,
-            target_acc_w=None,
+        target_vel, target_yaw = self._controller.process_rl_actions(self._processed_actions)
+        rotor_cmds = self._controller.compute(
+            root_state=root,
+            target_pos=None,
+            target_vel=target_vel,
+            target_acc=None,
+            target_yaw=target_yaw,
+            body_rate=False,
         )
+        rotor_cmds = torch.clamp(rotor_cmds, -1.0, 1.0)
+        self._rotor_cmds.copy_(rotor_cmds)
+
+        rotor_thrusts, rotor_moments = self._actuator(rotor_cmds)
+
+        total_thrust = rotor_thrusts.sum(dim=-1)
+        tau_x = (rotor_thrusts * self._mix_tau_x).sum(dim=-1)
+        tau_y = (rotor_thrusts * self._mix_tau_y).sum(dim=-1)
+        tau_z = rotor_moments.sum(dim=-1)
 
         self._forces.zero_()
         self._torques.zero_()
-        self._forces[:, 0, 2] = self._thrust_sign * thrust.squeeze(-1)
-        self._torques[:, 0, :] = torque_body
+        self._forces[:, 0, 2] = self._thrust_sign * total_thrust
+        self._torques[:, 0, 0] = tau_x
+        self._torques[:, 0, 1] = tau_y
+        self._torques[:, 0, 2] = tau_z
 
         self._asset.permanent_wrench_composer.set_forces_and_torques(
             forces=self._forces,
@@ -262,3 +174,45 @@ class RootTwistVelocityActionTerm(ActionTerm):
             env_ids=None,
             is_global=False,
         )
+        self._debug_counter += 1
+        if self._debug_print and (self._debug_counter % self._debug_interval == 0):
+            self._print_debug(
+                root=root,
+                rotor_cmds=rotor_cmds,
+                rotor_thrusts=rotor_thrusts,
+                total_thrust=total_thrust,
+                tau_x=tau_x,
+                tau_y=tau_y,
+                tau_z=tau_z,
+            )
+
+    def _print_debug(
+        self,
+        root: torch.Tensor,
+        rotor_cmds: torch.Tensor,
+        rotor_thrusts: torch.Tensor,
+        total_thrust: torch.Tensor,
+        tau_x: torch.Tensor,
+        tau_y: torch.Tensor,
+        tau_z: torch.Tensor,
+    ) -> None:
+        try:
+            env_id = min(self._debug_env_id, self._num_envs - 1)
+            cmd_sat_ratio = (rotor_cmds.abs() >= self._debug_cmd_sat_eps).to(torch.float32).mean(dim=-1)
+            thrust_to_weight = total_thrust / max(self._uav_mass * self._g, 1e-6)
+            z = root[:, 2]
+            vz = root[:, 9]
+            print(
+                "[CTRL_DEBUG] "
+                f"step={self._debug_counter} env={env_id} "
+                f"z={z[env_id].item():+.3f} vz={vz[env_id].item():+.3f} "
+                f"T={total_thrust[env_id].item():+.3f}N T/W={thrust_to_weight[env_id].item():+.3f} "
+                f"tau=({tau_x[env_id].item():+.4f},{tau_y[env_id].item():+.4f},{tau_z[env_id].item():+.4f}) "
+                f"cmd[min,max]=({rotor_cmds[env_id].min().item():+.3f},{rotor_cmds[env_id].max().item():+.3f}) "
+                f"cmd_sat={cmd_sat_ratio[env_id].item():.2%} "
+                f"mean_cmd_sat={cmd_sat_ratio.mean().item():.2%} "
+                f"mean_thrust={rotor_thrusts.mean().item():+.3f}",
+                flush=True,
+            )
+        except Exception:
+            pass
