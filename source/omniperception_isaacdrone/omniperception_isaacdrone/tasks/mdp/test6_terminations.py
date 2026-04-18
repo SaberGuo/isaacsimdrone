@@ -99,16 +99,17 @@ def termination_collision(
 
         collided = max_force > float(threshold)
 
-        collided_env_ids = torch.nonzero(collided, as_tuple=False).squeeze(-1)
-        if collided_env_ids.numel() > 0:
-            root_pos = mdp.root_pos_w(env, asset_cfg=SceneEntityCfg("robot"))
-            for env_id in collided_env_ids.tolist():
-                pos = root_pos[env_id]
-                print(
-                    f"[COLLISION] env={env_id} root_pos=({pos[0].item():.4f}, {pos[1].item():.4f}, {pos[2].item():.4f}) "
-                    f"max_force={max_force[env_id].item():.4f}",
-                    flush=True,
-                )
+        if bool(getattr(env, "_collision_print_enabled", False)):
+            collided_env_ids = torch.nonzero(collided, as_tuple=False).squeeze(-1)
+            if collided_env_ids.numel() > 0:
+                root_pos = mdp.root_pos_w(env, asset_cfg=SceneEntityCfg("robot"))
+                for env_id in collided_env_ids.tolist():
+                    pos = root_pos[env_id]
+                    print(
+                        f"[COLLISION] env={env_id} root_pos=({pos[0].item():.4f}, {pos[1].item():.4f}, {pos[2].item():.4f}) "
+                        f"max_force={max_force[env_id].item():.4f}",
+                        flush=True,
+                    )
 
         return collided
 
@@ -130,15 +131,16 @@ def termination_collision(
 
     collided = max_force > float(threshold)
 
-    # collided_env_ids = torch.nonzero(collided, as_tuple=False).squeeze(-1)
-    # if collided_env_ids.numel() > 0:
-    #     root_pos = mdp.root_pos_w(env, asset_cfg=SceneEntityCfg("robot"))
-    #     for env_id in collided_env_ids.tolist():
-    #         pos = root_pos[env_id]
-            # print(
-            #     f"[COLLISION] env={env_id} root_pos=({pos[0].item():.4f}, {pos[1].item():.4f}, {pos[2].item():.4f}) "
-            #     f"max_force={max_force[env_id].item():.4f}",
-            #     flush=True,
-            # )
+    if bool(getattr(env, "_collision_print_enabled", False)):
+        collided_env_ids = torch.nonzero(collided, as_tuple=False).squeeze(-1)
+        if collided_env_ids.numel() > 0:
+            root_pos = mdp.root_pos_w(env, asset_cfg=SceneEntityCfg("robot"))
+            for env_id in collided_env_ids.tolist():
+                pos = root_pos[env_id]
+                print(
+                    f"[COLLISION] env={env_id} root_pos=({pos[0].item():.4f}, {pos[1].item():.4f}, {pos[2].item():.4f}) "
+                    f"max_force={max_force[env_id].item():.4f}",
+                    flush=True,
+                )
 
     return collided

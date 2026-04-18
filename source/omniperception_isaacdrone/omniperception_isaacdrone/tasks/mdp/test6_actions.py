@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import math
-
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import ActionTermCfg as ActionTermCfg
 from isaaclab.managers.action_manager import ActionTerm
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, wrap_to_pi
 
 from omniperception_isaacdrone.actuator import RotorGroup
 from omniperception_isaacdrone.assets.robots.drone_cfg import DRONE_PARAMS
@@ -28,12 +27,12 @@ def _get_step_dt(env: ManagerBasedRLEnv) -> float:
 class RootTwistVelocityActionTerm(ActionTerm):
     """OmniPerception-style controller + actuator chain.
 
-    4D action: [vx_cmd, vy_cmd, vz_cmd, yaw_cmd]
-      - velocity command is mapped to target velocity in world frame
-      - yaw command is mapped to target yaw angle in [-pi, pi]
+    4D action: [vx_body_cmd, vy_body_cmd, vz_body_cmd, yaw_rate_cmd]
+      - linear velocity command is interpreted in the body frame
+      - yaw command is interpreted as yaw rate in rad/s
 
     Pipeline:
-      rl action -> LeePositionController (rotor cmds) -> RotorGroup -> body wrench
+      rl action (body frame) -> target vel / target yaw -> LeePositionController -> RotorGroup -> body wrench
     """
 
     def __init__(self, cfg: ActionTermCfg, env: ManagerBasedRLEnv):
@@ -52,7 +51,8 @@ class RootTwistVelocityActionTerm(ActionTerm):
 
         self._vel_scale = float(p_get("vel_scale", 1.0))
         self._vel_clip = float(p_get("vel_clip", 6.0))
-        self._yaw_clip = float(p_get("yaw_clip", 1.0))
+        self._yaw_rate_scale = float(p_get("yaw_rate_scale", p_get("yaw_clip", 1.0)))
+        self._yaw_rate_clip = float(p_get("yaw_rate_clip", p_get("yaw_clip", self._yaw_rate_scale)))
         self._thrust_sign = float(p_get("thrust_sign", 1.0))
         self._g = float(p_get("g", 9.81))
         self._debug_print = bool(p_get("debug_print", False))
@@ -83,6 +83,8 @@ class RootTwistVelocityActionTerm(ActionTerm):
         self._forces = torch.zeros((self._num_envs, 1, 3), device=self._device, dtype=torch.float32)
         self._torques = torch.zeros((self._num_envs, 1, 3), device=self._device, dtype=torch.float32)
         self._rotor_cmds = torch.zeros((self._num_envs, self._num_rotors), device=self._device, dtype=torch.float32)
+        self._target_yaw_w = torch.zeros((self._num_envs, 1), device=self._device, dtype=torch.float32)
+        self._target_yaw_initialized = torch.zeros((self._num_envs,), device=self._device, dtype=torch.bool)
 
         body_id = 0
         try:
@@ -114,6 +116,8 @@ class RootTwistVelocityActionTerm(ActionTerm):
             self._forces.zero_()
             self._torques.zero_()
             self._rotor_cmds.zero_()
+            self._target_yaw_w.zero_()
+            self._target_yaw_initialized.zero_()
             self._actuator.reset(None)
         else:
             self._raw_actions[env_ids] = 0.0
@@ -121,6 +125,8 @@ class RootTwistVelocityActionTerm(ActionTerm):
             self._forces[env_ids] = 0.0
             self._torques[env_ids] = 0.0
             self._rotor_cmds[env_ids] = 0.0
+            self._target_yaw_w[env_ids] = 0.0
+            self._target_yaw_initialized[env_ids] = False
             self._actuator.reset(env_ids)
 
     def process_actions(self, actions: torch.Tensor):
@@ -132,21 +138,32 @@ class RootTwistVelocityActionTerm(ActionTerm):
         if self._vel_clip > 0.0:
             target_vel = torch.clamp(target_vel, -self._vel_clip, self._vel_clip)
 
-        target_yaw = torch.clamp(actions[:, 3:4], -self._yaw_clip, self._yaw_clip)
+        target_yaw_rate = actions[:, 3:4] * self._yaw_rate_scale
+        if self._yaw_rate_clip > 0.0:
+            target_yaw_rate = torch.clamp(target_yaw_rate, -self._yaw_rate_clip, self._yaw_rate_clip)
 
         self._processed_actions[:, 0:3] = target_vel
-        self._processed_actions[:, 3:4] = target_yaw
+        self._processed_actions[:, 3:4] = target_yaw_rate
 
     def apply_actions(self):
         root = self._asset.data.root_link_state_w
+        root_quat_w = root[:, 3:7]
+        current_yaw_w = euler_xyz_from_quat(root_quat_w)[2].unsqueeze(-1)
 
-        target_vel, target_yaw = self._controller.process_rl_actions(self._processed_actions)
+        uninitialized = ~self._target_yaw_initialized
+        if torch.any(uninitialized):
+            self._target_yaw_w[uninitialized] = current_yaw_w[uninitialized]
+            self._target_yaw_initialized[uninitialized] = True
+
+        target_vel_w = quat_apply(root_quat_w, self._processed_actions[:, 0:3])
+        target_yaw_rate = self._processed_actions[:, 3:4]
+        self._target_yaw_w[:] = wrap_to_pi(self._target_yaw_w + target_yaw_rate * self._dt)
         rotor_cmds = self._controller.compute(
             root_state=root,
             target_pos=None,
-            target_vel=target_vel,
+            target_vel=target_vel_w,
             target_acc=None,
-            target_yaw=target_yaw,
+            target_yaw=self._target_yaw_w,
             body_rate=False,
         )
         rotor_cmds = torch.clamp(rotor_cmds, -1.0, 1.0)

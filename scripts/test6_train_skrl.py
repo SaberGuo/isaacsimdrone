@@ -46,16 +46,19 @@ parser.set_defaults(clip_predicted_values=True)
 parser.add_argument("--reward_scale", type=float, default=1.0)
 parser.add_argument("--reward_clip", type=float, default=500.0)
 parser.add_argument("--tb_interval", type=int, default=500)
-parser.add_argument("--dist_interval", type=int, default=500)
+parser.add_argument("--dist_interval", type=int, default=0)
 parser.add_argument("--dist_window", type=int, default=10)
 parser.add_argument("--dist_max_samples", type=int, default=2048)
 parser.add_argument("--checkpoint_interval", type=int, default=50000)
-parser.add_argument("--cuda_clean_interval", type=int, default=2000)
+parser.add_argument("--cuda_clean_interval", type=int, default=0)
 parser.add_argument("--extra_tb_subdir", type=str, default="extra_tb")
 parser.add_argument("--keep_infos", action="store_true", default=False)
-parser.add_argument("--grad_hist_interval", type=int, default=50)
+parser.add_argument("--grad_hist_interval", type=int, default=0)
 parser.add_argument("--grad_hist_samples", type=int, default=65536)
 parser.add_argument("--debug_act", action="store_true", default=False)
+parser.add_argument("--pbar_interval", type=int, default=50)
+parser.add_argument("--render_interval", type=int, default=0)
+parser.add_argument("--finite_check_interval", type=int, default=0)
 
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -80,7 +83,7 @@ from tqdm import tqdm
 from omniperception_isaacdrone.envs.test6_env import WallSpawner, setup_global_obstacles
 
 STATE_OBS_NAMES_17 = [
-    "root_pos_z", "root_quat_w", "root_quat_x", "root_quat_y", "root_quat_z",
+    "root_pos_z", "tilt_quat_w", "tilt_quat_x", "tilt_quat_y", "tilt_quat_z",
     "root_lin_vel_x", "root_lin_vel_y", "root_lin_vel_z",
     "root_ang_vel_x", "root_ang_vel_y", "root_ang_vel_z",
     "projected_gravity_x", "projected_gravity_y", "projected_gravity_z",
@@ -89,6 +92,14 @@ STATE_OBS_NAMES_17 = [
 ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
 
 DEBUG_PRINT = False
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
 
 from pxr import Usd, UsdGeom, UsdPhysics, Gf
 import isaacsim.core.utils.prims as prim_utils
@@ -377,17 +388,17 @@ class TensorDictStats:
         for name, value in values.items():
             if not isinstance(value, torch.Tensor) or value.numel() == 0: continue
             v = torch.nan_to_num(value.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
-            mean_v, min_v, max_v = float(v.mean().item()), float(v.min().item()), float(v.max().item())
-            self.sum[name] = self.sum.get(name, 0.0) + mean_v
-            self.min[name] = min_v if name not in self.min else min(self.min[name], min_v)
-            self.max[name] = max_v if name not in self.max else max(self.max[name], max_v)
+            mean_v, min_v, max_v = v.mean(), v.min(), v.max()
+            self.sum[name] = mean_v if name not in self.sum else (self.sum[name] + mean_v)
+            self.min[name] = min_v if name not in self.min else torch.minimum(self.min[name], min_v)
+            self.max[name] = max_v if name not in self.max else torch.maximum(self.max[name], max_v)
     def flush(self, writer: SummaryWriter, prefix: str, step: int):
         if self.window_steps <= 0: return
         for name in sorted(self.sum.keys()):
             tag = sanitize_tb_tag(name)
-            writer.add_scalar(f"{prefix}/{tag}/mean", self.sum[name] / float(self.window_steps), step)
-            writer.add_scalar(f"{prefix}/{tag}/min", self.min[name], step)
-            writer.add_scalar(f"{prefix}/{tag}/max", self.max[name], step)
+            writer.add_scalar(f"{prefix}/{tag}/mean", float((self.sum[name] / float(self.window_steps)).item()), step)
+            writer.add_scalar(f"{prefix}/{tag}/min", float(self.min[name].item()), step)
+            writer.add_scalar(f"{prefix}/{tag}/max", float(self.max[name].item()), step)
 
 
 class RewardBreakdownAccumulator:
@@ -440,9 +451,11 @@ class SkrlLossMirror:
     def __init__(self): self.reset()
     def reset(self): self.policy_losses, self.value_losses = [], []
     def bind(self, agent: PPO):
+        original_track_data = agent.track_data
         def wrapped_track_data(tag, value):
             if "loss" in (low := str(tag).lower()) and "policy" in low: self.policy_losses.append(to_float(value))
             elif "loss" in low and "value" in low: self.value_losses.append(to_float(value))
+            original_track_data(tag, value)
         agent.track_data = wrapped_track_data
     def flush(self, writer, step):
         if len(self.policy_losses) > 0: writer.add_scalar("Loss/policy", float(np.mean(self.policy_losses)), step)
@@ -533,6 +546,13 @@ def main() -> None:
     env_cfg.scene.replicate_physics = True
     env_cfg.scene.filter_collisions = True
     try:
+        action_params = getattr(env_cfg.actions.root_twist, "params", None) or {}
+        if isinstance(action_params, dict):
+            action_params["debug_print"] = bool(args.debug_act)
+            env_cfg.actions.root_twist.params = action_params
+    except Exception:
+        pass
+    try:
         setattr(env_cfg, "seed", int(args.seed))
     except Exception:
         pass
@@ -560,6 +580,11 @@ def main() -> None:
     setup_global_obstacles(int(args.num_obstacles))
     print("[INFO] Creating env...", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
+    setattr(base_env, "_enable_tb_reward_terms", int(args.tb_interval) > 0)
+    setattr(base_env, "_enable_tb_aux_terms", False)
+    setattr(base_env, "_collision_print_enabled", False)
+    if bool(args.headless) or int(args.num_envs) > 1:
+        setattr(base_env, "_goal_vis_enabled", False)
     scale_robot_visual_only(num_envs=base_env.num_envs, visual_scale=(20.0, 20.0, 10.0))
     space = getattr(base_env, "single_observation_space", None)
     policy_space = space.spaces.get("policy", None) if isinstance(space, gym.spaces.Dict) else getattr(base_env, "observation_space", None)
@@ -621,18 +646,28 @@ def main() -> None:
     loss_mirror.bind(agent)
     raw_obs, infos = env.reset()
     states = sanitize_states(ensure_obs_shape(extract_policy_obs(raw_obs), num_envs, obs_dim), state_dim=state_dim, lidar_dim=lidar_dim)
-    last_good_snapshot = snapshot_models(models)
+    finite_check_interval = int(args.finite_check_interval)
+    keep_nan_snapshot = finite_check_interval > 0
+    last_good_snapshot = snapshot_models(models) if keep_nan_snapshot else {}
+    enable_scalar_logging = int(args.tb_interval) > 0
+    enable_hist_logging = int(args.dist_interval) > 0
     reward_weights = extract_reward_weights(base_env)
-    reward_window = RewardBreakdownAccumulator()
+    reward_window = RewardBreakdownAccumulator() if enable_scalar_logging else None
     termination_ratio_window = InfoTerminationRatioAccumulator()
     hist_logger = RollingHistogramLogger(
         obs_names=build_state_names(state_dim),
         action_names=build_action_names(act_dim),
         window=int(args.dist_window),
         max_samples=int(args.dist_max_samples),
-    )
+    ) if enable_hist_logging else None
     latest_curriculum_log: Dict[str, float] = {}
-    pbar = tqdm(range(int(args.timesteps)), ncols=110)
+    pbar = tqdm(
+        range(int(args.timesteps)),
+        ncols=110,
+        disable=int(args.pbar_interval) <= 0,
+        miniters=max(int(args.pbar_interval), 1),
+        mininterval=1.0,
+    )
     try:
         for t in pbar:
             global_step = t + 1
@@ -643,16 +678,18 @@ def main() -> None:
             if not torch.isfinite(actions).all(): raise RuntimeError(f"Non-finite actions detected at t={t}")
             actions = sanitize_actions(actions)
             rollout_boundary = (global_step % int(args.rollouts) == 0)
-            if rollout_boundary: last_good_snapshot = snapshot_models(models)
+            if keep_nan_snapshot and rollout_boundary:
+                last_good_snapshot = snapshot_models(models)
             next_obs, rewards, terminated, truncated, infos = env.step(actions)
             next_states = sanitize_states(ensure_obs_shape(extract_policy_obs(next_obs), num_envs, obs_dim), state_dim=state_dim, lidar_dim=lidar_dim)
             rewards = ensure_vec_shape(torch.nan_to_num(rewards.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "rewards")
             terminated = ensure_vec_shape(torch.nan_to_num(terminated.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "terminated").bool()
             truncated = ensure_vec_shape(torch.nan_to_num(truncated.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "truncated").bool()
             train_rewards = scale_rewards(rewards, scale=args.reward_scale, clip=args.reward_clip)
-            raw_terms, weighted_terms, scaled_terms = build_reward_term_views(base_env, reward_weights=reward_weights, reward_scale=float(args.reward_scale), reward_clip=float(args.reward_clip))
-            reward_window.update(raw_terms=raw_terms, weighted_terms=weighted_terms, scaled_terms=scaled_terms)
-            clear_tb_caches(base_env)
+            if reward_window is not None:
+                raw_terms, weighted_terms, scaled_terms = build_reward_term_views(base_env, reward_weights=reward_weights, reward_scale=float(args.reward_scale), reward_clip=float(args.reward_clip))
+                reward_window.update(raw_terms=raw_terms, weighted_terms=weighted_terms, scaled_terms=scaled_terms)
+                clear_tb_caches(base_env)
             done_count = int((terminated | truncated).sum().item())
             termination_ratio_window.update(infos, done_count=done_count)
             if done_count > 0:
@@ -662,26 +699,29 @@ def main() -> None:
                 agent.record_transition(states=states, actions=actions, rewards=train_rewards, next_states=next_states, terminated=terminated, truncated=truncated, infos=infos if args.keep_infos else {}, timestep=t, timesteps=int(args.timesteps))
             agent.post_interaction(timestep=t, timesteps=int(args.timesteps))
             if rollout_boundary: loss_mirror.flush(writer, global_step)
-            if rollout_boundary and not models_are_finite(models):
-                debug_dir = exp_dir / "debug"
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(last_good_snapshot, debug_dir / f"last_good_before_nan_t{t}.pt")
-                raise RuntimeError(f"Non-finite model parameters detected at t={t}")
-            if not args.headless:
+            if keep_nan_snapshot and rollout_boundary and finite_check_interval > 0 and ((global_step // int(args.rollouts)) % finite_check_interval == 0):
+                if not models_are_finite(models):
+                    debug_dir = exp_dir / "debug"
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save(last_good_snapshot, debug_dir / f"last_good_before_nan_t{t}.pt")
+                    raise RuntimeError(f"Non-finite model parameters detected at t={t}")
+            if not args.headless and int(args.render_interval) > 0 and (global_step % int(args.render_interval) == 0):
                 try: env.render()
                 except Exception: pass
-            should_log_dist = int(args.dist_interval) > 0 and ((global_step % int(args.dist_interval) == 0) or (global_step == int(args.timesteps)))
-            should_log_scalars = int(args.tb_interval) > 0 and ((global_step % int(args.tb_interval) == 0) or (global_step == int(args.timesteps)))
-            if should_log_dist:
+            should_log_dist = enable_hist_logging and ((global_step % int(args.dist_interval) == 0) or (global_step == int(args.timesteps)))
+            should_log_scalars = enable_scalar_logging and ((global_step % int(args.tb_interval) == 0) or (global_step == int(args.timesteps)))
+            if should_log_dist and hist_logger is not None:
                 hist_logger.update(states=states, actions=actions, state_dim=state_dim)
                 hist_logger.flush(writer, global_step)
                 if not should_log_scalars: writer.flush()
             if should_log_scalars:
                 for key, value in sorted(latest_curriculum_log.items()): writer.add_scalar(sanitize_tb_tag(key), value, global_step)
-                reward_window.flush(writer, global_step)
+                if reward_window is not None:
+                    reward_window.flush(writer, global_step)
                 termination_ratio_window.flush(writer, global_step)
                 writer.flush()
-                reward_window.reset()
+                if reward_window is not None:
+                    reward_window.reset()
                 termination_ratio_window.reset()
             if int(args.grad_hist_interval) > 0 and rollout_boundary and (global_step // int(args.rollouts)) % int(args.grad_hist_interval) == 0:
                 log_gradients(writer, models, global_step, int(args.grad_hist_samples))
@@ -693,7 +733,8 @@ def main() -> None:
             if int(args.cuda_clean_interval) > 0 and (global_step % int(args.cuda_clean_interval) == 0):
                 gc.collect()
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
-            pbar.set_description(f"t={t} envR={rewards.mean().item():+.3f} trainR={train_rewards.mean().item():+.3f} done={done_count}")
+            if int(args.pbar_interval) > 0 and (global_step % int(args.pbar_interval) == 0):
+                pbar.set_description(f"t={t} envR={rewards.mean().item():+.3f} trainR={train_rewards.mean().item():+.3f} done={done_count}")
             states = next_states
     except KeyboardInterrupt:
         print("\n[WARN] KeyboardInterrupt: stopping training early", flush=True)

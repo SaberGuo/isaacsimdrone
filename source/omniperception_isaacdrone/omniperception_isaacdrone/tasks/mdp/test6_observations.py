@@ -8,7 +8,7 @@ import torch
 import isaaclab.envs.mdp as mdp
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import quat_apply_inverse, quat_inv, quat_mul, quat_unique, yaw_quat
 
 
 # =============================================================================
@@ -152,13 +152,9 @@ def obs_goal_delta(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.T
     # 世界坐标系下的距离差
     delta_w = goal - pos
 
-    # 将世界系坐标转换到机体坐标系（通过乘以机体四元数的共轭，即逆旋转）
+    # 将世界系目标误差转换到机体坐标系
     quat_w = mdp.root_quat_w(env, asset_cfg=asset_cfg)
-    quat_inv = quat_w.clone()
-    quat_inv[..., 1:] = -quat_inv[..., 1:]  # 共轭即为逆 [w, -x, -y, -z]
-
-    delta_b = quat_apply(quat_inv, delta_w)
-    return delta_b
+    return quat_apply_inverse(quat_w, delta_w)
 
 
 # =============================================================================
@@ -193,15 +189,14 @@ def obs_root_pos_z_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> to
 
 
 def obs_root_quat_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    # 根节点四元数归一化与半球校正
+    # 根节点姿态归一化：移除绝对偏航，仅保留与机体系相关的倾斜姿态
     quat = mdp.root_quat_w(env, asset_cfg=asset_cfg).to(torch.float32)
+    quat_tilt = quat_mul(quat_inv(yaw_quat(quat)), quat)
 
     if _get_quat_hemisphere(env):
-        w = quat[:, 0:1]
-        sign = torch.where(w < 0.0, torch.tensor(-1.0, device=quat.device), torch.tensor(1.0, device=quat.device))
-        quat = quat * sign
+        quat_tilt = quat_unique(quat_tilt)
 
-    return _clamp_m11(quat)
+    return _clamp_m11(quat_tilt)
 
 
 def obs_root_lin_vel_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:

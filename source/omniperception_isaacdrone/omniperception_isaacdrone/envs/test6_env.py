@@ -168,6 +168,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         # lidar threat gradient buffers (placeholders, resized after super().__init__)
         self._lidar_threat_prev_min_dist = None
         self._lidar_threat_reset_mask = None
+        self._lidar_grid_cache = None
 
         # goal visualizer settings / cache
         self._goal_vis_enabled = True
@@ -339,35 +340,17 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
             )
         self._lidar_threat_reset_mask[env_ids] = True
 
-    def _build_goal_info(self) -> dict:
-        info = {}
-        try:
-            pos = mdp.root_pos_w(self, asset_cfg=SceneEntityCfg("robot"))
-            info["goal_state_delta"] = (self.goal_pos_w - pos).detach()
-            info["goal_pos_w"] = self.goal_pos_w.detach()
-        except Exception:
-            pass
-        return info
+    def _clear_lidar_grid_cache(self) -> None:
+        self._lidar_grid_cache = None
 
     def _reset_idx(self, env_ids: torch.Tensor | None = None):
         env_ids = torch.arange(self.num_envs, device=self.device) if env_ids is None else env_ids
 
-        parent = super()
-        out = parent._reset_idx(env_ids) if hasattr(parent, "_reset_idx") else parent.reset_idx(env_ids)
-
+        super()._reset_idx(env_ids)
+        self._clear_lidar_grid_cache()
         self._refresh_energy_prev_buffers(env_ids)
         self._refresh_progress_prev_dist(env_ids)
         self._refresh_lidar_threat_prev_dist(env_ids)
 
-        obs_dict = self.observation_manager.compute()
-
-        goal_info = self._build_goal_info()
-        if isinstance(out, tuple) and len(out) == 2:
-            out = (obs_dict, out[1])
-            if isinstance(out[1], dict):
-                out[1].update(goal_info)
-
-        return out
-
     def reset_idx(self, env_ids: torch.Tensor | None = None):
-        return self._reset_idx(env_ids)
+        self._reset_idx(env_ids)

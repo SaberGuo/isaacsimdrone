@@ -30,6 +30,8 @@ def _tb_get_dict(env: ManagerBasedRLEnv, attr: str) -> dict:
 
 def _tb_store_reward(env: ManagerBasedRLEnv, name: str, value: torch.Tensor):
     try:
+        if not bool(getattr(env, "_enable_tb_reward_terms", True)):
+            return
         d = _tb_get_dict(env, "_tb_reward_terms")
         if isinstance(value, torch.Tensor):
             d[name] = value.detach()
@@ -39,6 +41,8 @@ def _tb_store_reward(env: ManagerBasedRLEnv, name: str, value: torch.Tensor):
 
 def _tb_store_aux(env: ManagerBasedRLEnv, name: str, value: torch.Tensor):
     try:
+        if not bool(getattr(env, "_enable_tb_aux_terms", False)):
+            return
         d = _tb_get_dict(env, "_tb_aux_terms")
         if isinstance(value, torch.Tensor):
             d[name] = value.detach()

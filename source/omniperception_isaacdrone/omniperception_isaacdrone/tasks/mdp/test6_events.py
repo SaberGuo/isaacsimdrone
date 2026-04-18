@@ -173,3 +173,7 @@ def randomize_obstacles_on_reset(
 
     asset.write_root_pose_to_sim(root_pose, env_ids=all_obstacle_ids)
     asset.write_root_velocity_to_sim(velocities, env_ids=all_obstacle_ids)
+
+    if hasattr(u, "_refresh_lidar_threat_prev_dist"):
+        all_env_ids = torch.arange(u.num_envs, dtype=torch.long, device=env.device)
+        u._refresh_lidar_threat_prev_dist(all_env_ids)
