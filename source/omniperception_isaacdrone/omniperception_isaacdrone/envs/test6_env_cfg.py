@@ -50,6 +50,7 @@ class ObstacleCurriculumSettingsCfg:
     initial_level: int = 0
     success_term_name: str = "reached_goal"
     success_threshold: float = 0.85
+    success_thresholds: tuple[float, ...] = (0.85, 0.82, 0.72, 0.68, 0.62, 0.58)
     k_roll: int = 4
     clear_history_on_promotion: bool = True
 
@@ -182,6 +183,9 @@ class Test6EventCfg:
             "x_range": (-33.0, 33.0),
             "y_range": (-33.0, 33.0),
             "z_height": 10.0,
+            "edge_margin": 8.0,
+            "min_separation": 3.5,
+            "max_sample_tries": 4000,
         },
     )
 
@@ -189,18 +193,18 @@ class Test6EventCfg:
 @configclass
 class Test6RewardsCfg:
     """奖励配置。"""
-    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=4.0, params={})
+    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=3.0, params={})
     dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=1.0, params={})
     vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=1.0, params={})
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=1.0, params={})
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.005, params={})
     # ← 从 OLD 迁移：权重恢复为 -20.0
     lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-20.0, params={})
-    safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-5.0, params={})
+    safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-7.5, params={})
     energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.002, params={})
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.0005)
     success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=10.0, params={})
-    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-10.0, params={})
+    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-15.0, params={})
     oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-10.0, params={})
     timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-5.0, params={})
 
@@ -224,6 +228,7 @@ class Test6CurriculumCfg:
             "levels": (0, 10, 20, 30, 50, 100),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
+            "success_thresholds": (0.85, 0.82, 0.72, 0.68, 0.62, 0.58),
             "k_roll": 4,
         },
     )
@@ -324,10 +329,15 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.rewards.lidar_threat.params = {
             "lidar_name": "lidar",
             "safe_dist": None,
-            "safe_dist_ratio": 0.16,
+            "safe_dist_ratio": 0.20,
+            "warning_dist": None,
+            "warning_dist_ratio": 1.6,
             "speed_ref": 6.0,
             "clip": 1.0,
             "proximity_boost": True,
+            "static_penalty_scale": 0.85,
+            "warning_approach_scale": 0.35,
+            "proximity_power": 2.0,
             "use_grid": True,
             "theta_min": 30.0,
             "theta_max": 90.0,
@@ -340,8 +350,8 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.rewards.safe_vel_penalty.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "lidar_name": "lidar",
-            "safe_dist": 6.0,
-            "margin": 2.0,
+            "safe_dist": 8.0,
+            "margin": 4.0,
             "theta_min": 30.0,
             "theta_max": 90.0,
             "phi_min": 0.0,

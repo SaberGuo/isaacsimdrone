@@ -343,6 +343,9 @@ def extract_reward_weights(base_env: Any) -> Dict[str, float]:
 def extract_tb_reward_terms(base_env: Any) -> Dict[str, torch.Tensor]:
     return data if isinstance(data := getattr(base_env, "_tb_reward_terms", None), dict) else {}
 
+def extract_tb_aux_terms(base_env: Any) -> Dict[str, torch.Tensor]:
+    return data if isinstance(data := getattr(base_env, "_tb_aux_terms", None), dict) else {}
+
 def clear_tb_caches(base_env: Any) -> None:
     for attr in ("_tb_reward_terms", "_tb_aux_terms"):
         if isinstance(d := getattr(base_env, attr, None), dict): d.clear()
@@ -581,7 +584,7 @@ def main() -> None:
     print("[INFO] Creating env...", flush=True)
     base_env = gym.make(args.task, cfg=env_cfg).unwrapped
     setattr(base_env, "_enable_tb_reward_terms", int(args.tb_interval) > 0)
-    setattr(base_env, "_enable_tb_aux_terms", False)
+    setattr(base_env, "_enable_tb_aux_terms", int(args.tb_interval) > 0)
     setattr(base_env, "_collision_print_enabled", False)
     if bool(args.headless) or int(args.num_envs) > 1:
         setattr(base_env, "_goal_vis_enabled", False)
@@ -653,6 +656,7 @@ def main() -> None:
     enable_hist_logging = int(args.dist_interval) > 0
     reward_weights = extract_reward_weights(base_env)
     reward_window = RewardBreakdownAccumulator() if enable_scalar_logging else None
+    aux_window = TensorDictStats() if enable_scalar_logging else None
     termination_ratio_window = InfoTerminationRatioAccumulator()
     hist_logger = RollingHistogramLogger(
         obs_names=build_state_names(state_dim),
@@ -689,6 +693,8 @@ def main() -> None:
             if reward_window is not None:
                 raw_terms, weighted_terms, scaled_terms = build_reward_term_views(base_env, reward_weights=reward_weights, reward_scale=float(args.reward_scale), reward_clip=float(args.reward_clip))
                 reward_window.update(raw_terms=raw_terms, weighted_terms=weighted_terms, scaled_terms=scaled_terms)
+                if aux_window is not None:
+                    aux_window.update(extract_tb_aux_terms(base_env))
                 clear_tb_caches(base_env)
             done_count = int((terminated | truncated).sum().item())
             termination_ratio_window.update(infos, done_count=done_count)
@@ -718,10 +724,14 @@ def main() -> None:
                 for key, value in sorted(latest_curriculum_log.items()): writer.add_scalar(sanitize_tb_tag(key), value, global_step)
                 if reward_window is not None:
                     reward_window.flush(writer, global_step)
+                if aux_window is not None:
+                    aux_window.flush(writer, "Aux", global_step)
                 termination_ratio_window.flush(writer, global_step)
                 writer.flush()
                 if reward_window is not None:
                     reward_window.reset()
+                if aux_window is not None:
+                    aux_window.reset()
                 termination_ratio_window.reset()
             if int(args.grad_hist_interval) > 0 and rollout_boundary and (global_step // int(args.rollouts)) % int(args.grad_hist_interval) == 0:
                 log_gradients(writer, models, global_step, int(args.grad_hist_samples))

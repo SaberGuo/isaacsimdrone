@@ -5,6 +5,79 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
 
+def _sample_obstacle_positions(
+    device: torch.device,
+    num_active: int,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    z_height: float,
+    edge_margin: float,
+    min_separation: float,
+    max_sample_tries: int,
+) -> torch.Tensor:
+    """Sample obstacle centers with soft spacing constraints.
+
+    The sampler prefers layouts that are not clustered and stay away from the
+    boundary spawn/goal belt. If the requested density is too high, it
+    gradually relaxes the separation constraint instead of failing.
+    """
+
+    if num_active <= 0:
+        return torch.zeros((0, 3), device=device, dtype=torch.float32)
+
+    x_min, x_max = float(x_range[0]), float(x_range[1])
+    y_min, y_max = float(y_range[0]), float(y_range[1])
+    edge_margin = max(float(edge_margin), 0.0)
+
+    inner_x_min = min(x_max, x_min + edge_margin)
+    inner_x_max = max(inner_x_min, x_max - edge_margin)
+    inner_y_min = min(y_max, y_min + edge_margin)
+    inner_y_max = max(inner_y_min, y_max - edge_margin)
+
+    positions_xy = torch.empty((num_active, 2), device=device, dtype=torch.float32)
+    placed = 0
+    tries = 0
+    total_try_budget = max(int(max_sample_tries), num_active * 32)
+    base_min_separation = max(float(min_separation), 0.0)
+
+    while placed < num_active and tries < total_try_budget:
+        candidate = torch.tensor(
+            [
+                torch.empty((), device=device).uniform_(inner_x_min, inner_x_max).item(),
+                torch.empty((), device=device).uniform_(inner_y_min, inner_y_max).item(),
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+
+        if placed == 0 or base_min_separation <= 0.0:
+            positions_xy[placed] = candidate
+            placed += 1
+            tries += 1
+            continue
+
+        progress = tries / float(total_try_budget)
+        relaxed_min_separation = base_min_separation * max(0.35, 1.0 - 0.7 * progress)
+        dist = torch.norm(positions_xy[:placed] - candidate.unsqueeze(0), dim=1)
+        if bool((dist >= relaxed_min_separation).all()):
+            positions_xy[placed] = candidate
+            placed += 1
+
+        tries += 1
+
+    if placed < num_active:
+        remaining = num_active - placed
+        fallback_xy = torch.empty((remaining, 2), device=device, dtype=torch.float32)
+        fallback_xy[:, 0].uniform_(inner_x_min, inner_x_max)
+        fallback_xy[:, 1].uniform_(inner_y_min, inner_y_max)
+        positions_xy[placed:] = fallback_xy
+
+    positions = torch.zeros((num_active, 3), device=device, dtype=torch.float32)
+    positions[:, :2] = positions_xy
+    positions[:, 2] = float(z_height) / 2.0
+    return positions
+
+
 def reset_root_state_on_square_edge(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
@@ -69,6 +142,9 @@ def randomize_obstacles_on_reset(
     x_range: tuple = (-33.0, 33.0),
     y_range: tuple = (-33.0, 33.0),
     z_height: float = 10.0,
+    edge_margin: float = 8.0,
+    min_separation: float = 3.5,
+    max_sample_tries: int = 4000,
 ):
     """
     每次 level 变化时，根据当前 Curriculum 等级重新随机放置全局障碍物。
@@ -148,15 +224,17 @@ def randomize_obstacles_on_reset(
 
     # 激活部分随机分布在 workspace 中
     if num_active > 0:
-        positions[:num_active, 0] = (
-            torch.rand(num_active, device=env.device)
-            * (x_range[1] - x_range[0]) + x_range[0]
+        sampled_positions = _sample_obstacle_positions(
+            device=env.device,
+            num_active=num_active,
+            x_range=x_range,
+            y_range=y_range,
+            z_height=z_height,
+            edge_margin=edge_margin,
+            min_separation=min_separation,
+            max_sample_tries=max_sample_tries,
         )
-        positions[:num_active, 1] = (
-            torch.rand(num_active, device=env.device)
-            * (y_range[1] - y_range[0]) + y_range[0]
-        )
-        positions[:num_active, 2] = z_height / 2.0
+        positions[:num_active] = sampled_positions
 
     orientations = torch.zeros((max_obstacles, 4), device=env.device)
     orientations[:, 0] = 1.0  # w = 1（单位四元数）

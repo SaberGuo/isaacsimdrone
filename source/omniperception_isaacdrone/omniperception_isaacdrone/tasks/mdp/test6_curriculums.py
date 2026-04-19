@@ -71,12 +71,31 @@ def _window_is_full(env: "ManagerBasedRLEnv") -> bool:
     return filled >= u.curr_window_size
 
 
+def _resolve_success_threshold(
+    env: "ManagerBasedRLEnv",
+    success_threshold: float,
+    success_thresholds: Sequence[float] | None,
+) -> float:
+    u = env.unwrapped
+    if not success_thresholds:
+        return float(success_threshold)
+
+    thresholds = list(success_thresholds)
+    if len(thresholds) == 0:
+        return float(success_threshold)
+
+    level_idx = int(getattr(u, "curr_level_idx", 0))
+    level_idx = max(0, min(level_idx, len(thresholds) - 1))
+    return float(thresholds[level_idx])
+
+
 def update_obstacle_curriculum(
     env: "ManagerBasedRLEnv",
     env_ids: Sequence[int] | slice | torch.Tensor,
     levels: Sequence[int] = (0, 10, 20, 30, 50, 100),
     success_term_name: str = "reached_goal",
     success_threshold: float = 0.85,
+    success_thresholds: Sequence[float] | None = None,
     window_size: int = 200,   # 保留签名兼容性，实际由 num_envs * k_roll 决定
     k_roll: int = 4,
 ) -> dict[str, float]:
@@ -95,11 +114,12 @@ def update_obstacle_curriculum(
     # ------------------------------------------------------------------
     def _default_log() -> dict[str, float]:
         filled = int((u.curr_history >= 0.0).sum().item())
+        current_threshold = _resolve_success_threshold(env, success_threshold, success_thresholds)
         return {
             "Curriculum/active_count":        float(u.curr_obstacle_count),
             "Curriculum/level_idx":           float(u.curr_level_idx),
             "Curriculum/success_rate":        _compute_success_rate(env),
-            "Curriculum/success_threshold":   float(success_threshold),
+            "Curriculum/success_threshold":   float(current_threshold),
             "Curriculum/window_full":         float(_window_is_full(env)),
             "Curriculum/window_filled_slots": float(filled),
             "Curriculum/window_size":         float(u.curr_window_size),
@@ -149,10 +169,11 @@ def update_obstacle_curriculum(
     # ------------------------------------------------------------------
     success_rate = _compute_success_rate(env)
     is_full      = _window_is_full(env)
+    current_threshold = _resolve_success_threshold(env, success_threshold, success_thresholds)
 
     if (
         is_full
-        and success_rate >= float(success_threshold)
+        and success_rate >= current_threshold
         and u.curr_level_idx < len(u.curr_levels) - 1
     ):
         u.curr_level_idx      += 1
@@ -169,7 +190,7 @@ def update_obstacle_curriculum(
         u.obstacle_level_changed = True
 
         print(
-            f"[CURRICULUM] 成功率 {success_rate:.3f} >= {success_threshold} | "
+            f"[CURRICULUM] 成功率 {success_rate:.3f} >= {current_threshold:.3f} | "
             f"晋级 → 难度等级 {u.curr_level_idx} | "
             f"障碍物数量: {u.curr_obstacle_count}",
             flush=True,
@@ -177,13 +198,14 @@ def update_obstacle_curriculum(
 
         success_rate = 0.0
         is_full      = False
+        current_threshold = _resolve_success_threshold(env, success_threshold, success_thresholds)
 
     filled = int((u.curr_history >= 0.0).sum().item())
     return {
         "Curriculum/active_count":        float(u.curr_obstacle_count),
         "Curriculum/level_idx":           float(u.curr_level_idx),
         "Curriculum/success_rate":        float(success_rate),
-        "Curriculum/success_threshold":   float(success_threshold),
+        "Curriculum/success_threshold":   float(current_threshold),
         "Curriculum/window_full":         float(is_full),
         "Curriculum/window_filled_slots": float(filled),
         "Curriculum/window_size":         float(u.curr_window_size),
