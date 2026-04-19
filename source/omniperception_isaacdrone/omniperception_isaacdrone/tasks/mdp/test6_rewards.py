@@ -310,14 +310,9 @@ def penalty_lidar_threat(
     lidar_name: str = "lidar",
     safe_dist: float | None = None,
     safe_dist_ratio: float = 0.16,
-    warning_dist: float | None = None,
-    warning_dist_ratio: float = 1.5,
     speed_ref: float = 6.0,
     clip: float = 1.0,
     proximity_boost: bool = True,
-    static_penalty_scale: float = 0.75,
-    warning_approach_scale: float = 0.35,
-    proximity_power: float = 2.0,
     use_grid: bool = True,
     theta_min: float = 30.0,
     theta_max: float = 90.0,
@@ -328,19 +323,13 @@ def penalty_lidar_threat(
     max_vis_points: int | None = None,
 ) -> torch.Tensor:
     """梯度型激光雷达威胁奖惩。
-
-    在预警范围 (min_dist < warning_dist) 内：
-      - 始终施加与障碍物接近程度相关的静态惩罚，避免“临撞前才学会刹车”
-      - 靠近障碍物时额外施加距离变化率惩罚；远离时给出恢复性正反馈
-
     在危险范围 (min_dist < safe_dist) 内：
       - 最小距离增大 (远离障碍物) → 返回负值 → ×负权重 = 正奖励 (鼓励)
       - 最小距离减小 (靠近障碍物) → 返回正值 → ×负权重 = 负惩罚 (惩罚)
-      - 危险范围外，仅保留较弱的预警信号
+      - 危险范围外 → 返回 0
 
     Args:
         safe_dist: 危险距离阈值 (m)。None 则由 safe_dist_ratio × max_distance 计算。
-        warning_dist: 预警距离阈值 (m)。None 则由 safe_dist × warning_dist_ratio 计算。
         safe_dist_ratio: safe_dist 为 None 时使用的比例。
         speed_ref: 归一化参考速度 (m/s)，用于将距离变化率映射到 [-1, 1]。
         clip: 输出裁剪范围 [-clip, clip]。
@@ -365,10 +354,6 @@ def penalty_lidar_threat(
         safe_dist = float(safe_dist_ratio) * float(max_d)
     safe_dist = max(float(safe_dist), 1e-6)
 
-    if warning_dist is None:
-        warning_dist = safe_dist * float(warning_dist_ratio)
-    warning_dist = max(float(warning_dist), safe_dist + 1e-6)
-
     # ── 计算当前 min_dist ──
     min_dist = _compute_min_dist_from_lidar(
         env, lidar, lidar_name, max_d, use_grid,
@@ -388,7 +373,6 @@ def penalty_lidar_threat(
         _tb_store_aux(env, "lidar_min_dist", min_dist)
         _tb_store_aux(env, "lidar_threat_approach_rate", zeros)
         _tb_store_aux(env, "lidar_threat_in_danger_ratio", (min_dist < safe_dist).float())
-        _tb_store_aux(env, "lidar_threat_in_warning_ratio", (min_dist < warning_dist).float())
         return zeros
 
     # ── 处理刚 reset 的环境（抑制虚假梯度） ──
@@ -418,26 +402,14 @@ def penalty_lidar_threat(
 
     # ── 危险区域判定 & 接近度缩放 ──
     in_danger = min_dist < safe_dist
-    in_warning = min_dist < warning_dist
 
     if proximity_boost:
-        danger_factor = torch.clamp((safe_dist - min_dist) / safe_dist, 0.0, 1.0)
-        warning_factor = torch.clamp(
-            (warning_dist - min_dist) / max(warning_dist - safe_dist, 1e-6),
-            0.0,
-            1.0,
+        proximity_factor = torch.clamp(
+            (safe_dist - min_dist) / safe_dist, 0.0, 1.0
         )
+        out = normalized * proximity_factor
     else:
-        danger_factor = in_danger.float()
-        warning_factor = in_warning.float()
-
-    approach_factor = torch.where(
-        in_danger,
-        danger_factor,
-        warning_factor * float(warning_approach_scale),
-    )
-    static_penalty = warning_factor.pow(max(float(proximity_power), 1.0)) * in_warning.float()
-    out = normalized * approach_factor + static_penalty * float(static_penalty_scale)
+        out = normalized * in_danger.float()
 
     out = out.to(torch.float32)
 
@@ -448,10 +420,8 @@ def penalty_lidar_threat(
     _tb_store_reward(env, "lidar_threat", out)
     _tb_store_aux(env, "lidar_min_dist", min_dist)
     _tb_store_aux(env, "lidar_safe_dist", torch.full_like(min_dist, safe_dist))
-    _tb_store_aux(env, "lidar_warning_dist", torch.full_like(min_dist, warning_dist))
     _tb_store_aux(env, "lidar_threat_approach_rate", approach_rate)
     _tb_store_aux(env, "lidar_threat_in_danger_ratio", in_danger.float())
-    _tb_store_aux(env, "lidar_threat_in_warning_ratio", in_warning.float())
     return out
 
 

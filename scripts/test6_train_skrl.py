@@ -310,13 +310,65 @@ def extract_log_dict(infos: Any) -> Dict[str, Any]:
         if isinstance(log := extras.get("log", None), dict): return log
     return {}
 
-def extract_termination_count_dict(infos: Any) -> Dict[str, float]:
-    return {k.split("/", 1)[1]: to_float(v) for k, v in extract_log_dict(infos).items() if k.startswith("Episode_Termination/")}
+def _get_done_mask(terminated: torch.Tensor, truncated: torch.Tensor) -> torch.Tensor:
+    num_envs = int(terminated.shape[0])
+    terminated_mask = ensure_vec_shape(torch.nan_to_num(terminated.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "terminated").squeeze(-1).bool()
+    truncated_mask = ensure_vec_shape(torch.nan_to_num(truncated.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "truncated").squeeze(-1).bool()
+    return terminated_mask | truncated_mask
 
-def extract_termination_ratio_dict(infos: Any, done_count: int) -> Dict[str, float]:
-    if int(done_count) <= 0: return {}
+def _get_termination_term_mask(base_env: Any, name: str, num_envs: int) -> torch.Tensor | None:
+    try:
+        term = base_env.termination_manager.get_term(name)
+    except Exception:
+        return None
+    if not isinstance(term, torch.Tensor):
+        return None
+    mask = ensure_vec_shape(torch.nan_to_num(term.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, f"termination_{name}")
+    return mask.squeeze(-1).bool()
+
+def build_primary_termination_count_dict(base_env: Any, terminated: torch.Tensor, truncated: torch.Tensor) -> Dict[str, float]:
+    done_mask = _get_done_mask(terminated, truncated)
+    if not done_mask.any():
+        return {}
+
+    num_envs = int(done_mask.shape[0])
+    truncated_mask = ensure_vec_shape(torch.nan_to_num(truncated.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "truncated").squeeze(-1).bool()
+
+    raw_masks: Dict[str, torch.Tensor] = {}
+    for name in ("reached_goal", "collision", "oob"):
+        if (mask := _get_termination_term_mask(base_env, name, num_envs)) is not None:
+            raw_masks[name] = mask & done_mask
+
+    time_out_mask = _get_termination_term_mask(base_env, "time_out", num_envs)
+    if time_out_mask is None:
+        raw_masks["time_out"] = truncated_mask & done_mask
+    else:
+        raw_masks["time_out"] = (time_out_mask | truncated_mask) & done_mask
+
+    counts: Dict[str, float] = {}
+    remaining = done_mask.clone()
+
+    # 使用互斥主因统计，保证各终止原因求和恰好等于 done_count。
+    for name in ("reached_goal", "collision", "oob", "time_out"):
+        mask = raw_masks.get(name)
+        if mask is None:
+            continue
+        primary = remaining & mask
+        count = int(primary.sum().item())
+        if count > 0:
+            counts[name] = float(count)
+        remaining &= ~primary
+
+    if remaining.any():
+        counts["other"] = float(remaining.sum().item())
+
+    return counts
+
+def build_termination_ratio_dict(count_dict: Dict[str, float], done_count: int) -> Dict[str, float]:
+    if int(done_count) <= 0 or len(count_dict) == 0:
+        return {}
     denom = max(float(done_count), 1.0)
-    return {k: float(v) / denom for k, v in extract_termination_count_dict(infos).items()}
+    return {k: float(v) / denom for k, v in count_dict.items()}
 
 def extract_prefixed_log_scalars(infos: Any, prefix: str) -> Dict[str, float]:
     return {k: to_float(v) for k, v in extract_log_dict(infos).items() if k.startswith(prefix)}
@@ -416,8 +468,8 @@ class InfoTerminationRatioAccumulator:
     """累积各终止原因的比率统计。"""
     def __init__(self): self.reset()
     def reset(self): self.update_steps, self.sum_ratios, self.last_ratios = 0, {}, {}
-    def update(self, infos, done_count):
-        if int(done_count) <= 0 or len(ratio_dict := extract_termination_ratio_dict(infos, done_count)) == 0: return
+    def update(self, ratio_dict: Dict[str, float]):
+        if len(ratio_dict) == 0: return
         self.update_steps += 1
         for name, value in ratio_dict.items():
             self.sum_ratios[name] = self.sum_ratios.get(name, 0.0) + float(value)
@@ -697,7 +749,12 @@ def main() -> None:
                     aux_window.update(extract_tb_aux_terms(base_env))
                 clear_tb_caches(base_env)
             done_count = int((terminated | truncated).sum().item())
-            termination_ratio_window.update(infos, done_count=done_count)
+            termination_ratio_window.update(
+                build_termination_ratio_dict(
+                    build_primary_termination_count_dict(base_env, terminated=terminated, truncated=truncated),
+                    done_count=done_count,
+                )
+            )
             if done_count > 0:
                 if len(curriculum_log_dict := extract_prefixed_log_scalars(infos, "Curriculum/")) > 0:
                     latest_curriculum_log.update(curriculum_log_dict)
