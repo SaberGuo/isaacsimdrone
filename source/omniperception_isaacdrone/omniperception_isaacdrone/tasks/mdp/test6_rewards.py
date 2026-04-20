@@ -312,8 +312,6 @@ def penalty_lidar_threat(
     safe_dist_ratio: float = 0.16,
     speed_ref: float = 6.0,
     clip: float = 1.0,
-    danger_scale: float = 0.35,
-    danger_power: float = 2.0,
     proximity_boost: bool = True,
     use_grid: bool = True,
     theta_min: float = 30.0,
@@ -324,24 +322,16 @@ def penalty_lidar_threat(
     delta_phi: float = 5.0,
     max_vis_points: int | None = None,
 ) -> torch.Tensor:
-    """纯惩罚型激光雷达威胁项。
+    """梯度型激光雷达威胁项。
 
-    输出仅在靠近障碍物或已经进入危险区时增大，不再对“远离障碍物”给正回报。
-    结果由两部分组成：
-      - approach_penalty: 当前正在靠近障碍物的速度惩罚
-      - danger_penalty: 已进入危险距离后的绝对近障惩罚
-
-    Args:
-        safe_dist: 危险距离阈值 (m)。None 则由 safe_dist_ratio × max_distance 计算。
-        safe_dist_ratio: safe_dist 为 None 时使用的比例。
-        speed_ref: 归一化参考速度 (m/s)。
-        clip: 接近速度项的上限。
+    在危险范围 (min_dist < safe_dist) 内：
+      - 最小距离减小 (靠近障碍物) → 返回正值 → ×负权重 = 负惩罚
+      - 最小距离增大 (远离障碍物) → 返回负值 → ×负权重 = 正奖励
+      - 危险范围外 → 返回 0
     """
 
     clip_val = max(float(clip), 1e-6)
     speed_ref_val = max(float(speed_ref), 1e-6)
-    danger_scale = max(float(danger_scale), 0.0)
-    danger_power = max(float(danger_power), 1.0)
     zeros = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
 
     # ── 获取 lidar 传感器 ──
@@ -395,14 +385,15 @@ def penalty_lidar_threat(
     max_delta = speed_ref_val * dt * 3.0
     delta = torch.clamp(delta, -max_delta, max_delta)
 
-    # 接近速率：仅对“正在靠近障碍物”计罚
-    approach_rate = torch.clamp(-delta / dt, min=0.0)
+    # 接近速率：正值=正在靠近障碍物，负值=正在远离障碍物
+    approach_rate = -delta / dt
     danger = torch.clamp((safe_dist - min_dist) / safe_dist, 0.0, 1.0)
-    approach_penalty = torch.clamp(approach_rate / speed_ref_val, 0.0, clip_val)
+    normalized = torch.clamp(approach_rate / speed_ref_val, -clip_val, clip_val)
     if proximity_boost:
-        approach_penalty = approach_penalty * (1.0 + danger)
-    danger_penalty = danger_scale * danger.pow(danger_power)
-    out = (approach_penalty + danger_penalty).to(torch.float32)
+        out = normalized * danger
+    else:
+        out = normalized * (danger > 0.0).float()
+    out = out.to(torch.float32)
     in_danger = danger > 0.0
 
     # ── 更新 prev 缓存 ──
