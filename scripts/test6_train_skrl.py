@@ -4,6 +4,7 @@ import argparse
 import copy
 import gc
 import inspect
+import json
 import os
 import traceback
 from collections import deque
@@ -590,6 +591,30 @@ def build_action_names(act_dim: int) -> List[str]:
     return list(ACTION_NAMES_4) if int(act_dim) == len(ACTION_NAMES_4) else [f"action_{i}" for i in range(int(act_dim))]
 
 
+def json_dumps_pretty(data: Any) -> str:
+    return json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def write_run_config_snapshot(config_path: Path, args_ns: argparse.Namespace, env_cfg: Any, runtime_meta: Dict[str, Any]) -> None:
+    try:
+        env_cfg_dict = env_cfg.to_dict() if hasattr(env_cfg, "to_dict") else {"_error": "env_cfg has no to_dict()"}
+    except Exception as exc:
+        env_cfg_dict = {"_error": f"Failed to serialize env_cfg: {exc}"}
+    content = "\n".join([
+        "[test6_train_skrl.py args]",
+        json_dumps_pretty(vars(args_ns)),
+        "",
+        "[test6_env_cfg.py resolved_cfg]",
+        json_dumps_pretty(env_cfg_dict),
+        "",
+        "[runtime_meta]",
+        json_dumps_pretty(runtime_meta),
+        "",
+    ])
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(content, encoding="utf-8")
+
+
 def main() -> None:
     print(f"[INFO] task={args.task}, num_envs={args.num_envs}, device={args.device}", flush=True)
     env_cfg = parse_env_cfg(
@@ -679,10 +704,26 @@ def main() -> None:
     exp_dir = log_root / run_name
     tb_dir = exp_dir / args.extra_tb_subdir
     tb_dir.mkdir(parents=True, exist_ok=True)
+    config_path = exp_dir / "config" / "config.txt"
     cfg["experiment"]["directory"] = str(log_root)
     cfg["experiment"]["experiment_name"] = run_name
     cfg["experiment"]["write_interval"] = int(args.tb_interval)
     cfg["experiment"]["checkpoint_interval"] = int(args.checkpoint_interval)
+    write_run_config_snapshot(
+        config_path=config_path,
+        args_ns=args,
+        env_cfg=env_cfg,
+        runtime_meta={
+            "task": str(args.task),
+            "num_envs": int(num_envs),
+            "obs_dim": int(obs_dim),
+            "state_dim": int(state_dim),
+            "lidar_dim": int(lidar_dim),
+            "act_dim": int(act_dim),
+            "step_dt": float(step_dt),
+            "run_name": str(run_name),
+        },
+    )
     writer = SummaryWriter(log_dir=str(tb_dir))
     writer.add_text("run/args", str(vars(args)), 0)
     writer.add_text("run/dims", f"obs={obs_dim}, state={state_dim}, lidar={lidar_dim}, act={act_dim}", 0)
