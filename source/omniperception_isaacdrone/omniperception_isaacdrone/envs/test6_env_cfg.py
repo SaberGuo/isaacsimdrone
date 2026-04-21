@@ -46,12 +46,12 @@ class ObstacleCurriculumSettingsCfg:
     """障碍物课程学习配置。"""
     enabled: bool = True
     # ← 从 OLD 迁移
-    levels: tuple[int, ...] = (0, 5, 10, 20, 30, 50, 100)
+    levels: tuple[int, ...] = (0, 10, 15, 20, 30, 50, 100)
     initial_level: int = 0
     success_term_name: str = "reached_goal"
     success_threshold: float = 0.85
-    success_thresholds: tuple[float, ...] = (0.85, 0.78, 0.72, 0.68, 0.64, 0.60, 0.56)
-    k_roll: int = 4
+    success_thresholds: tuple[float, ...] = (0.85, 0.80, 0.72, 0.68, 0.64, 0.60, 0.56)
+    k_roll: int = 6
     clear_history_on_promotion: bool = True
 
 
@@ -224,11 +224,11 @@ class Test6CurriculumCfg:
         func=my_mdp.update_obstacle_curriculum,
         params={
             # ← 从 OLD 迁移
-            "levels": (0, 5, 10, 20, 30, 50, 100),
+            "levels": (0, 10, 15, 20, 30, 50, 100),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
-            "success_thresholds": (0.85, 0.78, 0.72, 0.68, 0.64, 0.60, 0.56),
-            "k_roll": 4,
+            "success_thresholds": (0.85, 0.80, 0.72, 0.68, 0.64, 0.60, 0.56),
+            "k_roll": 6,
         },
     )
 

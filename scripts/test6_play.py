@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import os
 import traceback
 from pathlib import Path
@@ -28,6 +27,8 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--state_dim", type=int, default=17)
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
+parser.add_argument("--model_cfg_path", type=str, default="")
+parser.add_argument("--model_cfg_json", type=str, default="")
 
 parser.add_argument(
     "--checkpoint",
@@ -88,18 +89,20 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import omniperception_isaacdrone.tasks.test6_registry as _test6_registry  # noqa: F401
 from gymnasium.spaces import Box
 from isaaclab_tasks.utils import parse_env_cfg
 import isaacsim.core.utils.prims as prim_utils
 from pxr import UsdGeom, Gf
 
-# 与训练脚本保持一致：使用 skrl 的 GaussianMixin / DeterministicMixin / Model
-from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
-
 from omniperception_isaacdrone.envs.test6_env import WallSpawner, setup_global_obstacles
+from omniperception_isaacdrone.models import (
+    Policy,
+    find_config_snapshot_for_checkpoint,
+    load_model_cfg_from_snapshot,
+    model_cfg_to_dict,
+    resolve_model_cfg,
+)
 
 # -----------------------------------------------------------------------------
 # Names
@@ -339,200 +342,6 @@ class PlaySpaceAdapter(gym.Wrapper):
 
 
 # -----------------------------------------------------------------------------
-# Model definitions  — 与训练脚本完全一致，保证权重键名匹配
-# -----------------------------------------------------------------------------
-
-def init_hidden(m: nn.Module) -> None:
-    if isinstance(m, (nn.Linear, nn.Conv2d)):
-        nn.init.orthogonal_(m.weight, gain=np.sqrt(2.0))
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0.0)
-    elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
-        if getattr(m, "weight", None) is not None:
-            nn.init.constant_(m.weight, 1.0)
-        if getattr(m, "bias", None) is not None:
-            nn.init.constant_(m.bias, 0.0)
-
-
-def init_policy_head(m: nn.Linear) -> None:
-    nn.init.orthogonal_(m.weight, gain=0.01)
-    if m.bias is not None:
-        nn.init.constant_(m.bias, 0.0)
-
-
-def init_value_head(m: nn.Linear) -> None:
-    nn.init.orthogonal_(m.weight, gain=1.0)
-    if m.bias is not None:
-        nn.init.constant_(m.bias, 0.0)
-
-
-def gaussian_mixin_kwargs() -> dict:
-    kwargs: dict = {"clip_actions": True}
-    if "clip_mean_actions" in inspect.signature(GaussianMixin.__init__).parameters:
-        kwargs["clip_mean_actions"] = True
-    return kwargs
-
-
-class StructuredFeatureExtractor(nn.Module):
-    @staticmethod
-    def _group_norm_groups(num_channels: int) -> int:
-        for groups in (8, 4, 2, 1):
-            if num_channels % groups == 0:
-                return groups
-        return 1
-
-    class LidarConvBlock(nn.Module):
-        def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple[int, int], stride: tuple[int, int]):
-            super().__init__()
-            self.pad_h = kernel_size[0] // 2
-            self.pad_w = kernel_size[1] // 2
-            self.conv = nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=0,
-                bias=False,
-            )
-            self.norm = nn.GroupNorm(
-                num_groups=StructuredFeatureExtractor._group_norm_groups(out_channels),
-                num_channels=out_channels,
-            )
-            self.act = nn.SiLU()
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            if self.pad_w > 0:
-                x = F.pad(x, (self.pad_w, self.pad_w, 0, 0), mode="circular")
-            if self.pad_h > 0:
-                x = F.pad(x, (0, 0, self.pad_h, self.pad_h), mode="replicate")
-            return self.act(self.norm(self.conv(x)))
-
-    class LidarCNNEncoder(nn.Module):
-        def __init__(self, theta_bins: int, phi_bins: int, out_dim: int):
-            super().__init__()
-            self.theta_bins = int(theta_bins)
-            self.phi_bins = int(phi_bins)
-            self.backbone = nn.Sequential(
-                StructuredFeatureExtractor.LidarConvBlock(1, 16, kernel_size=(3, 5), stride=(1, 2)),
-                StructuredFeatureExtractor.LidarConvBlock(16, 32, kernel_size=(3, 5), stride=(1, 2)),
-                StructuredFeatureExtractor.LidarConvBlock(32, 64, kernel_size=(3, 3), stride=(2, 2)),
-            )
-            with torch.no_grad():
-                dummy = torch.zeros(1, 1, self.theta_bins, self.phi_bins, dtype=torch.float32)
-                conv_out = self.backbone(dummy)
-            flat_dim = int(np.prod(conv_out.shape[1:]))
-            self.head = nn.Sequential(
-                nn.Flatten(),
-                nn.LayerNorm(flat_dim),
-                nn.Linear(flat_dim, out_dim),
-                nn.SiLU(),
-                nn.LayerNorm(out_dim),
-            )
-            self.apply(init_hidden)
-
-        def forward(self, lidar_flat: torch.Tensor) -> torch.Tensor:
-            lidar_grid = torch.clamp(lidar_flat, 0.0, 1.0).reshape(-1, 1, self.theta_bins, self.phi_bins)
-            lidar_grid = lidar_grid * 2.0 - 1.0
-            return self.head(self.backbone(lidar_grid))
-
-    def __init__(self, state_dim: int, lidar_dim: int, feat_dim: int = 256, lidar_grid_shape: tuple[int, int] | None = None):
-        super().__init__()
-        self.state_dim = int(state_dim)
-        self.lidar_dim = int(lidar_dim)
-
-        self.state_ln = nn.LayerNorm(self.state_dim)
-        self.state_net = nn.Sequential(
-            nn.Linear(self.state_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, 128),
-            nn.LayerNorm(128),
-            nn.Tanh(),
-        )
-
-        if self.lidar_dim > 0:
-            self.lidar_grid_shape = (
-                tuple(int(v) for v in lidar_grid_shape)
-                if lidar_grid_shape is not None and int(np.prod(lidar_grid_shape)) == self.lidar_dim
-                else None
-            )
-            if self.lidar_grid_shape is not None:
-                self.lidar_encoder = StructuredFeatureExtractor.LidarCNNEncoder(
-                    theta_bins=self.lidar_grid_shape[0],
-                    phi_bins=self.lidar_grid_shape[1],
-                    out_dim=256,
-                )
-            else:
-                self.lidar_encoder = nn.Sequential(
-                    nn.LayerNorm(self.lidar_dim),
-                    nn.Linear(self.lidar_dim, 256),
-                    nn.Tanh(),
-                    nn.Linear(256, 256),
-                    nn.LayerNorm(256),
-                    nn.Tanh(),
-                )
-            fuse_in = 128 + 256
-        else:
-            self.lidar_grid_shape = None
-            self.lidar_encoder = None
-            fuse_in = 128
-
-        self.fuse_net = nn.Sequential(
-            nn.Linear(fuse_in, feat_dim),
-            nn.LayerNorm(feat_dim),
-            nn.Tanh(),
-        )
-        self.apply(init_hidden)
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        state = self.state_net(self.state_ln(torch.clamp(obs[:, :self.state_dim], -1.0, 1.0)))
-        if self.lidar_dim <= 0:
-            return self.fuse_net(state)
-        lidar = obs[:, self.state_dim:self.state_dim + self.lidar_dim]
-        lidar_feat = self.lidar_encoder(lidar)
-        return self.fuse_net(torch.cat([state, lidar_feat], dim=-1))
-
-
-class Policy(GaussianMixin, Model):
-    """与训练脚本中的 Policy 类完全一致，保证 state_dict 键名匹配。"""
-
-    def __init__(self, observation_space, action_space, device, state_dim, lidar_dim, feat_dim=256, lidar_grid_shape: tuple[int, int] | None = None):
-        Model.__init__(self, observation_space, action_space, device)
-        GaussianMixin.__init__(self, **gaussian_mixin_kwargs())
-        if self.num_observations != state_dim + lidar_dim:
-            raise RuntimeError(
-                f"obs dim mismatch: model expects {state_dim + lidar_dim}, "
-                f"got {self.num_observations}"
-            )
-        self.fe = StructuredFeatureExtractor(state_dim, lidar_dim, feat_dim, lidar_grid_shape=lidar_grid_shape)
-        self.mean = nn.Linear(feat_dim, self.num_actions)
-        self.log_std_parameter = nn.Parameter(torch.full((self.num_actions,), -1.0))
-        init_policy_head(self.mean)
-
-    def compute(self, inputs, role):
-        mean    = torch.tanh(self.mean(self.fe(inputs["states"])))
-        log_std = torch.clamp(self.log_std_parameter, min=-5.0, max=0.0).expand_as(mean)
-        return mean, log_std, {}
-
-    # ------------------------------------------------------------------
-    # 推理接口：deterministic → mean；stochastic → 从高斯分布采样
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def play_act(self, obs: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
-        """
-        obs: (num_envs, obs_dim) tensor already on the correct device.
-        返回 clamp 后的 action tensor，shape (num_envs, act_dim)。
-        """
-        inputs = {"states": obs}
-        mean, log_std, _ = self.compute(inputs, role="policy")
-        if deterministic:
-            action = mean
-        else:
-            std    = torch.exp(log_std)
-            action = mean + std * torch.randn_like(std)
-        return torch.clamp(action, -1.0, 1.0)
-
-
-# -----------------------------------------------------------------------------
 # Space / name utilities
 # -----------------------------------------------------------------------------
 
@@ -641,6 +450,28 @@ def load_policy_checkpoint(
             "This usually means test6_play.py and the training-time feature extractor are not aligned."
         ) from exc
     print("[INFO] Policy checkpoint loaded successfully.", flush=True)
+
+
+def resolve_play_model_cfg(
+    *,
+    checkpoint_path: Path,
+    feat_dim: int,
+    lidar_grid_shape: tuple[int, int] | None,
+) -> tuple[Any, dict[str, Any], Path | None]:
+    snapshot_path = find_config_snapshot_for_checkpoint(checkpoint_path)
+    snapshot_model_cfg = None
+    if snapshot_path is not None:
+        snapshot_model_cfg = load_model_cfg_from_snapshot(snapshot_path)
+        if snapshot_model_cfg is not None:
+            print(f"[INFO] Loaded model_cfg snapshot: {snapshot_path}", flush=True)
+    model_cfg = resolve_model_cfg(
+        feat_dim=int(feat_dim),
+        lidar_grid_shape=lidar_grid_shape,
+        model_cfg_path=args.model_cfg_path or None,
+        model_cfg_json=args.model_cfg_json or None,
+        base_model_cfg=snapshot_model_cfg,
+    )
+    return model_cfg, model_cfg_to_dict(model_cfg), snapshot_path
 
 
 # -----------------------------------------------------------------------------
@@ -806,12 +637,33 @@ def main() -> None:
     num_envs = int(getattr(env, "num_envs", args.num_envs))
     device   = torch.device(getattr(env, "device", args.device))
 
+    script_dir = Path(__file__).resolve().parent
+    project_dir = script_dir.parent
+    log_root = project_dir / "logs"
+
+    if args.checkpoint.strip():
+        checkpoint_path = Path(args.checkpoint).expanduser().resolve()
+    else:
+        checkpoint_path = find_latest_checkpoint(log_root)
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    model_cfg, model_cfg_dict, snapshot_path = resolve_play_model_cfg(
+        checkpoint_path=checkpoint_path,
+        feat_dim=int(args.feat_dim),
+        lidar_grid_shape=lidar_grid_shape,
+    )
+
     print(
         f"[INFO] play spaces -> obs={obs_dim} (state={state_dim}, lidar={lidar_dim}), "
-        f"act={act_dim}, grid={lidar_grid_shape}, encoder={'cnn' if lidar_grid_shape is not None else 'mlp'}",
+        f"act={act_dim}, grid={model_cfg.lidar_encoder.grid_shape}, encoder={model_cfg.lidar_encoder.type}",
         flush=True,
     )
+    if snapshot_path is None:
+        print("[INFO] No config snapshot found for checkpoint; using default/CLI model_cfg.", flush=True)
     print(f"[INFO] num_envs={num_envs}, device={device}", flush=True)
+    print(f"[INFO] model_cfg={model_cfg_dict}", flush=True)
 
     # ------------------------------------------------------------------
     # 构建策略网络（与训练脚本 Policy 完全一致）
@@ -824,24 +676,10 @@ def main() -> None:
         lidar_dim=lidar_dim,
         feat_dim=args.feat_dim,
         lidar_grid_shape=lidar_grid_shape,
+        model_cfg=model_cfg,
     )
     policy.to(device)
     policy.eval()
-
-    # ------------------------------------------------------------------
-    # 加载 checkpoint
-    # ------------------------------------------------------------------
-    script_dir = Path(__file__).resolve().parent
-    project_dir = script_dir.parent
-    log_root = project_dir / "logs"
-
-    if args.checkpoint.strip():
-        checkpoint_path = Path(args.checkpoint).expanduser().resolve()
-    else:
-        checkpoint_path = find_latest_checkpoint(log_root)
-
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     load_policy_checkpoint(policy, checkpoint_path, device=device)
 
