@@ -22,9 +22,9 @@ os.environ.setdefault(
 parser = argparse.ArgumentParser("Stable skrl PPO trainer for IsaacLab drone lidar task")
 parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lidar-v0")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
-parser.add_argument("--num_envs", type=int, default=32)
+parser.add_argument("--num_envs", type=int, default=128)
 parser.add_argument("--num_obstacles", type=int, default=100)
-parser.add_argument("--timesteps", type=int, default=2_000_000)
+parser.add_argument("--timesteps", type=int, default=10_000_000)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--state_dim", type=int, default=17)
 parser.add_argument("--lidar_dim", type=int, default=432)
@@ -32,14 +32,14 @@ parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--rollouts", type=int, default=256)
 parser.add_argument("--learning_epochs", type=int, default=8)
 parser.add_argument("--mini_batches", type=int, default=8)
-parser.add_argument("--learning_rate", type=float, default=3e-5)
+parser.add_argument("--learning_rate", type=float, default=1e-4)
 parser.add_argument("--_lambda", type=float, default=0.97)
 parser.add_argument("--discount_factor", type=float, default=0.99)
 parser.add_argument("--ratio_clip", type=float, default=0.2)
 parser.add_argument("--value_clip", type=float, default=0.2)
 parser.add_argument("--value_loss_scale", type=float, default=0.5)
 parser.add_argument("--grad_norm_clip", type=float, default=1.0)
-parser.add_argument("--entropy_coef", type=float, default=1e-2)
+parser.add_argument("--entropy_coef", type=float, default=1.5e-2)
 parser.add_argument("--kl_threshold", type=float, default=0.01)
 parser.add_argument("--clip_predicted_values", action="store_true")
 parser.add_argument("--no_clip_predicted_values", dest="clip_predicted_values", action="store_false")
@@ -71,6 +71,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import omniperception_isaacdrone.tasks.test6_registry as _test6_registry  # noqa: F401
 from gymnasium.spaces import Box
 from isaaclab_tasks.utils import parse_env_cfg
@@ -169,10 +170,15 @@ def print_space_bounds(name: str, space: gym.Space) -> None:
     print(f"\n[SPACE] {name}: type={type(space).__name__}", flush=True)
 
 def init_hidden(m: nn.Module) -> None:
-    """正交初始化线性层权重。"""
-    if isinstance(m, nn.Linear):
+    """正交初始化线性/卷积层，并规范化归一化层参数。"""
+    if isinstance(m, (nn.Linear, nn.Conv2d)):
         nn.init.orthogonal_(m.weight, gain=np.sqrt(2.0))
         if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
+    elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
+        if getattr(m, "weight", None) is not None:
+            nn.init.constant_(m.weight, 1.0)
+        if getattr(m, "bias", None) is not None:
             nn.init.constant_(m.bias, 0.0)
 
 def init_policy_head(m: nn.Linear) -> None:
@@ -262,6 +268,28 @@ def get_state_lidar_dims(base_env: Any, obs_dim: int) -> tuple[int, int]:
     norm_cfg = getattr(getattr(base_env, "cfg", None), "normalization", None)
     state_dim = int(getattr(norm_cfg, "state_dim", args.state_dim))
     return state_dim, obs_dim - state_dim
+
+
+def infer_lidar_grid_shape(base_env: Any, lidar_dim: int) -> tuple[int, int] | None:
+    if int(lidar_dim) <= 0:
+        return None
+    try:
+        obs_cfg = getattr(getattr(getattr(base_env, "cfg", None), "observations", None), "policy", None)
+        lidar_term = getattr(obs_cfg, "lidar_grid", None)
+        params = getattr(lidar_term, "params", None) or {}
+        theta_min = float(params["theta_min"])
+        theta_max = float(params["theta_max"])
+        delta_theta = float(params["delta_theta"])
+        phi_min = float(params["phi_min"])
+        phi_max = float(params["phi_max"])
+        delta_phi = float(params["delta_phi"])
+        theta_bins = max(int(round((theta_max - theta_min) / delta_theta)), 1)
+        phi_bins = max(int(round((phi_max - phi_min) / delta_phi)), 1)
+        if theta_bins * phi_bins == int(lidar_dim):
+            return theta_bins, phi_bins
+    except Exception:
+        pass
+    return None
 
 def build_skrl_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int, int, gym.spaces.Dict, Box]:
     num_envs = int(getattr(base_env, "num_envs", 1))
@@ -535,21 +563,117 @@ def log_gradients(writer, models, step, max_samples):
 
 class StructuredFeatureExtractor(nn.Module):
     """分别提取状态和激光雷达特征后融合。"""
-    def __init__(self, state_dim, lidar_dim, feat_dim=256):
+
+    @staticmethod
+    def _group_norm_groups(num_channels: int) -> int:
+        for groups in (8, 4, 2, 1):
+            if num_channels % groups == 0:
+                return groups
+        return 1
+
+    class LidarConvBlock(nn.Module):
+        def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple[int, int], stride: tuple[int, int]):
+            super().__init__()
+            self.pad_h = kernel_size[0] // 2
+            self.pad_w = kernel_size[1] // 2
+            self.conv = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=0,
+                bias=False,
+            )
+            self.norm = nn.GroupNorm(
+                num_groups=StructuredFeatureExtractor._group_norm_groups(out_channels),
+                num_channels=out_channels,
+            )
+            self.act = nn.SiLU()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            if self.pad_w > 0:
+                x = F.pad(x, (self.pad_w, self.pad_w, 0, 0), mode="circular")
+            if self.pad_h > 0:
+                x = F.pad(x, (0, 0, self.pad_h, self.pad_h), mode="replicate")
+            return self.act(self.norm(self.conv(x)))
+
+    class LidarCNNEncoder(nn.Module):
+        def __init__(self, theta_bins: int, phi_bins: int, out_dim: int):
+            super().__init__()
+            self.theta_bins = int(theta_bins)
+            self.phi_bins = int(phi_bins)
+            self.backbone = nn.Sequential(
+                StructuredFeatureExtractor.LidarConvBlock(1, 16, kernel_size=(3, 5), stride=(1, 2)),
+                StructuredFeatureExtractor.LidarConvBlock(16, 32, kernel_size=(3, 5), stride=(1, 2)),
+                StructuredFeatureExtractor.LidarConvBlock(32, 64, kernel_size=(3, 3), stride=(2, 2)),
+            )
+            with torch.no_grad():
+                dummy = torch.zeros(1, 1, self.theta_bins, self.phi_bins, dtype=torch.float32)
+                conv_out = self.backbone(dummy)
+            flat_dim = int(np.prod(conv_out.shape[1:]))
+            self.head = nn.Sequential(
+                nn.Flatten(),
+                nn.LayerNorm(flat_dim),
+                nn.Linear(flat_dim, out_dim),
+                nn.SiLU(),
+                nn.LayerNorm(out_dim),
+            )
+            self.apply(init_hidden)
+
+        def forward(self, lidar_flat: torch.Tensor) -> torch.Tensor:
+            lidar_grid = torch.clamp(lidar_flat, 0.0, 1.0).reshape(-1, 1, self.theta_bins, self.phi_bins)
+            lidar_grid = lidar_grid * 2.0 - 1.0
+            return self.head(self.backbone(lidar_grid))
+
+    def __init__(self, state_dim, lidar_dim, feat_dim=256, lidar_grid_shape: tuple[int, int] | None = None):
         super().__init__()
         self.state_dim, self.lidar_dim = int(state_dim), int(lidar_dim)
-        self.state_ln, self.state_net = nn.LayerNorm(self.state_dim), nn.Sequential(nn.Linear(self.state_dim, 128), nn.Tanh(), nn.Linear(128, 128), nn.Tanh())
+        self.state_ln = nn.LayerNorm(self.state_dim)
+        self.state_net = nn.Sequential(
+            nn.Linear(self.state_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 128),
+            nn.LayerNorm(128),
+            nn.Tanh(),
+        )
         if self.lidar_dim > 0:
-            self.lidar_ln, self.lidar_net = nn.LayerNorm(self.lidar_dim), nn.Sequential(nn.Linear(self.lidar_dim, 256), nn.Tanh(), nn.Linear(256, 256), nn.Tanh())
+            self.lidar_grid_shape = (
+                tuple(int(v) for v in lidar_grid_shape)
+                if lidar_grid_shape is not None and int(np.prod(lidar_grid_shape)) == self.lidar_dim
+                else None
+            )
+            if self.lidar_grid_shape is not None:
+                self.lidar_encoder = StructuredFeatureExtractor.LidarCNNEncoder(
+                    theta_bins=self.lidar_grid_shape[0],
+                    phi_bins=self.lidar_grid_shape[1],
+                    out_dim=256,
+                )
+            else:
+                self.lidar_encoder = nn.Sequential(
+                    nn.LayerNorm(self.lidar_dim),
+                    nn.Linear(self.lidar_dim, 256),
+                    nn.Tanh(),
+                    nn.Linear(256, 256),
+                    nn.LayerNorm(256),
+                    nn.Tanh(),
+                )
             fuse_in = 128 + 256
         else:
-            self.lidar_ln, self.lidar_net, fuse_in = nn.Identity(), None, 128
-        self.fuse_net = nn.Sequential(nn.Linear(fuse_in, feat_dim), nn.Tanh())
+            self.lidar_grid_shape, self.lidar_encoder, fuse_in = None, None, 128
+        self.fuse_net = nn.Sequential(
+            nn.Linear(fuse_in, feat_dim),
+            nn.LayerNorm(feat_dim),
+            nn.Tanh(),
+        )
         self.apply(init_hidden)
+
     def forward(self, obs):
         state = self.state_net(self.state_ln(torch.clamp(obs[:, :self.state_dim], -1.0, 1.0)))
-        if self.lidar_dim <= 0: return self.fuse_net(state)
-        return self.fuse_net(torch.cat([state, self.lidar_net(self.lidar_ln(torch.clamp(obs[:, self.state_dim:self.state_dim + self.lidar_dim], 0.0, 1.0) * 2.0 - 1.0))], dim=-1))
+        if self.lidar_dim <= 0:
+            return self.fuse_net(state)
+        lidar = obs[:, self.state_dim:self.state_dim + self.lidar_dim]
+        lidar_feat = self.lidar_encoder(lidar)
+        return self.fuse_net(torch.cat([state, lidar_feat], dim=-1))
 
 
 def gaussian_mixin_kwargs():
@@ -560,11 +684,11 @@ def gaussian_mixin_kwargs():
 
 class Policy(GaussianMixin, Model):
     """PPO 策略网络。"""
-    def __init__(self, observation_space, action_space, device, state_dim, lidar_dim, feat_dim=256):
+    def __init__(self, observation_space, action_space, device, state_dim, lidar_dim, feat_dim=256, lidar_grid_shape: tuple[int, int] | None = None):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(self, **gaussian_mixin_kwargs())
         if self.num_observations != state_dim + lidar_dim: raise RuntimeError("obs dim mismatch")
-        self.fe, self.mean = StructuredFeatureExtractor(state_dim, lidar_dim, feat_dim), nn.Linear(feat_dim, self.num_actions)
+        self.fe, self.mean = StructuredFeatureExtractor(state_dim, lidar_dim, feat_dim, lidar_grid_shape=lidar_grid_shape), nn.Linear(feat_dim, self.num_actions)
         self.log_std_parameter = nn.Parameter(torch.full((self.num_actions,), -1.0))
         init_policy_head(self.mean)
     def compute(self, inputs, role):
@@ -574,11 +698,11 @@ class Policy(GaussianMixin, Model):
 
 class Value(DeterministicMixin, Model):
     """PPO 价值网络。"""
-    def __init__(self, observation_space, action_space, device, state_dim, lidar_dim, feat_dim=256):
+    def __init__(self, observation_space, action_space, device, state_dim, lidar_dim, feat_dim=256, lidar_grid_shape: tuple[int, int] | None = None):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self)
         if self.num_observations != state_dim + lidar_dim: raise RuntimeError("obs dim mismatch")
-        self.fe, self.value = StructuredFeatureExtractor(state_dim, lidar_dim, feat_dim), nn.Linear(feat_dim, 1)
+        self.fe, self.value = StructuredFeatureExtractor(state_dim, lidar_dim, feat_dim, lidar_grid_shape=lidar_grid_shape), nn.Linear(feat_dim, 1)
         init_value_head(self.value)
     def compute(self, inputs, role):
         return self.value(self.fe(inputs["states"])), {}
@@ -672,15 +796,17 @@ def main() -> None:
         raise RuntimeError("policy observation space not found")
     obs_dim_raw = int(np.prod(policy_space.shape))
     state_dim, lidar_dim = get_state_lidar_dims(base_env, obs_dim_raw)
+    lidar_grid_shape = infer_lidar_grid_shape(base_env, lidar_dim)
     obs_dim, act_dim, obs_space, act_space = build_skrl_spaces(base_env, state_dim, lidar_dim)
     adapted_env = SkrlSpaceAdapter(base_env, obs_space=obs_space, act_space=act_space, state_dim=state_dim, lidar_dim=lidar_dim)
     env = wrap_env(adapted_env, wrapper="isaaclab")
     num_envs = int(getattr(env, "num_envs", args.num_envs))
     device = torch.device(getattr(env, "device", args.device))
     step_dt = get_env_step_dt(base_env)
+    print(f"[INFO] lidar_grid_shape={lidar_grid_shape}", flush=True)
     models = {
-        "policy": Policy(obs_space, act_space, device, state_dim, lidar_dim, args.feat_dim),
-        "value": Value(obs_space, act_space, device, state_dim, lidar_dim, args.feat_dim),
+        "policy": Policy(obs_space, act_space, device, state_dim, lidar_dim, args.feat_dim, lidar_grid_shape=lidar_grid_shape),
+        "value": Value(obs_space, act_space, device, state_dim, lidar_dim, args.feat_dim, lidar_grid_shape=lidar_grid_shape),
     }
     cfg = copy.deepcopy(PPO_DEFAULT_CONFIG)
     cfg["rollouts"] = int(args.rollouts)
@@ -719,6 +845,8 @@ def main() -> None:
             "obs_dim": int(obs_dim),
             "state_dim": int(state_dim),
             "lidar_dim": int(lidar_dim),
+            "lidar_grid_shape": list(lidar_grid_shape) if lidar_grid_shape is not None else None,
+            "lidar_encoder": "cnn" if lidar_grid_shape is not None else "mlp",
             "act_dim": int(act_dim),
             "step_dt": float(step_dt),
             "run_name": str(run_name),
@@ -726,7 +854,11 @@ def main() -> None:
     )
     writer = SummaryWriter(log_dir=str(tb_dir))
     writer.add_text("run/args", str(vars(args)), 0)
-    writer.add_text("run/dims", f"obs={obs_dim}, state={state_dim}, lidar={lidar_dim}, act={act_dim}", 0)
+    writer.add_text(
+        "run/dims",
+        f"obs={obs_dim}, state={state_dim}, lidar={lidar_dim}, act={act_dim}, grid={lidar_grid_shape}, encoder={'cnn' if lidar_grid_shape is not None else 'mlp'}",
+        0,
+    )
     writer.add_text("run/step_dt", f"{step_dt:.8f}", 0)
     memory = RandomMemory(memory_size=int(args.rollouts), num_envs=num_envs, device=device)
     agent = PPO(
