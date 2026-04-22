@@ -113,8 +113,8 @@ class LeePositionController(nn.Module):
         self.requires_grad_(False)
 
     def process_rl_actions(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        target_vel, target_yaw = actions.split([3, 1], dim=-1)
-        return target_vel, target_yaw * torch.pi
+        target_vel, target_yaw_rate = actions.split([3, 1], dim=-1)
+        return target_vel, target_yaw_rate
 
     def compute(
         self,
@@ -122,7 +122,7 @@ class LeePositionController(nn.Module):
         target_pos: torch.Tensor | None = None,
         target_vel: torch.Tensor | None = None,
         target_acc: torch.Tensor | None = None,
-        target_yaw: torch.Tensor | None = None,
+        target_yaw_rate: torch.Tensor | None = None,
         body_rate: bool = False,
     ) -> torch.Tensor:
         batch_shape = root_state.shape[:-1]
@@ -143,19 +143,19 @@ class LeePositionController(nn.Module):
         else:
             target_acc = target_acc.expand(batch_shape + (3,))
 
-        if target_yaw is None:
-            target_yaw = _quat_to_yaw_wxyz(root_state[..., 3:7]).unsqueeze(-1)
+        if target_yaw_rate is None:
+            target_yaw_rate = torch.zeros(*batch_shape, 1, device=device)
         else:
-            if target_yaw.shape[-1] != 1:
-                target_yaw = target_yaw.unsqueeze(-1)
-            target_yaw = target_yaw.expand(batch_shape + (1,))
+            if target_yaw_rate.shape[-1] != 1:
+                target_yaw_rate = target_yaw_rate.unsqueeze(-1)
+            target_yaw_rate = target_yaw_rate.expand(batch_shape + (1,))
 
         cmd = self._compute(
             root_state.reshape(-1, 13),
             target_pos.reshape(-1, 3),
             target_vel.reshape(-1, 3),
             target_acc.reshape(-1, 3),
-            target_yaw.reshape(-1, 1),
+            target_yaw_rate.reshape(-1, 1),
             body_rate,
         )
         return cmd.reshape(*batch_shape, -1)
@@ -166,7 +166,7 @@ class LeePositionController(nn.Module):
         target_pos: torch.Tensor,
         target_vel: torch.Tensor,
         target_acc: torch.Tensor,
-        target_yaw: torch.Tensor,
+        target_yaw_rate: torch.Tensor,
         body_rate: bool,
     ) -> torch.Tensor:
         pos, rot, vel, ang_vel = torch.split(root_state, [3, 4, 3, 3], dim=-1)
@@ -179,11 +179,12 @@ class LeePositionController(nn.Module):
         acc = pos_error * self.pos_gain + vel_error * self.vel_gain - self.g - target_acc
 
         r = quat_to_rotmat_wxyz(rot)
+        current_yaw = _quat_to_yaw_wxyz(rot).unsqueeze(-1)
         b1_des = torch.cat(
             [
-                torch.cos(target_yaw),
-                torch.sin(target_yaw),
-                torch.zeros_like(target_yaw),
+                torch.cos(current_yaw),
+                torch.sin(current_yaw),
+                torch.zeros_like(current_yaw),
             ],
             dim=-1,
         )
@@ -210,7 +211,12 @@ class LeePositionController(nn.Module):
             dim=-1,
         )
 
-        ang_rate_err = ang_vel
+        angular_rate_des = torch.zeros_like(ang_vel)
+        angular_rate_des[:, 2] = target_yaw_rate.squeeze(1)
+        ang_rate_err = ang_vel - torch.bmm(
+            torch.bmm(r_des.transpose(-2, -1), r),
+            angular_rate_des.unsqueeze(2),
+        ).squeeze(2)
         ang_acc = -ang_error * self.attitute_gain - ang_rate_err * self.ang_rate_gain + torch.linalg.cross(
             ang_vel, ang_vel
         )

@@ -8,7 +8,7 @@ import torch
 import isaaclab.envs.mdp as mdp
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_apply_inverse, quat_inv, quat_mul, quat_unique, yaw_quat
+from isaaclab.utils.math import quat_apply_inverse, quat_unique
 
 
 # =============================================================================
@@ -189,14 +189,11 @@ def obs_root_pos_z_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> to
 
 
 def obs_root_quat_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    # 根节点姿态归一化：移除绝对偏航，仅保留与机体系相关的倾斜姿态
+    # 根节点姿态归一化：保留完整绝对姿态（包含 yaw）
     quat = mdp.root_quat_w(env, asset_cfg=asset_cfg).to(torch.float32)
-    quat_tilt = quat_mul(quat_inv(yaw_quat(quat)), quat)
-
     if _get_quat_hemisphere(env):
-        quat_tilt = quat_unique(quat_tilt)
-
-    return _clamp_m11(quat_tilt)
+        quat = quat_unique(quat)
+    return _clamp_m11(quat)
 
 
 def obs_root_lin_vel_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:

@@ -94,7 +94,7 @@ from omniperception_isaacdrone.envs.test6_env import WallSpawner, setup_global_o
 from omniperception_isaacdrone.models import Policy, Value, model_cfg_to_dict, resolve_model_cfg
 
 STATE_OBS_NAMES_17 = [
-    "root_pos_z", "tilt_quat_w", "tilt_quat_x", "tilt_quat_y", "tilt_quat_z",
+    "root_pos_z", "root_quat_w", "root_quat_x", "root_quat_y", "root_quat_z",
     "root_lin_vel_x", "root_lin_vel_y", "root_lin_vel_z",
     "root_ang_vel_x", "root_ang_vel_y", "root_ang_vel_z",
     "projected_gravity_x", "projected_gravity_y", "projected_gravity_z",

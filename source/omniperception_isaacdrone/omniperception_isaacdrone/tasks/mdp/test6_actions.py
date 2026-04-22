@@ -27,9 +27,9 @@ def _get_step_dt(env: ManagerBasedRLEnv) -> float:
 class RootTwistVelocityActionTerm(ActionTerm):
     """OmniPerception-style controller + actuator chain.
 
-    4D action: [vx_cmd, vy_cmd, vz_cmd, yaw_cmd]
+    4D action: [vx_cmd, vy_cmd, vz_cmd, yaw_rate_cmd]
       - velocity command is mapped to target velocity in world frame
-      - yaw command is mapped to target yaw angle in [-pi, pi]
+      - yaw rate command is mapped to target yaw rate in rad/s
 
     Pipeline:
       rl action -> LeePositionController (rotor cmds) -> RotorGroup -> body wrench
@@ -51,7 +51,8 @@ class RootTwistVelocityActionTerm(ActionTerm):
 
         self._vel_scale = float(p_get("vel_scale", 1.0))
         self._vel_clip = float(p_get("vel_clip", 6.0))
-        self._yaw_clip = float(p_get("yaw_clip", 1.0))
+        self._yaw_rate_scale = float(p_get("yaw_rate_scale", 1.0))
+        self._yaw_rate_clip = float(p_get("yaw_rate_clip", self._yaw_rate_scale))
         self._thrust_sign = float(p_get("thrust_sign", 1.0))
         self._g = float(p_get("g", 9.81))
         self._debug_print = bool(p_get("debug_print", False))
@@ -131,21 +132,23 @@ class RootTwistVelocityActionTerm(ActionTerm):
         if self._vel_clip > 0.0:
             target_vel = torch.clamp(target_vel, -self._vel_clip, self._vel_clip)
 
-        target_yaw = torch.clamp(actions[:, 3:4], -self._yaw_clip, self._yaw_clip)
+        target_yaw_rate = actions[:, 3:4] * self._yaw_rate_scale
+        if self._yaw_rate_clip > 0.0:
+            target_yaw_rate = torch.clamp(target_yaw_rate, -self._yaw_rate_clip, self._yaw_rate_clip)
 
         self._processed_actions[:, 0:3] = target_vel
-        self._processed_actions[:, 3:4] = target_yaw
+        self._processed_actions[:, 3:4] = target_yaw_rate
 
     def apply_actions(self):
         root = self._asset.data.root_link_state_w
 
-        target_vel, target_yaw = self._controller.process_rl_actions(self._processed_actions)
+        target_vel, target_yaw_rate = self._controller.process_rl_actions(self._processed_actions)
         rotor_cmds = self._controller.compute(
             root_state=root,
             target_pos=None,
             target_vel=target_vel,
             target_acc=None,
-            target_yaw=target_yaw,
+            target_yaw_rate=target_yaw_rate,
             body_rate=False,
         )
         rotor_cmds = torch.clamp(rotor_cmds, -1.0, 1.0)
