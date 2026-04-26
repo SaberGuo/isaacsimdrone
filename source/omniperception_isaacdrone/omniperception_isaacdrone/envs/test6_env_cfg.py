@@ -198,14 +198,15 @@ class Test6RewardsCfg:
     vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=0.8, params={})
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=1.0, params={})
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.005, params={})
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-16.0, params={})
-    safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-4.0, params={})
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-24.0, params={})
+    safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-8.0, params={})
     energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.002, params={})
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.0005)
-    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=10.0, params={})
-    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-15.0, params={})
-    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-10.0, params={})
-    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-5.0, params={})
+    # IsaacLab RewardManager 会额外乘以 dt=1/60；这里按“单次事件”目标值反推权重。
+    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=600.0, params={})
+    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-900.0, params={})
+    oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-600.0, params={})
+    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-300.0, params={})
 
 
 @configclass
@@ -333,9 +334,9 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "clip": 1.0,
             "proximity_boost": True,
             "use_grid": True,
-            # 只在横向障碍带上做惩罚，避免地板/天花板长期主导安全奖励。
-            "theta_min": 75.0,
-            "theta_max": 105.0,
+            # 与 policy LiDAR observation 使用同一角域，避免观测和避障奖励不一致。
+            "theta_min": 30.0,
+            "theta_max": 90.0,
             "phi_min": 0.0,
             "phi_max": 360.0,
             "delta_theta": 10.0,
@@ -348,8 +349,8 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "safe_dist": 8.0,
             "margin": 2.5,
             "front_cos_threshold": 0.70,
-            "theta_min": 75.0,
-            "theta_max": 105.0,
+            "theta_min": 30.0,
+            "theta_max": 90.0,
             "phi_min": 0.0,
             "phi_max": 360.0,
             "delta_theta": 10.0,
