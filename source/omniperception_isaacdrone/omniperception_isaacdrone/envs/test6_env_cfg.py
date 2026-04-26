@@ -37,8 +37,9 @@ class NormalizationCfg:
     z_bounds: tuple[float, float] = (0.0, 10.0)
     lin_vel_max: float = 6.0
     ang_vel_max: float = 31.4
+    goal_distance_max: float = 80.0
     quat_hemisphere: bool = True
-    state_dim: int = 17
+    state_dim: int = 18
 
 
 @configclass
@@ -141,7 +142,7 @@ class Test6ObservationsCfg:
         root_lin_vel = ObsTerm(func=my_mdp.obs_root_lin_vel_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         root_ang_vel = ObsTerm(func=my_mdp.obs_root_ang_vel_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         projected_gravity = ObsTerm(func=my_mdp.obs_projected_gravity_norm, params={"asset_cfg": SceneEntityCfg("robot")})
-        goal_delta = ObsTerm(func=my_mdp.obs_goal_delta_norm, params={"asset_cfg": SceneEntityCfg("robot")})
+        goal_dir_dist = ObsTerm(func=my_mdp.obs_goal_dir_dist_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         lidar_grid = ObsTerm(
             func=my_mdp.obs_lidar_min_range_grid,
             params=dict(
@@ -265,6 +266,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.normalization.x_bounds = WORKSPACE_X
         self.normalization.y_bounds = WORKSPACE_Y
         self.normalization.z_bounds = WORKSPACE_Z
+        self.normalization.goal_distance_max = 80.0
         # ← 保留 NEW：新控制器参数体系
         self.actions.root_twist.params = {
             "uav_params": DRONE_PARAMS,
@@ -325,12 +327,12 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "use_relu": True,
         }
         self.rewards.lidar_threat.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
             "lidar_name": "lidar",
-            "safe_dist": None,
-            "safe_dist_ratio": 0.18,
-            "speed_ref": 6.0,
-            "clip": 1.0,
-            "proximity_boost": True,
+            "crash_distance": 0.6,
+            "acc_max": 5.0,
+            "use_horizontal_speed": True,
+            "exp_clip": 1.0,
             "use_grid": True,
             # 只用近水平碰撞带计算避障奖励，避免顶部/底部边界长期主导安全信号。
             "theta_min": 75.0,

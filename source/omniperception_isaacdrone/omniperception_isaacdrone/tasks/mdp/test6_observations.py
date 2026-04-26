@@ -80,6 +80,20 @@ def _get_vmax_wmax(env: ManagerBasedRLEnv) -> Tuple[float, float]:
     return 5.0, 10.0
 
 
+def _get_goal_distance_max(env: ManagerBasedRLEnv) -> float:
+    norm = _get_cfg_obj(env, ("normalization", "obs_norm", "obs_normalization"))
+    if norm is not None:
+        goal_distance_max = getattr(norm, "goal_distance_max", None)
+        if goal_distance_max is not None:
+            return max(_safe_float(goal_distance_max, 80.0), 1e-6)
+
+    xb, yb, zb = _get_workspace_bounds(env)
+    dx = float(xb[1]) - float(xb[0])
+    dy = float(yb[1]) - float(yb[0])
+    dz = float(zb[1]) - float(zb[0])
+    return max(math.sqrt(dx * dx + dy * dy + dz * dz), 1e-6)
+
+
 def _get_quat_hemisphere(env: ManagerBasedRLEnv) -> bool:
     norm = _get_cfg_obj(env, ("normalization", "obs_norm", "obs_normalization"))
     if norm is None:
@@ -234,6 +248,29 @@ def obs_goal_delta_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> to
     return _clamp_m11(out)
 
 
+def obs_goal_dir_dist_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    # AirSim 风格目标观测：环境坐标系单位方向 + 归一化距离。
+    # mdp.root_pos_w 返回 environment frame 位置；goal_pos_w 在 reset 中也按同一坐标写入。
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg).to(torch.float32)
+    goal = getattr(env, "goal_pos_w", None)
+
+    if goal is None:
+        return torch.zeros((pos.shape[0], 4), device=pos.device, dtype=torch.float32)
+
+    goal = goal.to(device=pos.device, dtype=torch.float32)
+    if goal.shape[0] == 1 and pos.shape[0] > 1:
+        goal = goal.expand(pos.shape[0], 3)
+    elif goal.shape[0] != pos.shape[0]:
+        goal = goal[:1].expand(pos.shape[0], 3)
+
+    delta = goal - pos
+    dist = torch.linalg.norm(delta, dim=-1, keepdim=True)
+    unit_dir = torch.where(dist > 1e-6, delta / torch.clamp(dist, min=1e-6), torch.zeros_like(delta))
+    dist_norm = torch.clamp(dist / _get_goal_distance_max(env), 0.0, 1.0)
+
+    return torch.cat([_clamp_m11(unit_dir), dist_norm], dim=-1)
+
+
 def obs_state_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     # 拼接完整的无人机观测状态向量
     z = obs_root_pos_z_norm(env, asset_cfg)
@@ -241,7 +278,7 @@ def obs_state_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.T
     v = obs_root_lin_vel_norm(env, asset_cfg)
     w = obs_root_ang_vel_norm(env, asset_cfg)
     g = obs_projected_gravity_norm(env, asset_cfg)
-    d = obs_goal_delta_norm(env, asset_cfg)
+    d = obs_goal_dir_dist_norm(env, asset_cfg)
     return torch.cat([z, q, v, w, g, d], dim=-1)
 
 

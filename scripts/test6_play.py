@@ -24,7 +24,7 @@ parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--num_obstacles", type=int, default=20)
 parser.add_argument("--seed", type=int, default=42)
 
-parser.add_argument("--state_dim", type=int, default=17)
+parser.add_argument("--state_dim", type=int, default=18)
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--model_cfg_path", type=str, default="")
@@ -107,12 +107,12 @@ from omniperception_isaacdrone.models import (
 # -----------------------------------------------------------------------------
 # Names
 # -----------------------------------------------------------------------------
-STATE_OBS_NAMES_17 = [
+STATE_OBS_NAMES_18 = [
     "root_pos_z", "root_quat_w", "root_quat_x", "root_quat_y", "root_quat_z",
     "root_lin_vel_x", "root_lin_vel_y", "root_lin_vel_z",
     "root_ang_vel_x", "root_ang_vel_y", "root_ang_vel_z",
     "projected_gravity_x", "projected_gravity_y", "projected_gravity_z",
-    "goal_delta_x", "goal_delta_y", "goal_delta_z",
+    "goal_dir_x", "goal_dir_y", "goal_dir_z", "goal_dist",
 ]
 
 ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
@@ -346,7 +346,7 @@ class PlaySpaceAdapter(gym.Wrapper):
 # -----------------------------------------------------------------------------
 
 def build_state_names(state_dim: int) -> list[str]:
-    return list(STATE_OBS_NAMES_17) if int(state_dim) == len(STATE_OBS_NAMES_17) else [f"state_{i}" for i in range(int(state_dim))]
+    return list(STATE_OBS_NAMES_18) if int(state_dim) == len(STATE_OBS_NAMES_18) else [f"state_{i}" for i in range(int(state_dim))]
 
 
 def build_action_names(act_dim: int) -> list[str]:

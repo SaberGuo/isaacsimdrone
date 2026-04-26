@@ -307,12 +307,12 @@ def _compute_min_dist_from_lidar(
 
 def penalty_lidar_threat(
     env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     lidar_name: str = "lidar",
-    safe_dist: float | None = None,
-    safe_dist_ratio: float = 0.16,
-    speed_ref: float = 6.0,
-    clip: float = 1.0,
-    proximity_boost: bool = True,
+    crash_distance: float = 0.6,
+    acc_max: float = 5.0,
+    use_horizontal_speed: bool = True,
+    exp_clip: float = 1.0,
     use_grid: bool = True,
     theta_min: float = 30.0,
     theta_max: float = 90.0,
@@ -322,19 +322,14 @@ def penalty_lidar_threat(
     delta_phi: float = 5.0,
     max_vis_points: int | None = None,
 ) -> torch.Tensor:
-    """梯度型激光雷达威胁项。
+    """AirSim 风格 LiDAR 安全距离 barrier。
 
-    在危险范围 (min_dist < safe_dist) 内：
-      - 最小距离减小 (靠近障碍物) → 返回正值 → ×负权重 = 负惩罚
-      - 最小距离增大 (远离障碍物) → 返回负值 → ×负权重 = 正奖励
-      - 危险范围外 → 返回 0
+    安全距离按当前速度动态增大：d_safe = crash_distance + v^2 / (2 * acc_max)。
+    函数返回非负 penalty，RewardTerm 使用负权重后成为惩罚。
     """
 
-    clip_val = max(float(clip), 1e-6)
-    speed_ref_val = max(float(speed_ref), 1e-6)
     zeros = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
 
-    # ── 获取 lidar 传感器 ──
     try:
         lidar = env.scene[lidar_name]
     except Exception:
@@ -343,12 +338,6 @@ def penalty_lidar_threat(
 
     max_d = _get_lidar_max_distance(lidar)
 
-    # ── 确定 safe_dist ──
-    if safe_dist is None:
-        safe_dist = float(safe_dist_ratio) * float(max_d)
-    safe_dist = max(float(safe_dist), 1e-6)
-
-    # ── 计算当前 min_dist ──
     min_dist = _compute_min_dist_from_lidar(
         env, lidar, lidar_name, max_d, use_grid,
         theta_min, theta_max, phi_min, phi_max,
@@ -358,52 +347,25 @@ def penalty_lidar_threat(
         _tb_store_reward(env, "lidar_threat", zeros)
         return zeros
 
-    # ── 获取上一步的 min_dist ──
-    prev = getattr(env, "_lidar_threat_prev_min_dist", None)
-    if prev is None or prev.shape[0] != env.num_envs:
-        # 首次调用：初始化，本步不产生梯度信号
-        env._lidar_threat_prev_min_dist = min_dist.detach().clone()
-        _tb_store_reward(env, "lidar_threat", zeros)
-        _tb_store_aux(env, "lidar_min_dist", min_dist)
-        _tb_store_aux(env, "lidar_threat_approach_rate", zeros)
-        _tb_store_aux(env, "lidar_threat_in_danger_ratio", (min_dist < safe_dist).float())
-        return zeros
-
-    # ── 处理刚 reset 的环境（抑制虚假梯度） ──
-    reset_mask = getattr(env, "_lidar_threat_reset_mask", None)
-    has_reset = reset_mask is not None and reset_mask.any()
-    if has_reset:
-        prev = prev.clone()
-        prev[reset_mask] = min_dist[reset_mask].detach()
-        env._lidar_threat_reset_mask[reset_mask] = False
-
-    # ── 计算距离变化梯度 ──
-    dt = max(_get_step_dt(env), 1e-6)
-    delta = min_dist - prev  # 正 = 远离障碍物，负 = 靠近障碍物
-
-    # 防止 reset 或传感器跳变导致的异常梯度
-    max_delta = speed_ref_val * dt * 3.0
-    delta = torch.clamp(delta, -max_delta, max_delta)
-
-    # 接近速率：正值=正在靠近障碍物，负值=正在远离障碍物
-    approach_rate = -delta / dt
-    danger = torch.clamp((safe_dist - min_dist) / safe_dist, 0.0, 1.0)
-    normalized = torch.clamp(approach_rate / speed_ref_val, -clip_val, clip_val)
-    if proximity_boost:
-        out = normalized * danger
+    vel_w = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg).to(torch.float32)
+    if bool(use_horizontal_speed):
+        speed = torch.linalg.norm(vel_w[:, :2], dim=-1)
     else:
-        out = normalized * (danger > 0.0).float()
-    out = out.to(torch.float32)
-    in_danger = danger > 0.0
+        speed = _safe_norm(vel_w)
 
-    # ── 更新 prev 缓存 ──
-    env._lidar_threat_prev_min_dist = min_dist.detach().clone()
+    crash_distance = max(float(crash_distance), 1e-6)
+    acc_max = max(float(acc_max), 1e-6)
+    d_safe = crash_distance + speed * speed / (2.0 * acc_max)
 
-    # ── TensorBoard 日志 ──
+    margin = torch.clamp((d_safe - min_dist) / torch.clamp(d_safe, min=1e-6), min=0.0)
+    exp_clip = max(float(exp_clip), 1e-6)
+    out = torch.expm1(torch.clamp(margin, max=exp_clip)).to(torch.float32)
+    in_danger = margin > 0.0
+
     _tb_store_reward(env, "lidar_threat", out)
     _tb_store_aux(env, "lidar_min_dist", min_dist)
-    _tb_store_aux(env, "lidar_safe_dist", torch.full_like(min_dist, safe_dist))
-    _tb_store_aux(env, "lidar_threat_approach_rate", approach_rate)
+    _tb_store_aux(env, "lidar_safe_dist", d_safe)
+    _tb_store_aux(env, "lidar_threat_margin", margin)
     _tb_store_aux(env, "lidar_threat_in_danger_ratio", in_danger.float())
     return out
 

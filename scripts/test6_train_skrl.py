@@ -25,7 +25,7 @@ parser.add_argument("--num_envs", type=int, default=128)
 parser.add_argument("--num_obstacles", type=int, default=100)
 parser.add_argument("--timesteps", type=int, default=10_000_000)
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--state_dim", type=int, default=17)
+parser.add_argument("--state_dim", type=int, default=18)
 parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--model_cfg_path", type=str, default="")
@@ -93,12 +93,12 @@ from tqdm import tqdm
 from omniperception_isaacdrone.envs.test6_env import WallSpawner, setup_global_obstacles
 from omniperception_isaacdrone.models import Policy, Value, model_cfg_to_dict, resolve_model_cfg
 
-STATE_OBS_NAMES_17 = [
+STATE_OBS_NAMES_18 = [
     "root_pos_z", "root_quat_w", "root_quat_x", "root_quat_y", "root_quat_z",
     "root_lin_vel_x", "root_lin_vel_y", "root_lin_vel_z",
     "root_ang_vel_x", "root_ang_vel_y", "root_ang_vel_z",
     "projected_gravity_x", "projected_gravity_y", "projected_gravity_z",
-    "goal_delta_x", "goal_delta_y", "goal_delta_z",
+    "goal_dir_x", "goal_dir_y", "goal_dir_z", "goal_dist",
 ]
 ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
 
@@ -547,7 +547,7 @@ def log_gradients(writer, models, step, max_samples):
 
 
 def build_state_names(state_dim: int) -> List[str]:
-    return list(STATE_OBS_NAMES_17) if int(state_dim) == len(STATE_OBS_NAMES_17) else [f"state_{i}" for i in range(int(state_dim))]
+    return list(STATE_OBS_NAMES_18) if int(state_dim) == len(STATE_OBS_NAMES_18) else [f"state_{i}" for i in range(int(state_dim))]
 
 def build_action_names(act_dim: int) -> List[str]:
     return list(ACTION_NAMES_4) if int(act_dim) == len(ACTION_NAMES_4) else [f"action_{i}" for i in range(int(act_dim))]
