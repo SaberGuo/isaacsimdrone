@@ -202,14 +202,9 @@ class Test6EventCfg:
 @configclass
 class Test6RewardsCfg:
     """奖励配置。"""
-    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=2.4, params={})
-    dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=0.0, params={})
-    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=0.6, params={})
-    height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.8, params={})
-    stability = RewTerm(func=my_mdp.reward_stability, weight=0.0, params={})
+    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=2.0, params={})
+    height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.5, params={})
     lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-40.0, params={})
-    energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.0, params={})
-    action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.0)
     # IsaacLab RewardManager 会额外乘以 dt=1/60；这里按“单次事件”目标值反推权重。
     success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=720.0, params={})
     collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-1200.0, params={})
@@ -317,25 +312,10 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "speed_ref": 4.0,
             "clip": 1.0,
         }
-        self.rewards.dist_to_goal.params = {
-            "asset_cfg": SceneEntityCfg("robot"),
-            "std": 50.0,
-        }
         self.rewards.height.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "target_z": 5.0,
             "std": 2.5,
-        }
-        self.rewards.stability.params = {
-            "asset_cfg": SceneEntityCfg("robot"),
-            "lin_std": 4.0,
-            "ang_std": 6.0,
-        }
-        self.rewards.vel_towards_goal.params = {
-            "asset_cfg": SceneEntityCfg("robot"),
-            "min_speed": 0.2,
-            "speed_ref": 3.0,
-            "use_relu": True,
         }
         self.rewards.lidar_threat.params = {
             "asset_cfg": SceneEntityCfg("robot"),
@@ -355,16 +335,6 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "delta_theta": 30.0,
             "delta_phi": 5.0,
             "max_vis_points": 12000,
-        }
-        self.rewards.energy.params = {
-            "asset_cfg": SceneEntityCfg("robot"),
-            "lin_vel_scale": 100.0,
-            "ang_vel_scale": 100.0,
-            "lin_acc_scale": 100.0,
-            "ang_acc_scale": 100.0,
-            "include_acc": True,
-            "acc_weight": 0.2,
-            "max_penalty": 1.0,
         }
         self.rewards.success_bonus.params = {
             "asset_cfg": SceneEntityCfg("robot"),
