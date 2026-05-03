@@ -203,13 +203,13 @@ class Test6EventCfg:
 class Test6RewardsCfg:
     """奖励配置。"""
     progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=2.4, params={})
-    dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=0.7, params={})
+    dist_to_goal = RewTerm(func=my_mdp.reward_distance_to_goal, weight=0.0, params={})
     vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=0.6, params={})
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.8, params={})
-    stability = RewTerm(func=my_mdp.reward_stability, weight=0.005, params={})
+    stability = RewTerm(func=my_mdp.reward_stability, weight=0.0, params={})
     lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-40.0, params={})
-    energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.002, params={})
-    action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.0015)
+    energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.0, params={})
+    action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.0)
     # IsaacLab RewardManager 会额外乘以 dt=1/60；这里按“单次事件”目标值反推权重。
     success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=720.0, params={})
     collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-1200.0, params={})
@@ -340,8 +340,10 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.rewards.lidar_threat.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "lidar_name": "lidar",
-            "crash_distance": 0.6,
-            "acc_max": 5.0,
+            # 避障训练阶段需要在碰撞前给出足够早的密集惩罚；
+            # 这里的 crash_distance 是 barrier 的基础安全距离，不是物理碰撞半径。
+            "crash_distance": 5.0,
+            "acc_max": 3.0,
             "use_horizontal_speed": True,
             "exp_clip": 1.0,
             "use_grid": True,
@@ -351,7 +353,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "phi_min": 0.0,
             "phi_max": 360.0,
             "delta_theta": 30.0,
-            "delta_phi": 15.0,
+            "delta_phi": 5.0,
             "max_vis_points": 12000,
         }
         self.rewards.energy.params = {
