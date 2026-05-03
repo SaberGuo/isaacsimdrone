@@ -1,9 +1,12 @@
+"""Project LiDAR config for the Mid360-style BodyFrameLidarSensor."""
+
 from isaaclab.sensors import LidarSensorCfg
 from isaaclab.sensors.ray_caster.patterns import LivoxPatternCfg
 
 from .lidar_sensor import BodyFrameLidarSensor
 
 
+# Keep the Mid360 pattern parameters unchanged; downstream code only bins the output.
 LIDAR_CFG = LidarSensorCfg(
     class_type=BodyFrameLidarSensor,
     prim_path="{ENV_REGEX_NS}/Robot/body",

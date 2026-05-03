@@ -1,3 +1,5 @@
+"""Iris drone asset and parameter config used by Test6."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -18,6 +20,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 _IRIS_USD_PATH = str(_THIS_DIR / "iris.usd")
 _IRIS_PARAM_PATH = _THIS_DIR / "iris.yaml"
 
+# Load the OmniDrones-style physical and rotor parameters once at import time.
 with _IRIS_PARAM_PATH.open("r", encoding="utf-8") as f:
     IRIS_PARAMS = yaml.safe_load(f)
 
@@ -30,6 +33,9 @@ DRONE_INERTIA_DIAG: tuple[float, float, float] = (
 )
 
 
+# -----------------------------------------------------------------------------
+# Articulation config
+# -----------------------------------------------------------------------------
 @configclass
 class IrisDroneCfg(ArticulationCfg):
     """Iris drone articulation config.
@@ -77,6 +83,7 @@ class IrisDroneCfg(ArticulationCfg):
     }
 
 
+# Public aliases used by env cfg and action terms.
 IRIS_CFG = IrisDroneCfg()
 DRONE_CFG = IRIS_CFG
 DRONE_PARAMS = IRIS_PARAMS

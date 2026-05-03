@@ -1,3 +1,5 @@
+"""Reset events for drone start states, goals, and global obstacles."""
+
 from __future__ import annotations
 
 import torch
@@ -5,6 +7,9 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
 
+# -----------------------------------------------------------------------------
+# Obstacle sampling helpers
+# -----------------------------------------------------------------------------
 def _sample_obstacle_positions(
     device: torch.device,
     num_active: int,
@@ -78,6 +83,9 @@ def _sample_obstacle_positions(
     return positions
 
 
+# -----------------------------------------------------------------------------
+# Robot and goal reset event
+# -----------------------------------------------------------------------------
 def reset_root_state_on_square_edge(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
@@ -135,6 +143,9 @@ def reset_root_state_on_square_edge(
             env.unwrapped._update_goal_visualizers(env_ids)
 
 
+# -----------------------------------------------------------------------------
+# Global obstacle layout event
+# -----------------------------------------------------------------------------
 def randomize_obstacles_on_reset(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
@@ -153,7 +164,7 @@ def randomize_obstacles_on_reset(
     --------
     * 障碍物是全局共享资产（/World/Obstacles/obj_*），与 env 无关，
       因此每次只要有任意 env reset，就整体重新布置一次即可。
-    * 只有在 obstacle_level_changed=True（晋级）或首次运行时，
+    * 只有在 obstacle_level_changed=True（晋级）、显式刷新标志或障碍物数量变化时，
       才真正重排障碍物，其余 reset 继续沿用当前布置。
     * 读取障碍物数量统一使用 curr_obstacle_count（由 Curriculum 维护）。
     """
@@ -174,21 +185,7 @@ def randomize_obstacles_on_reset(
             u.curr_obstacle_count = 0
 
     # ------------------------------------------------------------------ #
-    # 2. 只在 level 发生变化时重排；其余 reset 直接跳过                    #
-    # ------------------------------------------------------------------ #
-    if not u.obstacle_level_changed:
-        return
-
-    # 消耗标志位（同一 step 内多个 env 同时 reset 也只执行一次）
-    u.obstacle_level_changed = False
-
-    # ------------------------------------------------------------------ #
-    # 3. 确定本次应激活的障碍物数量                                        #
-    # ------------------------------------------------------------------ #
-    num_active = int(u.curr_obstacle_count)
-
-    # ------------------------------------------------------------------ #
-    # 4. 解析全局资产的 max_obstacles                                      #
+    # 2. 解析全局资产的 max_obstacles                                      #
     # ------------------------------------------------------------------ #
     asset = env.scene[asset_cfg.name]
     state_shape = asset.data.default_root_state.shape
@@ -205,7 +202,24 @@ def randomize_obstacles_on_reset(
         )
         return
 
-    num_active = min(num_active, max_obstacles)
+    # ------------------------------------------------------------------ #
+    # 3. 确定本次应激活的障碍物数量                                        #
+    # ------------------------------------------------------------------ #
+    num_requested = int(u.curr_obstacle_count)
+    num_active = min(num_requested, max_obstacles)
+
+    refresh_required = bool(getattr(u, "obstacle_layout_refresh_required", False))
+    level_changed = bool(getattr(u, "obstacle_level_changed", False))
+    last_applied_count = getattr(u, "_last_applied_obstacle_count", None)
+    count_changed = last_applied_count is None or int(last_applied_count) != num_active
+
+    # 只在首次、课程升级或障碍物数量发生变化时重排；其余 reset 沿用当前布局。
+    if not (refresh_required or level_changed or count_changed):
+        return
+
+    # 消耗标志位（同一 step 内多个 env 同时 reset 也只执行一次）
+    u.obstacle_level_changed = False
+    u.obstacle_layout_refresh_required = False
 
     print(
         f"[OBSTACLE] 重排障碍物: active={num_active}/{max_obstacles} "
@@ -251,3 +265,4 @@ def randomize_obstacles_on_reset(
 
     asset.write_root_pose_to_sim(root_pose, env_ids=all_obstacle_ids)
     asset.write_root_velocity_to_sim(velocities, env_ids=all_obstacle_ids)
+    u._last_applied_obstacle_count = int(num_active)

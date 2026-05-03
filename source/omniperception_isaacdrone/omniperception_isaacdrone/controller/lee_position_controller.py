@@ -1,3 +1,5 @@
+"""Lee-style velocity/yaw-rate controller used by the Test6 action term."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,6 +13,9 @@ except Exception as exc:  # pragma: no cover
     raise RuntimeError("PyYAML is required for LeePositionController config loading.") from exc
 
 
+# -----------------------------------------------------------------------------
+# Quaternion and mixer helpers
+# -----------------------------------------------------------------------------
 def _normalize(v: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return v / torch.linalg.norm(v, dim=-1, keepdim=True).clamp_min(eps)
 
@@ -60,6 +65,9 @@ def compute_parameters(rotor_config: dict, inertia_matrix_4x4: torch.Tensor) -> 
     return a.t() @ torch.linalg.inv(a @ a.t()) @ inertia_matrix_4x4
 
 
+# -----------------------------------------------------------------------------
+# Controller module
+# -----------------------------------------------------------------------------
 class LeePositionController(nn.Module):
     """Lee controller ported from OmniPerception/OmniDrones.
 
@@ -229,5 +237,5 @@ class LeePositionController(nn.Module):
         return torch.clamp(cmd, -1.0, 1.0)
 
 
-# compatibility alias
+# Compatibility alias used by older scripts.
 LeeVelocityYawRateController = LeePositionController

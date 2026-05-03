@@ -1,4 +1,5 @@
-# omniperception_isaacdrone/tasks/mdp/test6_rewards.py
+"""Reward terms and TensorBoard caches for Test6."""
+
 from __future__ import annotations
 
 import math
@@ -16,9 +17,9 @@ from .test6_terminations import (
 )
 
 
-# =============================================================================
-# 日志与调试辅助函数
-# =============================================================================
+# -----------------------------------------------------------------------------
+# TensorBoard cache helpers
+# -----------------------------------------------------------------------------
 
 def _tb_get_dict(env: ManagerBasedRLEnv, attr: str) -> dict:
     d = getattr(env, attr, None)
@@ -50,9 +51,9 @@ def _tb_store_aux(env: ManagerBasedRLEnv, name: str, value: torch.Tensor):
         pass
 
 
-# =============================================================================
-# 基础计算与环境辅助函数
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Numeric and environment helpers
+# -----------------------------------------------------------------------------
 
 def _safe_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.sqrt(torch.sum(x * x, dim=-1) + eps)
@@ -105,9 +106,9 @@ def _get_exp_closeness(d: float, max_d: float, alpha: float = 3.0) -> float:
     return (math.exp(-alpha * norm_dist) - exp_alpha) / (1.0 - exp_alpha)
 
 
-# =============================================================================
-# 任务目标与进度奖励
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Goal and progress rewards
+# -----------------------------------------------------------------------------
 
 def reward_distance_to_goal(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, std: float = 6.0) -> torch.Tensor:
     pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
@@ -196,9 +197,9 @@ def reward_velocity_towards_goal(
     return out
 
 
-# =============================================================================
-# 飞行姿态与控制约束奖励
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Flight-state and control rewards
+# -----------------------------------------------------------------------------
 
 def reward_height_tracking(
     env: ManagerBasedRLEnv,
@@ -255,9 +256,9 @@ def reward_action_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
     return out
 
 
-# =============================================================================
-# 避障与安全惩罚
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Obstacle-avoidance penalties
+# -----------------------------------------------------------------------------
 
 def _compute_min_dist_from_lidar(
     env: ManagerBasedRLEnv,
@@ -381,7 +382,7 @@ def penalty_safe_vel(
     theta_max: float = 90.0,
     phi_min: float = 0.0,
     phi_max: float = 360.0,
-    delta_theta: float = 10.0,
+    delta_theta: float = 20.0,
     delta_phi: float = 5.0,
     max_vis_points: int | None = 12000,
 ) -> torch.Tensor:
@@ -557,9 +558,9 @@ def penalty_energy(
     return pen
 
 
-# =============================================================================
-# 终止条件相关奖惩
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Termination-related rewards and penalties
+# -----------------------------------------------------------------------------
 
 def reward_goal_reached(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, threshold: float = 1.0) -> torch.Tensor:
     out = termination_reached_goal(env, asset_cfg=asset_cfg, threshold=threshold).to(torch.float32)

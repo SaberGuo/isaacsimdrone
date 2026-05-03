@@ -1,3 +1,5 @@
+"""skrl policy/value models and configurable lidar-state feature extractors."""
+
 from __future__ import annotations
 
 import inspect
@@ -13,6 +15,9 @@ import torch.nn.functional as F
 from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 
 
+# -----------------------------------------------------------------------------
+# Config parsing helpers
+# -----------------------------------------------------------------------------
 def _json_load_maybe_path(model_cfg_path: str | None, model_cfg_json: str | None) -> dict[str, Any]:
     merged: dict[str, Any] = {}
     if model_cfg_path:
@@ -142,6 +147,9 @@ def _normalize_hidden_norms(hidden_dims: Sequence[int], hidden_norms: Sequence[A
     raise ValueError("hidden_norms length must match hidden_dims length")
 
 
+# -----------------------------------------------------------------------------
+# Model config dataclasses
+# -----------------------------------------------------------------------------
 @dataclass
 class MLPBranchCfg:
     input_norm: str = "none"
@@ -351,6 +359,9 @@ def resolve_model_cfg(
     return resolved
 
 
+# -----------------------------------------------------------------------------
+# Config snapshot helpers
+# -----------------------------------------------------------------------------
 def _parse_snapshot_sections(config_path: Path) -> dict[str, str]:
     current: str | None = None
     sections: dict[str, list[str]] = {}
@@ -387,6 +398,9 @@ def find_config_snapshot_for_checkpoint(checkpoint_path: Path) -> Path | None:
     return None
 
 
+# -----------------------------------------------------------------------------
+# Module initialization helpers
+# -----------------------------------------------------------------------------
 def init_hidden(m: nn.Module) -> None:
     if isinstance(m, (nn.Linear, nn.Conv2d)):
         nn.init.orthogonal_(m.weight, gain=np.sqrt(2.0))
@@ -418,6 +432,9 @@ def gaussian_mixin_kwargs() -> dict[str, Any]:
     return kwargs
 
 
+# -----------------------------------------------------------------------------
+# Neural network building blocks
+# -----------------------------------------------------------------------------
 class MLPBranch(nn.Module):
     def __init__(self, input_dim: int, cfg: MLPBranchCfg):
         super().__init__()
@@ -590,6 +607,9 @@ class StructuredFeatureExtractor(nn.Module):
         return self.fuse_net(torch.cat([state, lidar_feat], dim=-1))
 
 
+# -----------------------------------------------------------------------------
+# skrl models
+# -----------------------------------------------------------------------------
 class Policy(GaussianMixin, Model):
     def __init__(
         self,

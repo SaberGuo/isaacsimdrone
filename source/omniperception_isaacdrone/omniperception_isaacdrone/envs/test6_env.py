@@ -1,4 +1,5 @@
-# omniperception_isaacdrone/envs/test6_env.py
+"""Runtime helpers and custom ManagerBasedRLEnv for the Test6 drone task."""
+
 from __future__ import annotations
 
 from collections import deque
@@ -20,9 +21,9 @@ except Exception:  # pragma: no cover
     Box = None
 
 
-# =============================================================================
-# USD / Xform helpers
-# =============================================================================
+# -----------------------------------------------------------------------------
+# USD transform helpers
+# -----------------------------------------------------------------------------
 def _get_stage():
     import isaacsim.core.utils.prims as prim_utils
 
@@ -56,9 +57,9 @@ def _set_prim_visibility(stage, prim_path: str, visible: bool) -> bool:
     return True
 
 
-# =============================================================================
-# Spawners
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Workspace and obstacle spawners
+# -----------------------------------------------------------------------------
 class WallSpawner:
     """Spawn workspace boundary walls under /World/Wall."""
 
@@ -121,7 +122,7 @@ class WallSpawner:
 
 
 def setup_global_obstacles(max_obstacles: int = 100):
-    """预生成全局共享的障碍物模板到 /World/Obstacles"""
+    """预生成全局共享的障碍物模板到 /World/Obstacles。"""
     import isaacsim.core.utils.prims as prim_utils
     import isaaclab.sim as sim_utils
 
@@ -143,9 +144,9 @@ def setup_global_obstacles(max_obstacles: int = 100):
         cfg_obstacle.func(obstacle_path, cfg_obstacle, translation=(1000.0, 1000.0, -1000.0))
 
 
-# =============================================================================
-# Env with goal buffer / energy cache / progress cache / lidar grid cache
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Custom RL environment
+# -----------------------------------------------------------------------------
 class MyDroneRLEnv(ManagerBasedRLEnv):
     """Custom env with goal buffers."""
 
@@ -202,9 +203,9 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         print(f"[MyDroneRLEnv] num_envs={self.num_envs}, device={self.device}", flush=True)
         print(f"[MyDroneRLEnv] policy_state_dim={self.policy_state_dim}, policy_lidar_dim={self.policy_lidar_dim}", flush=True)
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # gym spaces
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _get_state_dim_from_cfg(self) -> int:
         try:
             norm_cfg = getattr(self.cfg, "normalization", None)
@@ -273,9 +274,9 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self.observation_space = self.single_observation_space = single_obs_space
         self.action_space = self.single_action_space = act_box
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # goal visualizers & tracking
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _get_stage(self):
         return self.sim.stage if hasattr(self, "sim") else self.scene.stage
 

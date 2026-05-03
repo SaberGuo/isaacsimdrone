@@ -1,3 +1,5 @@
+"""Action terms for the Test6 drone task."""
+
 from __future__ import annotations
 
 import math
@@ -12,6 +14,9 @@ from omniperception_isaacdrone.assets.robots.drone_cfg import DRONE_PARAMS
 from omniperception_isaacdrone.controller import LeePositionController
 
 
+# -----------------------------------------------------------------------------
+# Timing helpers
+# -----------------------------------------------------------------------------
 def _get_step_dt(env: ManagerBasedRLEnv) -> float:
     if hasattr(env, "step_dt"):
         try:
@@ -24,6 +29,9 @@ def _get_step_dt(env: ManagerBasedRLEnv) -> float:
         return 1.0 / 60.0
 
 
+# -----------------------------------------------------------------------------
+# Action terms
+# -----------------------------------------------------------------------------
 class RootTwistVelocityActionTerm(ActionTerm):
     """OmniPerception-style controller + actuator chain.
 
@@ -188,6 +196,9 @@ class RootTwistVelocityActionTerm(ActionTerm):
                 tau_z=tau_z,
             )
 
+    # ------------------------------------------------------------------
+    # Debug output
+    # ------------------------------------------------------------------
     def _print_debug(
         self,
         root: torch.Tensor,

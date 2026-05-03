@@ -1,3 +1,5 @@
+"""Rotor actuator dynamics used by the Test6 action term."""
+
 from __future__ import annotations
 
 import math
@@ -6,6 +8,9 @@ import torch
 import torch.nn as nn
 
 
+# -----------------------------------------------------------------------------
+# Batched rotor actuator
+# -----------------------------------------------------------------------------
 class RotorGroup(nn.Module):
     """Rotor actuator dynamics ported from OmniPerception/OmniDrones.
 

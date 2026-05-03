@@ -1,3 +1,5 @@
+"""Project-local LiDAR sensor wrapper for body-frame point clouds."""
+
 from __future__ import annotations
 
 import math
@@ -8,6 +10,9 @@ from isaaclab.sensors import LidarSensor
 from isaaclab.sensors.ray_caster import RayCaster
 
 
+# -----------------------------------------------------------------------------
+# LiDAR sensor
+# -----------------------------------------------------------------------------
 class BodyFrameLidarSensor(LidarSensor):
     """Project-local LiDAR wrapper for body-frame scans and stable Livox timing.
 

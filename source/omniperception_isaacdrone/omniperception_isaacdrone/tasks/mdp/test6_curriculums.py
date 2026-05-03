@@ -1,3 +1,5 @@
+"""Obstacle-count curriculum for Test6 training."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -9,6 +11,9 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+# -----------------------------------------------------------------------------
+# Curriculum state helpers
+# -----------------------------------------------------------------------------
 def _init_curriculum_state(
     env: "ManagerBasedRLEnv",
     levels: Sequence[int],
@@ -42,6 +47,7 @@ def _init_curriculum_state(
 
     # 触发首次障碍物布置
     u.obstacle_level_changed = True
+    u.obstacle_layout_refresh_required = True
 
     print(
         f"[CURRICULUM] 初始化: levels={list(levels)}, "
@@ -89,6 +95,9 @@ def _resolve_success_threshold(
     return float(thresholds[level_idx])
 
 
+# -----------------------------------------------------------------------------
+# Curriculum term
+# -----------------------------------------------------------------------------
 def update_obstacle_curriculum(
     env: "ManagerBasedRLEnv",
     env_ids: Sequence[int] | slice | torch.Tensor,
@@ -188,6 +197,7 @@ def update_obstacle_curriculum(
 
         # 通知 Event 重排障碍物
         u.obstacle_level_changed = True
+        u.obstacle_layout_refresh_required = True
 
         print(
             f"[CURRICULUM] 成功率 {success_rate:.3f} >= {current_threshold:.3f} | "

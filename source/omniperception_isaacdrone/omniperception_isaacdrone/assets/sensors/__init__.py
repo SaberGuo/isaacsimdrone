@@ -1,3 +1,5 @@
+"""Sensor config exports."""
+
 from .lidar_cfg import LIDAR_CFG
 from .lidar_sensor import BodyFrameLidarSensor
 

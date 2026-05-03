@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import gymnasium as gym
 
+# Gym task identifiers used by train/play scripts.
 TASK_ID_NO_LIDAR = "Isaac-OmniPerception-Drone-v0"
 TASK_ID_LIDAR = "Isaac-OmniPerception-Drone-Lidar-v0"
 
-# IMPORTANT:
-# Use our custom env class (MyDroneRLEnv) so env has goal_pos_w
+# Use the custom env class so MDP functions can access goal_pos_w and caches.
 ENTRY_POINT = "omniperception_isaacdrone.envs.test6_env:MyDroneRLEnv"
 
+
+# -----------------------------------------------------------------------------
+# Registration
+# -----------------------------------------------------------------------------
 gym.register(
     id=TASK_ID_NO_LIDAR,
     entry_point=ENTRY_POINT,

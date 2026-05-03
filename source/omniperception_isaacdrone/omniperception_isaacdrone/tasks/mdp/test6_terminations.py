@@ -1,4 +1,4 @@
-# omniperception_isaacdrone/tasks/mdp/test6_terminations.py
+"""Termination terms for Test6."""
 
 from __future__ import annotations
 
@@ -9,6 +9,9 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
 
+# -----------------------------------------------------------------------------
+# Goal and workspace terminations
+# -----------------------------------------------------------------------------
 def termination_reached_goal(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -54,6 +57,9 @@ def termination_out_of_workspace(
     )
 
 
+# -----------------------------------------------------------------------------
+# Contact termination
+# -----------------------------------------------------------------------------
 def termination_collision(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,

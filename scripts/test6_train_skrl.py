@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# Standard-library imports must stay above AppLauncher construction.
 import argparse
 import copy
 import gc
@@ -13,11 +14,15 @@ from typing import Any, Dict, List
 
 from isaaclab.app import AppLauncher
 
+# Keep CUDA allocator policy visible before torch is imported.
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
     "max_split_size_mb:128,garbage_collection_threshold:0.8",
 )
 
+# -----------------------------------------------------------------------------
+# CLI and Isaac application bootstrap
+# -----------------------------------------------------------------------------
 parser = argparse.ArgumentParser("Stable skrl PPO trainer for IsaacLab drone lidar task")
 parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lidar-v0")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
@@ -76,7 +81,10 @@ args = parser.parse_args()
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
+# Imports below require the Isaac/Omniverse application to be running.
 import gymnasium as gym
+import isaacsim.core.utils.bounds as bounds_utils
+import isaacsim.core.utils.prims as prim_utils
 import numpy as np
 import torch
 import torch.nn as nn
@@ -89,10 +97,14 @@ from skrl.memories.torch import RandomMemory
 from skrl.resources.schedulers.torch import KLAdaptiveLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 from omniperception_isaacdrone.envs.test6_env import WallSpawner, setup_global_obstacles
 from omniperception_isaacdrone.models import Policy, Value, model_cfg_to_dict, resolve_model_cfg
 
+# -----------------------------------------------------------------------------
+# Runtime metadata and backend settings
+# -----------------------------------------------------------------------------
 STATE_OBS_NAMES_18 = [
     "root_pos_z", "root_quat_w", "root_quat_x", "root_quat_y", "root_quat_z",
     "root_lin_vel_x", "root_lin_vel_y", "root_lin_vel_z",
@@ -112,11 +124,10 @@ try:
 except Exception:
     pass
 
-from pxr import Usd, UsdGeom, UsdPhysics, Gf
-import isaacsim.core.utils.prims as prim_utils
-import isaacsim.core.utils.bounds as bounds_utils
 
-
+# -----------------------------------------------------------------------------
+# USD and debug helpers
+# -----------------------------------------------------------------------------
 def scale_robot_visual_only(num_envs: int, visual_scale=(20.0, 20.0, 10.0)) -> None:
     """仅缩放机器人视觉网格，不影响碰撞体。"""
     stage = prim_utils.get_prim_at_path("/World").GetStage()
@@ -169,6 +180,10 @@ def debug_print(msg: str) -> None:
 def print_env0_transition(step, states, actions, rewards, terminated, truncated, next_states, state_dim, lidar_dim):
     pass
 
+
+# -----------------------------------------------------------------------------
+# Observation/action shape and value sanitizers
+# -----------------------------------------------------------------------------
 def format_array_preview(x: np.ndarray, max_items: int = 16) -> str:
     x = np.asarray(x).reshape(-1)
     if x.size <= max_items:
@@ -276,6 +291,10 @@ def infer_lidar_grid_shape(base_env: Any, lidar_dim: int) -> tuple[int, int] | N
         pass
     return None
 
+
+# -----------------------------------------------------------------------------
+# skrl space adapter
+# -----------------------------------------------------------------------------
 def build_skrl_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int, int, gym.spaces.Dict, Box]:
     num_envs = int(getattr(base_env, "num_envs", 1))
     act_space = getattr(base_env, "single_action_space", getattr(base_env, "action_space", None))
@@ -308,6 +327,9 @@ class SkrlSpaceAdapter(gym.Wrapper):
         return self._convert_obs(raw_obs), rewards, terminated, truncated, infos
 
 
+# -----------------------------------------------------------------------------
+# Model safety and rollout log extraction
+# -----------------------------------------------------------------------------
 def models_are_finite(models: dict[str, nn.Module]) -> bool:
     for model in models.values():
         for p in model.parameters():
@@ -447,6 +469,9 @@ def build_reward_term_views(base_env: Any, reward_weights: Dict[str, float], rew
     return raw_terms, weighted_out, {name: value * dt * reward_scale * clip_factor for name, value in weighted_out.items()}
 
 
+# -----------------------------------------------------------------------------
+# TensorBoard accumulators
+# -----------------------------------------------------------------------------
 class TensorDictStats:
     """按步累积张量字典统计量（均值/最小/最大）。"""
     def __init__(self): self.reset()
@@ -546,6 +571,9 @@ def log_gradients(writer, models, step, max_samples):
                 except Exception: pass
 
 
+# -----------------------------------------------------------------------------
+# Run configuration helpers
+# -----------------------------------------------------------------------------
 def build_state_names(state_dim: int) -> List[str]:
     return list(STATE_OBS_NAMES_18) if int(state_dim) == len(STATE_OBS_NAMES_18) else [f"state_{i}" for i in range(int(state_dim))]
 
@@ -586,6 +614,9 @@ def write_run_config_snapshot(
     config_path.write_text(content, encoding="utf-8")
 
 
+# -----------------------------------------------------------------------------
+# Training entry point
+# -----------------------------------------------------------------------------
 def main() -> None:
     print(f"[INFO] task={args.task}, num_envs={args.num_envs}, device={args.device}", flush=True)
     env_cfg = parse_env_cfg(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import (
     ActionTermCfg,
@@ -18,7 +18,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, LidarSensorCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.assets import RigidObjectCfg
+
 from omniperception_isaacdrone.assets.robots.drone_cfg import DRONE_CFG, DRONE_MASS, DRONE_PARAMS
 
 try:
@@ -29,6 +29,9 @@ except Exception:
 from omniperception_isaacdrone.tasks import mdp as my_mdp
 
 
+# -----------------------------------------------------------------------------
+# Shared scalar settings
+# -----------------------------------------------------------------------------
 @configclass
 class NormalizationCfg:
     """观测归一化超参数。"""
@@ -55,6 +58,9 @@ class ObstacleCurriculumSettingsCfg:
     clear_history_on_promotion: bool = True
 
 
+# -----------------------------------------------------------------------------
+# Scene assets
+# -----------------------------------------------------------------------------
 @configclass
 class Test6SceneCfg(InteractiveSceneCfg):
     """场景配置。"""
@@ -91,7 +97,7 @@ class Test6SceneCfg(InteractiveSceneCfg):
         rot=(1.0, 0.0, 0.0, 0.0),
         joint_pos={".*": 0.0},
     )
-    # ← 保留 NEW：prim_path 改为 base_link
+    # Contact is attached to base_link to match the Iris USD body naming.
     contact_sensor: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base_link",
         update_period=0.0,
@@ -118,10 +124,13 @@ class Test6SceneCfg(InteractiveSceneCfg):
 class Test6SceneWithLidarCfg(Test6SceneCfg):
     """带激光雷达的场景配置。"""
     if LIDAR_CFG is not None:
-        # ← 保留 NEW：prim_path 改为 base_link
+        # LiDAR is attached to base_link; do not change the Mid360 scan pattern here.
         lidar: LidarSensorCfg = LIDAR_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot/base_link")
 
 
+# -----------------------------------------------------------------------------
+# Manager term configs
+# -----------------------------------------------------------------------------
 @configclass
 class Test6ActionsCfg:
     """动作配置。"""
@@ -147,11 +156,11 @@ class Test6ObservationsCfg:
             func=my_mdp.obs_lidar_min_range_grid,
             params=dict(
                 lidar_name="lidar",
-                theta_min=30.0,
-                theta_max=90.0,
+                theta_min=75.0,
+                theta_max=105.0,
                 phi_min=0.0,
                 phi_max=360.0,
-                delta_theta=10.0,
+                delta_theta=30.0,
                 delta_phi=5.0,
                 empty_value=0.0,
                 max_vis_points=12000,
@@ -199,7 +208,6 @@ class Test6RewardsCfg:
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.8, params={})
     stability = RewTerm(func=my_mdp.reward_stability, weight=0.005, params={})
     lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-40.0, params={})
-    safe_vel_penalty = RewTerm(func=my_mdp.penalty_safe_vel, weight=-14.0, params={})
     energy = RewTerm(func=my_mdp.penalty_energy, weight=-0.002, params={})
     action_l2 = RewTerm(func=my_mdp.reward_action_l2, weight=-0.0015)
     # IsaacLab RewardManager 会额外乘以 dt=1/60；这里按“单次事件”目标值反推权重。
@@ -233,6 +241,9 @@ class Test6CurriculumCfg:
     )
 
 
+# -----------------------------------------------------------------------------
+# Environment configs
+# -----------------------------------------------------------------------------
 @configclass
 class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
     """无人机环境主配置。"""
@@ -251,7 +262,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 1
         self.sim.dt = 1.0 / 60.0
         self.sim.render_interval = self.decimation
-        # ← 保留 NEW：改善力/速度积分一致性
+        # Keep external wrench integration consistent with the rotor controller.
         try:
             self.sim.physx.enable_external_forces_every_iteration = True
         except Exception:
@@ -267,7 +278,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.normalization.y_bounds = WORKSPACE_Y
         self.normalization.z_bounds = WORKSPACE_Z
         self.normalization.goal_distance_max = 80.0
-        # ← 保留 NEW：新控制器参数体系
+        # Controller and actuator parameters come from the project Iris config.
         self.actions.root_twist.params = {
             "uav_params": DRONE_PARAMS,
             "mass": DRONE_MASS,
@@ -339,22 +350,8 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "theta_max": 105.0,
             "phi_min": 0.0,
             "phi_max": 360.0,
-            "delta_theta": 10.0,
-            "delta_phi": 5.0,
-            "max_vis_points": 12000,
-        }
-        self.rewards.safe_vel_penalty.params = {
-            "asset_cfg": SceneEntityCfg("robot"),
-            "lidar_name": "lidar",
-            "safe_dist": 10.0,
-            "margin": 3.0,
-            "front_cos_threshold": 0.55,
-            "theta_min": 75.0,
-            "theta_max": 105.0,
-            "phi_min": 0.0,
-            "phi_max": 360.0,
-            "delta_theta": 10.0,
-            "delta_phi": 5.0,
+            "delta_theta": 30.0,
+            "delta_phi": 15.0,
             "max_vis_points": 12000,
         }
         self.rewards.energy.params = {

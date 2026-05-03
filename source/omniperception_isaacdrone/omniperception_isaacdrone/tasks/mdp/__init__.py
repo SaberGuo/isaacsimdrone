@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """MDP components for OmniPerception IsaacDrone (Test6)."""
 
+# Keep exports grouped by Manager type so env cfg files can import this module as my_mdp.
 from .test6_actions import RootTwistVelocityActionTerm
 from .test6_curriculums import update_obstacle_curriculum
 from .test6_events import reset_root_state_on_square_edge, randomize_obstacles_on_reset
