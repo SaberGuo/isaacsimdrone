@@ -49,11 +49,11 @@ class NormalizationCfg:
 class ObstacleCurriculumSettingsCfg:
     """障碍物课程学习配置。"""
     enabled: bool = True
-    levels: tuple[int, ...] = (0, 5, 10, 15, 20, 30, 50, 100)
+    levels: tuple[int, ...] = (0, 10, 20, 50, 100)
     initial_level: int = 0
     success_term_name: str = "reached_goal"
     success_threshold: float = 0.85
-    success_thresholds: tuple[float, ...] = (0.90, 0.86, 0.82, 0.78, 0.74, 0.70, 0.66, 0.62)
+    success_thresholds: tuple[float, ...] = (0.90, 0.85, 0.82, 0.78, 0.75)
     k_roll: int = 8
     clear_history_on_promotion: bool = True
 
@@ -202,14 +202,14 @@ class Test6EventCfg:
 @configclass
 class Test6RewardsCfg:
     """奖励配置。"""
-    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=2.0, params={})
-    height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.5, params={})
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-40.0, params={})
+    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=1.5, params={})
+    height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.3, params={})
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-80.0, params={})
     # IsaacLab RewardManager 会额外乘以 dt=1/60；这里按“单次事件”目标值反推权重。
     success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=720.0, params={})
-    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-1200.0, params={})
+    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-1800.0, params={})
     oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-900.0, params={})
-    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-240.0, params={})
+    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-720.0, params={})
 
 
 @configclass
@@ -227,10 +227,10 @@ class Test6CurriculumCfg:
     obstacle_count = CurrTerm(
         func=my_mdp.update_obstacle_curriculum,
         params={
-            "levels": (0, 5, 10, 15, 20, 30, 50, 100),
+            "levels": (0, 10, 20, 50, 100),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
-            "success_thresholds": (0.90, 0.86, 0.82, 0.78, 0.74, 0.70, 0.66, 0.62),
+            "success_thresholds": (0.90, 0.85, 0.82, 0.78, 0.75),
             "k_roll": 8,
         },
     )
@@ -322,7 +322,7 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "lidar_name": "lidar",
             # 避障训练阶段需要在碰撞前给出足够早的密集惩罚；
             # 这里的 crash_distance 是 barrier 的基础安全距离，不是物理碰撞半径。
-            "crash_distance": 5.0,
+            "crash_distance": 8.0,
             "acc_max": 3.0,
             "use_horizontal_speed": True,
             "exp_clip": 1.0,
