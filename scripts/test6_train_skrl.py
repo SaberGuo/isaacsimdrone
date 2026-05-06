@@ -35,15 +35,15 @@ parser.add_argument("--lidar_dim", type=int, default=432)
 parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--model_cfg_path", type=str, default="")
 parser.add_argument("--model_cfg_json", type=str, default="")
-parser.add_argument("--rollouts", type=int, default=256)
+parser.add_argument("--rollouts", type=int, default=384)
 parser.add_argument("--learning_epochs", type=int, default=6)
-parser.add_argument("--mini_batches", type=int, default=8)
+parser.add_argument("--mini_batches", type=int, default=12)
 parser.add_argument("--learning_rate", type=float, default=1.0e-5)
 parser.add_argument("--_lambda", type=float, default=0.95)
 parser.add_argument("--discount_factor", type=float, default=0.995)
 parser.add_argument("--ratio_clip", type=float, default=0.15)
 parser.add_argument("--value_clip", type=float, default=0.2)
-parser.add_argument("--value_loss_scale", type=float, default=0.75)
+parser.add_argument("--value_loss_scale", type=float, default=0.6)
 parser.add_argument("--grad_norm_clip", type=float, default=0.8)
 parser.add_argument("--entropy_coef", type=float, default=6.0e-3)
 parser.add_argument("--kl_threshold", type=float, default=0.008)
@@ -74,6 +74,9 @@ parser.add_argument("--debug_act", action="store_true", default=False)
 parser.add_argument("--pbar_interval", type=int, default=50)
 parser.add_argument("--render_interval", type=int, default=0)
 parser.add_argument("--finite_check_interval", type=int, default=0)
+parser.add_argument("--lidarcheck_step", type=int, default=1000)
+parser.add_argument("--lidarcheck_dir", type=str, default="")
+parser.add_argument("--lidarcheck_max_points", type=int, default=4000)
 
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -615,6 +618,146 @@ def write_run_config_snapshot(
 
 
 # -----------------------------------------------------------------------------
+# Low-frequency LiDAR diagnostics
+# -----------------------------------------------------------------------------
+def _import_plotting():
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    return plt
+
+
+def _make_lidarcheck_dir(root_arg: str, exp_dir: Path) -> Path:
+    root = Path(root_arg).expanduser() if str(root_arg).strip() else exp_dir / "lidarcheck"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _finite_downsample_points(points: torch.Tensor, max_points: int) -> np.ndarray:
+    pts = points.detach()
+    finite = torch.isfinite(pts).all(dim=-1)
+    pts = pts[finite]
+    if pts.numel() == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    max_points = int(max_points)
+    if max_points > 0 and pts.shape[0] > max_points:
+        step = max(int(pts.shape[0] // max_points), 1)
+        pts = pts[::step][:max_points]
+    return pts.float().cpu().numpy()
+
+
+def _save_pointcloud_3d(points_np: np.ndarray, path: Path, title: str) -> None:
+    plt = _import_plotting()
+    fig = plt.figure(figsize=(6.0, 6.0), dpi=150)
+    ax = fig.add_subplot(111, projection="3d")
+    if points_np.shape[0] > 0:
+        ax.scatter(points_np[:, 0], points_np[:, 1], points_np[:, 2], s=1.0, alpha=0.75)
+        mn, mx = points_np.min(axis=0), points_np.max(axis=0)
+        center = (mn + mx) * 0.5
+        radius = max(float((mx - mn).max() * 0.5), 1.0)
+        ax.set_xlim(center[0] - radius, center[0] + radius)
+        ax.set_ylim(center[1] - radius, center[1] + radius)
+        ax.set_zlim(center[2] - radius, center[2] + radius)
+    else:
+        ax.text2D(0.25, 0.5, "No finite LiDAR points", transform=ax.transAxes)
+        ax.set_xlim(-1.0, 1.0)
+        ax.set_ylim(-1.0, 1.0)
+        ax.set_zlim(-1.0, 1.0)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.set_title(title)
+    ax.view_init(elev=25, azim=45)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _save_closeness_radar(closeness_flat: torch.Tensor, grid_shape: tuple[int, int] | None, path: Path, title: str) -> None:
+    plt = _import_plotting()
+    lidar = torch.clamp(torch.nan_to_num(closeness_flat.detach().float(), nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+    lidar_np = lidar.cpu().numpy()
+    if grid_shape is None:
+        theta_bins, phi_bins = 1, int(lidar_np.size)
+    else:
+        theta_bins, phi_bins = int(grid_shape[0]), int(grid_shape[1])
+    if theta_bins * phi_bins != int(lidar_np.size) or phi_bins <= 0:
+        theta_bins, phi_bins = 1, int(lidar_np.size)
+    grid = lidar_np.reshape(theta_bins, phi_bins)
+
+    angles = np.linspace(0.0, 2.0 * np.pi, phi_bins, endpoint=False)
+    angles_closed = np.concatenate([angles, angles[:1]])
+
+    fig = plt.figure(figsize=(5.5, 5.5), dpi=150)
+    ax = fig.add_subplot(111, polar=True)
+    for theta_idx in range(theta_bins):
+        values = np.concatenate([grid[theta_idx], grid[theta_idx, :1]])
+        label = f"theta_bin_{theta_idx}" if theta_bins > 1 else None
+        ax.plot(angles_closed, values, linewidth=1.2, alpha=0.9, label=label)
+        ax.fill(angles_closed, values, alpha=0.08)
+    ax.set_theta_zero_location("E")
+    ax.set_theta_direction(-1)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title(title)
+    if theta_bins > 1:
+        ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.12), fontsize=7)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def save_lidarcheck_outputs(
+    *,
+    base_env: Any,
+    states: torch.Tensor,
+    state_dim: int,
+    lidar_dim: int,
+    lidar_grid_shape: tuple[int, int] | None,
+    output_root: Path,
+    global_step: int,
+    max_points: int,
+) -> None:
+    if int(lidar_dim) <= 0:
+        return
+    try:
+        lidar = base_env.scene["lidar"]
+    except Exception as exc:
+        print(f"[LIDARCHECK] skipped: lidar not available ({exc})", flush=True)
+        return
+
+    num_envs = int(getattr(base_env, "num_envs", states.shape[0]))
+    step_dir = output_root / f"step_{int(global_step):08d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+
+    env_ids = torch.arange(num_envs, device=getattr(base_env, "device", states.device))
+    try:
+        pointcloud = lidar.get_pointcloud(env_ids)
+    except Exception as exc:
+        print(f"[LIDARCHECK] pointcloud read failed at step={global_step}: {exc}", flush=True)
+        pointcloud = None
+    if isinstance(pointcloud, torch.Tensor) and pointcloud.dim() == 2:
+        pointcloud = pointcloud.unsqueeze(0)
+
+    lidar_obs = states[:, state_dim: state_dim + lidar_dim]
+    for env_id in range(num_envs):
+        prefix = f"env_{env_id:04d}"
+        if isinstance(pointcloud, torch.Tensor) and env_id < pointcloud.shape[0]:
+            pts_np = _finite_downsample_points(pointcloud[env_id], max_points=max_points)
+            _save_pointcloud_3d(
+                pts_np,
+                step_dir / f"{prefix}_pointcloud3d.png",
+                title=f"LiDAR point cloud env={env_id} step={global_step}",
+            )
+        _save_closeness_radar(
+            lidar_obs[env_id],
+            grid_shape=lidar_grid_shape,
+            path=step_dir / f"{prefix}_closeness_radar.png",
+            title=f"LiDAR closeness env={env_id} step={global_step}",
+        )
+    print(f"[LIDARCHECK] saved {num_envs} envs to {step_dir}", flush=True)
+
+
+# -----------------------------------------------------------------------------
 # Training entry point
 # -----------------------------------------------------------------------------
 def main() -> None:
@@ -746,6 +889,17 @@ def main() -> None:
     tb_dir = exp_dir / args.extra_tb_subdir
     tb_dir.mkdir(parents=True, exist_ok=True)
     config_path = exp_dir / "config" / "config.txt"
+    lidarcheck_interval = int(args.lidarcheck_step)
+    lidarcheck_root = (
+        _make_lidarcheck_dir(args.lidarcheck_dir, exp_dir)
+        if lidarcheck_interval > 0 and int(lidar_dim) > 0
+        else None
+    )
+    if lidarcheck_root is not None:
+        print(
+            f"[LIDARCHECK] enabled: every {lidarcheck_interval} steps, output={lidarcheck_root}",
+            flush=True,
+        )
     cfg["experiment"]["directory"] = str(log_root)
     cfg["experiment"]["experiment_name"] = run_name
     cfg["experiment"]["write_interval"] = int(args.tb_interval)
@@ -769,6 +923,9 @@ def main() -> None:
             "act_dim": int(act_dim),
             "step_dt": float(step_dt),
             "run_name": str(run_name),
+            "lidarcheck_step": int(lidarcheck_interval),
+            "lidarcheck_dir": str(lidarcheck_root) if lidarcheck_root is not None else "",
+            "lidarcheck_max_points": int(args.lidarcheck_max_points),
         },
         model_cfg=model_cfg_dict,
     )
@@ -832,6 +989,21 @@ def main() -> None:
                 last_good_snapshot = snapshot_models(models)
             next_obs, rewards, terminated, truncated, infos = env.step(actions)
             next_states = sanitize_states(ensure_obs_shape(extract_policy_obs(next_obs), num_envs, obs_dim), state_dim=state_dim, lidar_dim=lidar_dim)
+            if lidarcheck_root is not None and (global_step % lidarcheck_interval == 0):
+                try:
+                    with torch.no_grad():
+                        save_lidarcheck_outputs(
+                            base_env=base_env,
+                            states=next_states,
+                            state_dim=state_dim,
+                            lidar_dim=lidar_dim,
+                            lidar_grid_shape=lidar_grid_shape,
+                            output_root=lidarcheck_root,
+                            global_step=global_step,
+                            max_points=int(args.lidarcheck_max_points),
+                        )
+                except Exception as exc:
+                    print(f"[LIDARCHECK] failed at step={global_step}: {exc}", flush=True)
             rewards = ensure_vec_shape(torch.nan_to_num(rewards.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "rewards")
             terminated = ensure_vec_shape(torch.nan_to_num(terminated.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "terminated").bool()
             truncated = ensure_vec_shape(torch.nan_to_num(truncated.float(), nan=0.0, posinf=0.0, neginf=0.0), num_envs, "truncated").bool()

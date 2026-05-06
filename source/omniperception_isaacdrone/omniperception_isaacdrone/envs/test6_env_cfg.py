@@ -49,11 +49,11 @@ class NormalizationCfg:
 class ObstacleCurriculumSettingsCfg:
     """障碍物课程学习配置。"""
     enabled: bool = True
-    levels: tuple[int, ...] = (0, 10, 20, 50, 100)
+    levels: tuple[int, ...] = (0, 5, 10, 15, 20, 30, 50, 100)
     initial_level: int = 0
     success_term_name: str = "reached_goal"
     success_threshold: float = 0.85
-    success_thresholds: tuple[float, ...] = (0.90, 0.85, 0.82, 0.78, 0.75)
+    success_thresholds: tuple[float, ...] = (0.90, 0.86, 0.82, 0.80, 0.76, 0.72, 0.68, 0.64)
     k_roll: int = 8
     clear_history_on_promotion: bool = True
 
@@ -202,9 +202,9 @@ class Test6EventCfg:
 @configclass
 class Test6RewardsCfg:
     """奖励配置。"""
-    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=1.5, params={})
+    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=1.8, params={})
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.3, params={})
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-80.0, params={})
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-70.0, params={})
     # IsaacLab RewardManager 会额外乘以 dt=1/60；这里按“单次事件”目标值反推权重。
     success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=720.0, params={})
     collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-1800.0, params={})
@@ -227,10 +227,10 @@ class Test6CurriculumCfg:
     obstacle_count = CurrTerm(
         func=my_mdp.update_obstacle_curriculum,
         params={
-            "levels": (0, 10, 20, 50, 100),
+            "levels": (0, 5, 10, 15, 20, 30, 50, 100),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
-            "success_thresholds": (0.90, 0.85, 0.82, 0.78, 0.75),
+            "success_thresholds": (0.90, 0.86, 0.82, 0.80, 0.76, 0.72, 0.68, 0.64),
             "k_roll": 8,
         },
     )
