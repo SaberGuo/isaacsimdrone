@@ -116,12 +116,12 @@ def exact_obstacle_pointcloud_body(
 
 def exact_lidar_distance_grid(
     env: ManagerBasedRLEnv,
-    theta_min: float = 30.0,
-    theta_max: float = 90.0,
+    theta_min: float = 75.0,
+    theta_max: float = 105.0,
     phi_min: float = 0.0,
     phi_max: float = 360.0,
     delta_theta: float = 30.0,
-    delta_phi: float = 5.0,
+    delta_phi: float = 15.0,
     min_range: float = 0.2,
     max_distance: float = 50.0,
     obstacle_size_xy: float = 1.0,
@@ -172,12 +172,12 @@ def exact_lidar_distance_grid(
 
 def get_exact_lidar_grid_cached(
     env: ManagerBasedRLEnv,
-    theta_min: float = 30.0,
-    theta_max: float = 90.0,
+    theta_min: float = 75.0,
+    theta_max: float = 105.0,
     phi_min: float = 0.0,
     phi_max: float = 360.0,
     delta_theta: float = 30.0,
-    delta_phi: float = 5.0,
+    delta_phi: float = 15.0,
     min_range: float = 0.2,
     max_distance: float = 50.0,
     obstacle_size_xy: float = 1.0,
@@ -219,4 +219,3 @@ def get_exact_lidar_grid_cached(
     )
     env._lidar_grid_cache = {"step": current_step, "params": params, "data": grid}
     return grid
-

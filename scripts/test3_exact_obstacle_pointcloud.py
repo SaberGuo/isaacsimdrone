@@ -38,7 +38,7 @@ parser.add_argument("--theta_max", type=float, default=105.0)
 parser.add_argument("--phi_min", type=float, default=0.0)
 parser.add_argument("--phi_max", type=float, default=360.0)
 parser.add_argument("--delta_theta", type=float, default=30.0)
-parser.add_argument("--delta_phi", type=float, default=5.0)
+parser.add_argument("--delta_phi", type=float, default=15.0)
 parser.add_argument("--closeness_alpha", type=float, default=3.0)
 
 AppLauncher.add_app_launcher_args(parser)

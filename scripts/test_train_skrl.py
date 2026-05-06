@@ -31,7 +31,7 @@ parser.add_argument("--num_obstacles", type=int, default=100)
 parser.add_argument("--timesteps", type=int, default=10_000_000)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--state_dim", type=int, default=18)
-parser.add_argument("--lidar_dim", type=int, default=144)
+parser.add_argument("--lidar_dim", type=int, default=24)
 parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--model_cfg_path", type=str, default="")
 parser.add_argument("--model_cfg_json", type=str, default="")
@@ -77,12 +77,12 @@ parser.add_argument("--finite_check_interval", type=int, default=0)
 parser.add_argument("--lidarcheck_step", type=int, default=50000)
 parser.add_argument("--lidarcheck_dir", type=str, default="")
 parser.add_argument("--lidarcheck_max_points", type=int, default=4000)
-parser.add_argument("--theta_min", type=float, default=30.0)
-parser.add_argument("--theta_max", type=float, default=90.0)
+parser.add_argument("--theta_min", type=float, default=75.0)
+parser.add_argument("--theta_max", type=float, default=105.0)
 parser.add_argument("--phi_min", type=float, default=0.0)
 parser.add_argument("--phi_max", type=float, default=360.0)
 parser.add_argument("--delta_theta", type=float, default=30.0)
-parser.add_argument("--delta_phi", type=float, default=5.0)
+parser.add_argument("--delta_phi", type=float, default=15.0)
 parser.add_argument("--lidar_max_distance", type=float, default=50.0)
 parser.add_argument("--lidar_min_range", type=float, default=0.2)
 parser.add_argument("--lidar_surface_step", type=float, default=0.5)
@@ -257,11 +257,20 @@ def ensure_vec_shape(x: torch.Tensor, num_envs: int, name: str) -> torch.Tensor:
     raise RuntimeError(f"Invalid {name} shape")
 
 def sanitize_states(states: torch.Tensor, state_dim: int, lidar_dim: int, lidar_max_distance: float = 50.0) -> torch.Tensor:
+    """Clean raw base-env observations and normalize raw lidar distances to [0, 1]."""
     states = torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0)
     state = torch.clamp(states[:, :state_dim], -1.0, 1.0)
     if lidar_dim <= 0: return state
     max_distance = max(float(lidar_max_distance), 1.0e-6)
     lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim] / max_distance, 0.0, 1.0)
+    return torch.cat([state, lidar], dim=-1)
+
+def sanitize_wrapped_states(states: torch.Tensor, state_dim: int, lidar_dim: int) -> torch.Tensor:
+    """Clean observations returned by the skrl wrapper; lidar is already normalized."""
+    states = torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    state = torch.clamp(states[:, :state_dim], -1.0, 1.0)
+    if lidar_dim <= 0: return state
+    lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim], 0.0, 1.0)
     return torch.cat([state, lidar], dim=-1)
 
 def sanitize_actions(actions: torch.Tensor) -> torch.Tensor:
@@ -739,55 +748,201 @@ def _save_pointcloud_3d(points_np: np.ndarray, path: Path, title: str) -> None:
     plt.close(fig)
 
 
-def _save_lidar_distance_heatmap(distance_flat: torch.Tensor, grid_shape: tuple[int, int] | None, path: Path, title: str, max_distance: float) -> None:
+def _plot_body_axes(ax, axis_len: float = 2.0) -> None:
+    ax.scatter([0.0], [0.0], [0.0], c="red", s=28, marker="x", label="body origin")
+    ax.quiver(0, 0, 0, axis_len, 0, 0, color="red", linewidth=1.0)
+    ax.quiver(0, 0, 0, 0, axis_len, 0, color="green", linewidth=1.0)
+    ax.quiver(0, 0, 0, 0, 0, axis_len, color="blue", linewidth=1.0)
+
+
+def _reshape_lidar_flat(flat: torch.Tensor, grid_shape: tuple[int, int] | None) -> np.ndarray:
+    arr = flat.detach().cpu().numpy()
+    if grid_shape is None:
+        theta_bins, phi_bins = 1, int(arr.size)
+    else:
+        theta_bins, phi_bins = int(grid_shape[0]), int(grid_shape[1])
+    if theta_bins * phi_bins != int(arr.size) or phi_bins <= 0:
+        theta_bins, phi_bins = 1, int(arr.size)
+    return arr.reshape(theta_bins, phi_bins)
+
+
+def _masked_cmap(plt, name: str = "viridis_r"):
+    cmap = plt.get_cmap(name).copy()
+    cmap.set_bad(color=(0.82, 0.82, 0.82, 1.0))
+    return cmap
+
+
+def _save_lidar_distance_heatmap(
+    distance_flat: torch.Tensor,
+    grid_shape: tuple[int, int] | None,
+    path: Path,
+    title: str,
+    max_distance: float,
+    valid_flat: torch.Tensor | None = None,
+) -> None:
     plt = _import_plotting()
     lidar = torch.clamp(
         torch.nan_to_num(distance_flat.detach().float(), nan=float(max_distance), posinf=float(max_distance), neginf=0.0),
         0.0,
         float(max_distance),
     )
-    lidar_np = lidar.cpu().numpy()
-    if grid_shape is None:
-        theta_bins, phi_bins = 1, int(lidar_np.size)
-    else:
-        theta_bins, phi_bins = int(grid_shape[0]), int(grid_shape[1])
-    if theta_bins * phi_bins != int(lidar_np.size) or phi_bins <= 0:
-        theta_bins, phi_bins = 1, int(lidar_np.size)
-    grid = lidar_np.reshape(theta_bins, phi_bins)
+    grid = _reshape_lidar_flat(lidar, grid_shape)
+    if valid_flat is not None:
+        valid = _reshape_lidar_flat(valid_flat.detach().bool().to(torch.float32), grid_shape).astype(bool)
+        grid = np.ma.array(grid, mask=~valid)
 
     fig, ax = plt.subplots(figsize=(9.0, 3.2), dpi=150)
-    im = ax.imshow(grid, origin="lower", aspect="auto", interpolation="nearest", vmin=0.0, vmax=float(max_distance), cmap="viridis_r")
+    im = ax.imshow(
+        grid,
+        origin="lower",
+        aspect="auto",
+        interpolation="nearest",
+        vmin=0.0,
+        vmax=float(max_distance),
+        cmap=_masked_cmap(plt),
+    )
     ax.set_xlabel("phi bin")
     ax.set_ylabel("theta bin")
     ax.set_title(title)
-    fig.colorbar(im, ax=ax, label="nearest exact obstacle range (m)")
+    fig.colorbar(im, ax=ax, label="nearest exact obstacle range (m); gray = empty bin")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
 
 
-def _save_lidar_state_heatmap(state_flat: torch.Tensor, grid_shape: tuple[int, int] | None, path: Path, title: str) -> None:
+def _save_lidar_state_heatmap(
+    state_flat: torch.Tensor,
+    grid_shape: tuple[int, int] | None,
+    path: Path,
+    title: str,
+    valid_flat: torch.Tensor | None = None,
+) -> None:
     plt = _import_plotting()
     lidar = torch.clamp(
         torch.nan_to_num(state_flat.detach().float(), nan=1.0, posinf=1.0, neginf=0.0),
         0.0,
         1.0,
     )
-    lidar_np = lidar.cpu().numpy()
-    if grid_shape is None:
-        theta_bins, phi_bins = 1, int(lidar_np.size)
-    else:
-        theta_bins, phi_bins = int(grid_shape[0]), int(grid_shape[1])
-    if theta_bins * phi_bins != int(lidar_np.size) or phi_bins <= 0:
-        theta_bins, phi_bins = 1, int(lidar_np.size)
-    grid = lidar_np.reshape(theta_bins, phi_bins)
+    grid = _reshape_lidar_flat(lidar, grid_shape)
+    if valid_flat is not None:
+        valid = _reshape_lidar_flat(valid_flat.detach().bool().to(torch.float32), grid_shape).astype(bool)
+        grid = np.ma.array(grid, mask=~valid)
 
     fig, ax = plt.subplots(figsize=(9.0, 3.2), dpi=150)
-    im = ax.imshow(grid, origin="lower", aspect="auto", interpolation="nearest", vmin=0.0, vmax=1.0, cmap="viridis_r")
+    im = ax.imshow(
+        grid,
+        origin="lower",
+        aspect="auto",
+        interpolation="nearest",
+        vmin=0.0,
+        vmax=1.0,
+        cmap=_masked_cmap(plt),
+    )
     ax.set_xlabel("phi bin")
     ax.set_ylabel("theta bin")
     ax.set_title(title)
-    fig.colorbar(im, ax=ax, label="normalized nearest range [0, 1]")
+    fig.colorbar(im, ax=ax, label="normalized nearest range [0, 1]; gray = empty bin")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _lidar_bin_center_dirs(grid_shape: tuple[int, int] | None) -> np.ndarray:
+    if grid_shape is None:
+        theta_bins = 1
+        phi_bins = max(int(round((float(args.phi_max) - float(args.phi_min)) / float(args.delta_phi))), 1)
+    else:
+        theta_bins, phi_bins = int(grid_shape[0]), int(grid_shape[1])
+    theta_centers = np.deg2rad(
+        float(args.theta_min) + (np.arange(theta_bins, dtype=np.float32) + 0.5) * float(args.delta_theta)
+    )
+    phi_centers = np.deg2rad(
+        float(args.phi_min) + (np.arange(phi_bins, dtype=np.float32) + 0.5) * float(args.delta_phi)
+    )
+    tt, pp = np.meshgrid(theta_centers, phi_centers, indexing="ij")
+    dirs = np.stack(
+        [np.sin(tt) * np.cos(pp), np.sin(tt) * np.sin(pp), np.cos(tt)],
+        axis=-1,
+    )
+    return dirs.reshape(-1, 3).astype(np.float32)
+
+
+def _save_lidar_state_3d(
+    state_flat: torch.Tensor,
+    valid_flat: torch.Tensor,
+    grid_shape: tuple[int, int] | None,
+    path: Path,
+    title: str,
+) -> None:
+    plt = _import_plotting()
+    state = torch.clamp(
+        torch.nan_to_num(state_flat.detach().float(), nan=1.0, posinf=1.0, neginf=0.0),
+        0.0,
+        1.0,
+    ).cpu().numpy()
+    valid = valid_flat.detach().bool().cpu().numpy()
+    dirs = _lidar_bin_center_dirs(grid_shape)
+    if dirs.shape[0] != state.shape[0]:
+        dirs = _lidar_bin_center_dirs((1, int(state.shape[0])))
+    points = dirs * state[:, None]
+    empty_points = dirs
+
+    fig = plt.figure(figsize=(7.0, 6.4), dpi=150)
+    ax = fig.add_subplot(111, projection="3d")
+    if (~valid).any():
+        ax.scatter(
+            empty_points[~valid, 0],
+            empty_points[~valid, 1],
+            empty_points[~valid, 2],
+            c="lightgray",
+            s=18,
+            alpha=0.24,
+            linewidths=0,
+            label="empty bins at state=1",
+        )
+    if valid.any():
+        sc = ax.scatter(
+            points[valid, 0],
+            points[valid, 1],
+            points[valid, 2],
+            c=state[valid],
+            cmap="viridis_r",
+            vmin=0.0,
+            vmax=1.0,
+            s=36,
+            alpha=0.96,
+            linewidths=0,
+            label="state bins",
+        )
+        fig.colorbar(sc, ax=ax, shrink=0.72, pad=0.08, label="normalized range state [0, 1]")
+    else:
+        ax.text2D(0.18, 0.5, "No occupied LiDAR state bins", transform=ax.transAxes)
+
+    _plot_body_axes(ax, axis_len=0.18)
+    radius = 1.0
+    ax.set_xlim(-radius, radius)
+    ax.set_ylim(-radius, radius)
+    ax.set_zlim(-radius, radius)
+    ax.set_xlabel("body x forward (normalized)")
+    ax.set_ylabel("body y left (normalized)")
+    ax.set_zlabel("body z up (normalized)")
+    ax.set_title(f"{title}\noccupied={int(valid.sum())}/{int(valid.size)}")
+    ax.view_init(elev=22.0, azim=-58.0)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _save_lidar_valid_mask(valid_flat: torch.Tensor, grid_shape: tuple[int, int] | None, path: Path, title: str) -> None:
+    plt = _import_plotting()
+    valid = _reshape_lidar_flat(valid_flat.detach().bool().to(torch.float32), grid_shape)
+    fig, ax = plt.subplots(figsize=(9.0, 3.2), dpi=150)
+    im = ax.imshow(valid, origin="lower", aspect="auto", interpolation="nearest", vmin=0.0, vmax=1.0, cmap="gray_r")
+    ax.set_xlabel("phi bin")
+    ax.set_ylabel("theta bin")
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax, label="occupied bin")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -826,6 +981,7 @@ def save_lidarcheck_outputs(
 
     lidar_state = states[:, state_dim: state_dim + lidar_dim]
     lidar_distance = torch.clamp(lidar_state, 0.0, 1.0) * float(args.lidar_max_distance)
+    valid_mask = lidar_distance < (float(args.lidar_max_distance) - 1.0e-5)
     for env_id in range(num_envs):
         prefix = f"env_{env_id:04d}"
         if isinstance(pointcloud, list) and env_id < len(pointcloud):
@@ -841,12 +997,27 @@ def save_lidarcheck_outputs(
             path=step_dir / f"{prefix}_distance_grid.png",
             title=f"Exact LiDAR distance grid env={env_id} step={global_step}",
             max_distance=float(args.lidar_max_distance),
+            valid_flat=valid_mask[env_id],
         )
         _save_lidar_state_heatmap(
             lidar_state[env_id],
             grid_shape=lidar_grid_shape,
             path=step_dir / f"{prefix}_state_0_1_grid.png",
             title=f"Exact LiDAR normalized state env={env_id} step={global_step}",
+            valid_flat=valid_mask[env_id],
+        )
+        _save_lidar_valid_mask(
+            valid_mask[env_id],
+            grid_shape=lidar_grid_shape,
+            path=step_dir / f"{prefix}_valid_mask.png",
+            title=f"Exact LiDAR occupied bins env={env_id} step={global_step}",
+        )
+        _save_lidar_state_3d(
+            lidar_state[env_id],
+            valid_mask[env_id],
+            grid_shape=lidar_grid_shape,
+            path=step_dir / f"{prefix}_state_0_1_3d.png",
+            title=f"Exact LiDAR normalized state 3D env={env_id} step={global_step}",
         )
     print(f"[LIDARCHECK] saved {num_envs} envs to {step_dir}", flush=True)
 
@@ -1068,11 +1239,10 @@ def main() -> None:
     loss_mirror = SkrlLossMirror()
     loss_mirror.bind(agent)
     raw_obs, infos = env.reset()
-    states = sanitize_states(
+    states = sanitize_wrapped_states(
         ensure_obs_shape(extract_policy_obs(raw_obs), num_envs, obs_dim),
         state_dim=state_dim,
         lidar_dim=lidar_dim,
-        lidar_max_distance=float(args.lidar_max_distance),
     )
     finite_check_interval = int(args.finite_check_interval)
     keep_nan_snapshot = finite_check_interval > 0
@@ -1110,11 +1280,10 @@ def main() -> None:
             if keep_nan_snapshot and rollout_boundary:
                 last_good_snapshot = snapshot_models(models)
             next_obs, rewards, terminated, truncated, infos = env.step(actions)
-            next_states = sanitize_states(
+            next_states = sanitize_wrapped_states(
                 ensure_obs_shape(extract_policy_obs(next_obs), num_envs, obs_dim),
                 state_dim=state_dim,
                 lidar_dim=lidar_dim,
-                lidar_max_distance=float(args.lidar_max_distance),
             )
             if lidarcheck_root is not None and (global_step % lidarcheck_interval == 0):
                 try:

@@ -299,12 +299,12 @@ def penalty_lidar_threat(
     use_horizontal_speed: bool = True,
     exp_clip: float = 1.0,
     use_grid: bool = True,
-    theta_min: float = 30.0,
-    theta_max: float = 90.0,
+    theta_min: float = 75.0,
+    theta_max: float = 105.0,
     phi_min: float = 0.0,
     phi_max: float = 360.0,
     delta_theta: float = 1.0,
-    delta_phi: float = 5.0,
+    delta_phi: float = 15.0,
     max_vis_points: int | None = None,
 ) -> torch.Tensor:
     """AirSim 风格 LiDAR 安全距离 barrier。
@@ -361,12 +361,12 @@ def penalty_safe_vel(
     safe_dist: float = 8.0,
     margin: float = 2.0,
     front_cos_threshold: float = 0.6,
-    theta_min: float = 30.0,
-    theta_max: float = 90.0,
+    theta_min: float = 75.0,
+    theta_max: float = 105.0,
     phi_min: float = 0.0,
     phi_max: float = 360.0,
     delta_theta: float = 20.0,
-    delta_phi: float = 5.0,
+    delta_phi: float = 15.0,
     max_vis_points: int | None = 12000,
 ) -> torch.Tensor:
     """动态安全速度惩罚 (NavRL 风格)。"""

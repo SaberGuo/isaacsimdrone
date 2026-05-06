@@ -157,12 +157,12 @@ class Test6ObservationsCfg:
             params=dict(
                 # Exact obstacle geometry range grid:
                 # theta is the polar angle from body +Z, phi is azimuth around body Z.
-                theta_min=30.0,
-                theta_max=90.0,
+                theta_min=75.0,
+                theta_max=105.0,
                 phi_min=0.0,
                 phi_max=360.0,
                 delta_theta=30.0,
-                delta_phi=5.0,
+                delta_phi=15.0,
                 min_range=0.2,
                 max_distance=50.0,
                 obstacle_size_xy=1.0,
@@ -206,14 +206,14 @@ class Test6EventCfg:
 @configclass
 class Test6RewardsCfg:
     """奖励配置。"""
-    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=1.8, params={})
+    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=3.0, params={})
     height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.3, params={})
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-70.0, params={})
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-15.0, params={})
     # IsaacLab RewardManager 会额外乘以 dt=1/60；这里按“单次事件”目标值反推权重。
-    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=720.0, params={})
-    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-1800.0, params={})
+    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=480.0, params={})
+    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-900.0, params={})
     oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-900.0, params={})
-    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-720.0, params={})
+    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-480.0, params={})
 
 
 @configclass
@@ -231,7 +231,7 @@ class Test6CurriculumCfg:
     obstacle_count = CurrTerm(
         func=my_mdp.update_obstacle_curriculum,
         params={
-            "levels": (0, 5, 10, 15, 20, 30, 50, 100),
+            "levels": (30, 5, 10, 15, 20, 30, 50, 100),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
             "success_thresholds": (0.90, 0.86, 0.82, 0.80, 0.76, 0.72, 0.68, 0.64),
@@ -330,12 +330,12 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "use_horizontal_speed": True,
             "exp_clip": 1.0,
             "use_grid": True,
-            "theta_min": 30.0,
-            "theta_max": 90.0,
+            "theta_min": 75.0,
+            "theta_max": 105.0,
             "phi_min": 0.0,
             "phi_max": 360.0,
             "delta_theta": 30.0,
-            "delta_phi": 5.0,
+            "delta_phi": 15.0,
             "max_vis_points": None,
         }
         self.rewards.success_bonus.params = {

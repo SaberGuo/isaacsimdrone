@@ -25,16 +25,16 @@ parser.add_argument("--num_obstacles", type=int, default=20)
 parser.add_argument("--seed", type=int, default=42)
 
 parser.add_argument("--state_dim", type=int, default=18)
-parser.add_argument("--lidar_dim", type=int, default=144)
+parser.add_argument("--lidar_dim", type=int, default=24)
 parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--model_cfg_path", type=str, default="")
 parser.add_argument("--model_cfg_json", type=str, default="")
-parser.add_argument("--theta_min", type=float, default=30.0)
-parser.add_argument("--theta_max", type=float, default=90.0)
+parser.add_argument("--theta_min", type=float, default=75.0)
+parser.add_argument("--theta_max", type=float, default=105.0)
 parser.add_argument("--phi_min", type=float, default=0.0)
 parser.add_argument("--phi_max", type=float, default=360.0)
 parser.add_argument("--delta_theta", type=float, default=30.0)
-parser.add_argument("--delta_phi", type=float, default=5.0)
+parser.add_argument("--delta_phi", type=float, default=15.0)
 parser.add_argument("--lidar_max_distance", type=float, default=50.0)
 parser.add_argument("--lidar_min_range", type=float, default=0.2)
 parser.add_argument("--lidar_surface_step", type=float, default=0.5)
@@ -229,12 +229,27 @@ def sanitize_states(
     lidar_dim: int,
     lidar_max_distance: float = 50.0,
 ) -> torch.Tensor:
+    """Clean raw base-env observations and normalize raw lidar distances to [0, 1]."""
     states = torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0)
     state = torch.clamp(states[:, :state_dim], -1.0, 1.0)
     if lidar_dim <= 0:
         return state
     max_distance = max(float(lidar_max_distance), 1.0e-6)
     lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim] / max_distance, 0.0, 1.0)
+    return torch.cat([state, lidar], dim=-1)
+
+
+def sanitize_wrapped_states(
+    states: torch.Tensor,
+    state_dim: int,
+    lidar_dim: int,
+) -> torch.Tensor:
+    """Clean observations returned by the skrl wrapper; lidar is already normalized."""
+    states = torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    state = torch.clamp(states[:, :state_dim], -1.0, 1.0)
+    if lidar_dim <= 0:
+        return state
+    lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim], 0.0, 1.0)
     return torch.cat([state, lidar], dim=-1)
 
 
@@ -742,11 +757,10 @@ def main() -> None:
     # 初始 reset
     # ------------------------------------------------------------------
     obs, infos = env.reset()
-    states = sanitize_states(
+    states = sanitize_wrapped_states(
         ensure_obs_shape(extract_policy_obs(obs), num_envs, obs_dim),
         state_dim=state_dim,
         lidar_dim=lidar_dim,
-        lidar_max_distance=float(args.lidar_max_distance),
     )
 
     maybe_print_goal(base_env)
@@ -782,11 +796,10 @@ def main() -> None:
             # --------------------------------------------------------------
             next_obs, rewards, terminated, truncated, infos = env.step(actions)
 
-            next_states = sanitize_states(
+            next_states = sanitize_wrapped_states(
                 ensure_obs_shape(extract_policy_obs(next_obs), num_envs, obs_dim),
                 state_dim=state_dim,
                 lidar_dim=lidar_dim,
-                lidar_max_distance=float(args.lidar_max_distance),
             )
             rewards    = ensure_vec_shape(
                 torch.nan_to_num(rewards.float(),    nan=0.0, posinf=0.0, neginf=0.0),
