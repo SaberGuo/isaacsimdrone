@@ -41,7 +41,7 @@ def _init_curriculum_state(
     u.curr_level_idx = 0
 
     # ------------------------------------------------------------------ #
-    # 统一字段名：curr_obstacle_count（test6_events.py 也读取此字段）       #
+    # 统一字段名：curr_obstacle_count（test_events.py 也读取此字段）       #
     # ------------------------------------------------------------------ #
     u.curr_obstacle_count = int(levels[0])
 
@@ -188,7 +188,7 @@ def update_obstacle_curriculum(
         u.curr_level_idx      += 1
         # ----------------------------------------------------------------
         # 关键修复：同时更新 curr_obstacle_count
-        # test6_events.py 读取的正是这个字段
+        # test_events.py 读取的正是这个字段
         # ----------------------------------------------------------------
         u.curr_obstacle_count = int(u.curr_levels[u.curr_level_idx])
 

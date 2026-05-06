@@ -55,7 +55,7 @@ import torch
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 
-import omniperception_isaacdrone.tasks.test6_registry as _test_registry  # noqa: F401
+import omniperception_isaacdrone.tasks.test_registry as _test_registry  # noqa: F401
 from isaaclab.utils.math import quat_apply, quat_apply_inverse
 from isaaclab_tasks.utils import parse_env_cfg
 

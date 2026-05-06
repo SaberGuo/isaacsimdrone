@@ -31,7 +31,7 @@ parser.add_argument("--num_obstacles", type=int, default=100)
 parser.add_argument("--timesteps", type=int, default=10_000_000)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--state_dim", type=int, default=18)
-parser.add_argument("--lidar_dim", type=int, default=432)
+parser.add_argument("--lidar_dim", type=int, default=144)
 parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--model_cfg_path", type=str, default="")
 parser.add_argument("--model_cfg_json", type=str, default="")
@@ -74,10 +74,18 @@ parser.add_argument("--debug_act", action="store_true", default=False)
 parser.add_argument("--pbar_interval", type=int, default=50)
 parser.add_argument("--render_interval", type=int, default=0)
 parser.add_argument("--finite_check_interval", type=int, default=0)
-parser.add_argument("--lidarcheck_step", type=int, default=1000)
+parser.add_argument("--lidarcheck_step", type=int, default=50000)
 parser.add_argument("--lidarcheck_dir", type=str, default="")
 parser.add_argument("--lidarcheck_max_points", type=int, default=4000)
-parser.add_argument("--K_accumulate", type=int, default=4)
+parser.add_argument("--theta_min", type=float, default=30.0)
+parser.add_argument("--theta_max", type=float, default=90.0)
+parser.add_argument("--phi_min", type=float, default=0.0)
+parser.add_argument("--phi_max", type=float, default=360.0)
+parser.add_argument("--delta_theta", type=float, default=30.0)
+parser.add_argument("--delta_phi", type=float, default=5.0)
+parser.add_argument("--lidar_max_distance", type=float, default=50.0)
+parser.add_argument("--lidar_min_range", type=float, default=0.2)
+parser.add_argument("--lidar_surface_step", type=float, default=0.5)
 
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -92,7 +100,7 @@ import isaacsim.core.utils.prims as prim_utils
 import numpy as np
 import torch
 import torch.nn as nn
-import omniperception_isaacdrone.tasks.test6_registry as _test6_registry  # noqa: F401
+import omniperception_isaacdrone.tasks.test_registry as _test_registry  # noqa: F401
 from gymnasium.spaces import Box
 from isaaclab_tasks.utils import parse_env_cfg
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
@@ -105,6 +113,7 @@ from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 from omniperception_isaacdrone.envs.test_env import WallSpawner, setup_global_obstacles
 from omniperception_isaacdrone.models import Policy, Value, model_cfg_to_dict, resolve_model_cfg
+from omniperception_isaacdrone.tasks.mdp.test_lidar_data import exact_obstacle_pointcloud_body
 
 # -----------------------------------------------------------------------------
 # Runtime metadata and backend settings
@@ -247,11 +256,12 @@ def ensure_vec_shape(x: torch.Tensor, num_envs: int, name: str) -> torch.Tensor:
     if x.dim() == 2 and x.shape[0] == num_envs: return x
     raise RuntimeError(f"Invalid {name} shape")
 
-def sanitize_states(states: torch.Tensor, state_dim: int, lidar_dim: int) -> torch.Tensor:
+def sanitize_states(states: torch.Tensor, state_dim: int, lidar_dim: int, lidar_max_distance: float = 50.0) -> torch.Tensor:
     states = torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0)
     state = torch.clamp(states[:, :state_dim], -1.0, 1.0)
     if lidar_dim <= 0: return state
-    lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim], 0.0, 1.0)
+    max_distance = max(float(lidar_max_distance), 1.0e-6)
+    lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim] / max_distance, 0.0, 1.0)
     return torch.cat([state, lidar], dim=-1)
 
 def sanitize_actions(actions: torch.Tensor) -> torch.Tensor:
@@ -296,16 +306,55 @@ def infer_lidar_grid_shape(base_env: Any, lidar_dim: int) -> tuple[int, int] | N
     return None
 
 
+def apply_lidar_grid_cli_params(env_cfg: Any) -> None:
+    params = {
+        "theta_min": float(args.theta_min),
+        "theta_max": float(args.theta_max),
+        "phi_min": float(args.phi_min),
+        "phi_max": float(args.phi_max),
+        "delta_theta": float(args.delta_theta),
+        "delta_phi": float(args.delta_phi),
+        "min_range": float(args.lidar_min_range),
+        "max_distance": float(args.lidar_max_distance),
+        "obstacle_size_xy": 1.0,
+        "obstacle_height": 10.0,
+        "surface_step": float(args.lidar_surface_step),
+    }
+    try:
+        env_cfg.observations.policy.lidar_grid.params = dict(params)
+    except Exception:
+        pass
+    try:
+        reward_params = getattr(env_cfg.rewards.lidar_threat, "params", None) or {}
+        reward_params.update(
+            {
+                "use_grid": True,
+                "theta_min": params["theta_min"],
+                "theta_max": params["theta_max"],
+                "phi_min": params["phi_min"],
+                "phi_max": params["phi_max"],
+                "delta_theta": params["delta_theta"],
+                "delta_phi": params["delta_phi"],
+                "max_vis_points": None,
+            }
+        )
+        env_cfg.rewards.lidar_threat.params = reward_params
+    except Exception:
+        pass
+
+
 # -----------------------------------------------------------------------------
 # skrl space adapter
 # -----------------------------------------------------------------------------
-def build_skrl_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int, int, gym.spaces.Dict, Box]:
+def build_skrl_spaces(base_env: Any, state_dim: int, lidar_dim: int, lidar_max_distance: float) -> tuple[int, int, gym.spaces.Dict, Box]:
     num_envs = int(getattr(base_env, "num_envs", 1))
     act_space = getattr(base_env, "single_action_space", getattr(base_env, "action_space", None))
     act_dim = infer_single_dim_from_box(act_space, num_envs) if isinstance(act_space, gym.spaces.Box) else 4
     obs_dim = state_dim + lidar_dim
     obs_low, obs_high = -np.ones((obs_dim,), dtype=np.float32), np.ones((obs_dim,), dtype=np.float32)
-    if lidar_dim > 0: obs_low[state_dim:] = 0.0
+    if lidar_dim > 0:
+        obs_low[state_dim:] = 0.0
+        obs_high[state_dim:] = 1.0
     return obs_dim, act_dim, gym.spaces.Dict({"policy": Box(low=obs_low, high=obs_high, dtype=np.float32)}), Box(low=-np.ones((act_dim,), dtype=np.float32), high=np.ones((act_dim,), dtype=np.float32), dtype=np.float32)
 
 
@@ -318,81 +367,31 @@ class SkrlSpaceAdapter(gym.Wrapper):
         act_space: Box,
         state_dim: int,
         lidar_dim: int,
-        k_accumulate: int = 1,
+        lidar_max_distance: float = 50.0,
     ):
         super().__init__(env)
         self.state_dim, self.lidar_dim, self.obs_dim = int(state_dim), int(lidar_dim), int(state_dim) + int(lidar_dim)
-        self.k_accumulate = max(int(k_accumulate), 1)
-        self._lidar_hist: torch.Tensor | None = None
-        self._lidar_hist_index = 0
-        self._lidar_hist_count = 0
+        self.lidar_max_distance = float(lidar_max_distance)
         self.observation_space = self.single_observation_space = obs_space
         self.action_space = self.single_action_space = act_space
         self.num_envs = int(getattr(env, "num_envs", 1))
         self.device = getattr(env, "device", None)
-
-    def _reset_lidar_history(self, env_mask: torch.Tensor | None = None) -> None:
-        if self._lidar_hist is None:
-            return
-        if env_mask is None:
-            self._lidar_hist.zero_()
-            self._lidar_hist_index = 0
-            self._lidar_hist_count = 0
-            return
-        mask = env_mask.detach().to(device=self._lidar_hist.device).reshape(self.num_envs).bool()
-        if mask.any():
-            self._lidar_hist[:, mask, :] = 0.0
-
-    def _accumulate_lidar(self, obs: torch.Tensor) -> torch.Tensor:
-        if self.lidar_dim <= 0 or self.k_accumulate <= 1:
-            return obs
-        if obs.shape[-1] < self.state_dim + self.lidar_dim:
-            return obs
-
-        state = obs[:, :self.state_dim]
-        lidar = obs[:, self.state_dim:self.state_dim + self.lidar_dim]
-
-        if (
-            self._lidar_hist is None
-            or self._lidar_hist.shape != (self.k_accumulate, self.num_envs, self.lidar_dim)
-            or self._lidar_hist.device != obs.device
-            or self._lidar_hist.dtype != obs.dtype
-        ):
-            self._lidar_hist = torch.zeros(
-                (self.k_accumulate, self.num_envs, self.lidar_dim),
-                device=obs.device,
-                dtype=obs.dtype,
-            )
-            self._lidar_hist_index = 0
-            self._lidar_hist_count = 0
-
-        self._lidar_hist[self._lidar_hist_index].copy_(lidar)
-        self._lidar_hist_index = (self._lidar_hist_index + 1) % self.k_accumulate
-        self._lidar_hist_count = min(self._lidar_hist_count + 1, self.k_accumulate)
-
-        lidar_acc = self._lidar_hist[:self._lidar_hist_count].max(dim=0).values
-        return torch.cat([state, lidar_acc], dim=-1)
 
     def _convert_obs(self, raw_obs: Any) -> dict[str, torch.Tensor]:
         obs = sanitize_states(
             ensure_obs_shape(extract_policy_obs(raw_obs), self.num_envs, self.obs_dim),
             self.state_dim,
             self.lidar_dim,
+            lidar_max_distance=self.lidar_max_distance,
         )
-        return {"policy": self._accumulate_lidar(obs)}
+        return {"policy": obs}
 
     def reset(self, **kwargs):
         raw_obs, infos = self.env.reset(**kwargs)
-        self._reset_lidar_history()
         return self._convert_obs(raw_obs), infos
 
     def step(self, actions):
         raw_obs, rewards, terminated, truncated, infos = self.env.step(actions)
-        try:
-            done_mask = terminated.reshape(self.num_envs).bool() | truncated.reshape(self.num_envs).bool()
-            self._reset_lidar_history(done_mask)
-        except Exception:
-            pass
         obs = self._convert_obs(raw_obs)
         return obs, rewards, terminated, truncated, infos
 
@@ -740,9 +739,13 @@ def _save_pointcloud_3d(points_np: np.ndarray, path: Path, title: str) -> None:
     plt.close(fig)
 
 
-def _save_closeness_radar(closeness_flat: torch.Tensor, grid_shape: tuple[int, int] | None, path: Path, title: str) -> None:
+def _save_lidar_distance_heatmap(distance_flat: torch.Tensor, grid_shape: tuple[int, int] | None, path: Path, title: str, max_distance: float) -> None:
     plt = _import_plotting()
-    lidar = torch.clamp(torch.nan_to_num(closeness_flat.detach().float(), nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+    lidar = torch.clamp(
+        torch.nan_to_num(distance_flat.detach().float(), nan=float(max_distance), posinf=float(max_distance), neginf=0.0),
+        0.0,
+        float(max_distance),
+    )
     lidar_np = lidar.cpu().numpy()
     if grid_shape is None:
         theta_bins, phi_bins = 1, int(lidar_np.size)
@@ -752,22 +755,39 @@ def _save_closeness_radar(closeness_flat: torch.Tensor, grid_shape: tuple[int, i
         theta_bins, phi_bins = 1, int(lidar_np.size)
     grid = lidar_np.reshape(theta_bins, phi_bins)
 
-    angles = np.linspace(0.0, 2.0 * np.pi, phi_bins, endpoint=False)
-    angles_closed = np.concatenate([angles, angles[:1]])
-
-    fig = plt.figure(figsize=(5.5, 5.5), dpi=150)
-    ax = fig.add_subplot(111, polar=True)
-    for theta_idx in range(theta_bins):
-        values = np.concatenate([grid[theta_idx], grid[theta_idx, :1]])
-        label = f"theta_bin_{theta_idx}" if theta_bins > 1 else None
-        ax.plot(angles_closed, values, linewidth=1.2, alpha=0.9, label=label)
-        ax.fill(angles_closed, values, alpha=0.08)
-    ax.set_theta_zero_location("E")
-    ax.set_theta_direction(-1)
-    ax.set_ylim(0.0, 1.0)
+    fig, ax = plt.subplots(figsize=(9.0, 3.2), dpi=150)
+    im = ax.imshow(grid, origin="lower", aspect="auto", interpolation="nearest", vmin=0.0, vmax=float(max_distance), cmap="viridis_r")
+    ax.set_xlabel("phi bin")
+    ax.set_ylabel("theta bin")
     ax.set_title(title)
-    if theta_bins > 1:
-        ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.12), fontsize=7)
+    fig.colorbar(im, ax=ax, label="nearest exact obstacle range (m)")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _save_lidar_state_heatmap(state_flat: torch.Tensor, grid_shape: tuple[int, int] | None, path: Path, title: str) -> None:
+    plt = _import_plotting()
+    lidar = torch.clamp(
+        torch.nan_to_num(state_flat.detach().float(), nan=1.0, posinf=1.0, neginf=0.0),
+        0.0,
+        1.0,
+    )
+    lidar_np = lidar.cpu().numpy()
+    if grid_shape is None:
+        theta_bins, phi_bins = 1, int(lidar_np.size)
+    else:
+        theta_bins, phi_bins = int(grid_shape[0]), int(grid_shape[1])
+    if theta_bins * phi_bins != int(lidar_np.size) or phi_bins <= 0:
+        theta_bins, phi_bins = 1, int(lidar_np.size)
+    grid = lidar_np.reshape(theta_bins, phi_bins)
+
+    fig, ax = plt.subplots(figsize=(9.0, 3.2), dpi=150)
+    im = ax.imshow(grid, origin="lower", aspect="auto", interpolation="nearest", vmin=0.0, vmax=1.0, cmap="viridis_r")
+    ax.set_xlabel("phi bin")
+    ax.set_ylabel("theta bin")
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax, label="normalized nearest range [0, 1]")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -786,40 +806,47 @@ def save_lidarcheck_outputs(
 ) -> None:
     if int(lidar_dim) <= 0:
         return
-    try:
-        lidar = base_env.scene["lidar"]
-    except Exception as exc:
-        print(f"[LIDARCHECK] skipped: lidar not available ({exc})", flush=True)
-        return
 
     num_envs = int(getattr(base_env, "num_envs", states.shape[0]))
     step_dir = output_root / f"step_{int(global_step):08d}"
     step_dir.mkdir(parents=True, exist_ok=True)
 
-    env_ids = torch.arange(num_envs, device=getattr(base_env, "device", states.device))
     try:
-        pointcloud = lidar.get_pointcloud(env_ids)
+        pointcloud = exact_obstacle_pointcloud_body(
+            base_env,
+            obstacle_size_xy=1.0,
+            obstacle_height=10.0,
+            surface_step=float(args.lidar_surface_step),
+            min_range=float(args.lidar_min_range),
+            max_distance=float(args.lidar_max_distance),
+        )
     except Exception as exc:
-        print(f"[LIDARCHECK] pointcloud read failed at step={global_step}: {exc}", flush=True)
+        print(f"[LIDARCHECK] exact pointcloud build failed at step={global_step}: {exc}", flush=True)
         pointcloud = None
-    if isinstance(pointcloud, torch.Tensor) and pointcloud.dim() == 2:
-        pointcloud = pointcloud.unsqueeze(0)
 
-    lidar_obs = states[:, state_dim: state_dim + lidar_dim]
+    lidar_state = states[:, state_dim: state_dim + lidar_dim]
+    lidar_distance = torch.clamp(lidar_state, 0.0, 1.0) * float(args.lidar_max_distance)
     for env_id in range(num_envs):
         prefix = f"env_{env_id:04d}"
-        if isinstance(pointcloud, torch.Tensor) and env_id < pointcloud.shape[0]:
+        if isinstance(pointcloud, list) and env_id < len(pointcloud):
             pts_np = _finite_downsample_points(pointcloud[env_id], max_points=max_points)
             _save_pointcloud_3d(
                 pts_np,
-                step_dir / f"{prefix}_pointcloud3d.png",
-                title=f"LiDAR point cloud env={env_id} step={global_step}",
+                step_dir / f"{prefix}_exact_pointcloud3d.png",
+                title=f"Exact obstacle point cloud env={env_id} step={global_step}",
             )
-        _save_closeness_radar(
-            lidar_obs[env_id],
+        _save_lidar_distance_heatmap(
+            lidar_distance[env_id],
             grid_shape=lidar_grid_shape,
-            path=step_dir / f"{prefix}_closeness_radar.png",
-            title=f"LiDAR closeness env={env_id} step={global_step}",
+            path=step_dir / f"{prefix}_distance_grid.png",
+            title=f"Exact LiDAR distance grid env={env_id} step={global_step}",
+            max_distance=float(args.lidar_max_distance),
+        )
+        _save_lidar_state_heatmap(
+            lidar_state[env_id],
+            grid_shape=lidar_grid_shape,
+            path=step_dir / f"{prefix}_state_0_1_grid.png",
+            title=f"Exact LiDAR normalized state env={env_id} step={global_step}",
         )
     print(f"[LIDARCHECK] saved {num_envs} envs to {step_dir}", flush=True)
 
@@ -835,6 +862,7 @@ def main() -> None:
         num_envs=args.num_envs,
         use_fabric=not args.disable_fabric,
     )
+    apply_lidar_grid_cli_params(env_cfg)
     env_cfg.scene.replicate_physics = True
     env_cfg.scene.filter_collisions = True
     try:
@@ -891,15 +919,20 @@ def main() -> None:
         model_cfg_path=args.model_cfg_path or None,
         model_cfg_json=args.model_cfg_json or None,
     )
+    if int(lidar_dim) > 0:
+        model_cfg.lidar_encoder.input_clamp = [0.0, 1.0]
+        model_cfg.lidar_encoder.input_rescale_to_neg_one_to_one = True
     model_cfg_dict = model_cfg_to_dict(model_cfg)
-    obs_dim, act_dim, obs_space, act_space = build_skrl_spaces(base_env, state_dim, lidar_dim)
+    obs_dim, act_dim, obs_space, act_space = build_skrl_spaces(
+        base_env, state_dim, lidar_dim, lidar_max_distance=float(args.lidar_max_distance)
+    )
     adapted_env = SkrlSpaceAdapter(
         base_env,
         obs_space=obs_space,
         act_space=act_space,
         state_dim=state_dim,
         lidar_dim=lidar_dim,
-        k_accumulate=int(args.K_accumulate),
+        lidar_max_distance=float(args.lidar_max_distance),
     )
     env = wrap_env(adapted_env, wrapper="isaaclab")
     num_envs = int(getattr(env, "num_envs", args.num_envs))
@@ -907,7 +940,12 @@ def main() -> None:
     step_dt = get_env_step_dt(base_env)
     print(f"[INFO] lidar_grid_shape={lidar_grid_shape}", flush=True)
     if int(lidar_dim) > 0:
-        print(f"[INFO] lidar K_accumulate={max(int(args.K_accumulate), 1)}", flush=True)
+        print(
+            f"[INFO] exact lidar distance grid: theta=({args.theta_min},{args.theta_max}) "
+            f"phi=({args.phi_min},{args.phi_max}) delta=({args.delta_theta},{args.delta_phi}) "
+            f"max_distance={args.lidar_max_distance}",
+            flush=True,
+        )
     models = {
         "policy": Policy(
             obs_space,
@@ -1002,7 +1040,9 @@ def main() -> None:
             "lidarcheck_step": int(lidarcheck_interval),
             "lidarcheck_dir": str(lidarcheck_root) if lidarcheck_root is not None else "",
             "lidarcheck_max_points": int(args.lidarcheck_max_points),
-            "K_accumulate": max(int(args.K_accumulate), 1),
+            "lidar_max_distance": float(args.lidar_max_distance),
+            "lidar_min_range": float(args.lidar_min_range),
+            "lidar_surface_step": float(args.lidar_surface_step),
         },
         model_cfg=model_cfg_dict,
     )
@@ -1014,7 +1054,6 @@ def main() -> None:
         f"obs={obs_dim}, state={state_dim}, lidar={lidar_dim}, act={act_dim}, grid={model_cfg.lidar_encoder.grid_shape}, encoder={model_cfg.lidar_encoder.type}",
         0,
     )
-    writer.add_text("run/lidar_accumulate", f"K_accumulate={max(int(args.K_accumulate), 1)}", 0)
     writer.add_text("run/step_dt", f"{step_dt:.8f}", 0)
     memory = RandomMemory(memory_size=int(args.rollouts), num_envs=num_envs, device=device)
     agent = PPO(
@@ -1029,7 +1068,12 @@ def main() -> None:
     loss_mirror = SkrlLossMirror()
     loss_mirror.bind(agent)
     raw_obs, infos = env.reset()
-    states = sanitize_states(ensure_obs_shape(extract_policy_obs(raw_obs), num_envs, obs_dim), state_dim=state_dim, lidar_dim=lidar_dim)
+    states = sanitize_states(
+        ensure_obs_shape(extract_policy_obs(raw_obs), num_envs, obs_dim),
+        state_dim=state_dim,
+        lidar_dim=lidar_dim,
+        lidar_max_distance=float(args.lidar_max_distance),
+    )
     finite_check_interval = int(args.finite_check_interval)
     keep_nan_snapshot = finite_check_interval > 0
     last_good_snapshot = snapshot_models(models) if keep_nan_snapshot else {}
@@ -1066,7 +1110,12 @@ def main() -> None:
             if keep_nan_snapshot and rollout_boundary:
                 last_good_snapshot = snapshot_models(models)
             next_obs, rewards, terminated, truncated, infos = env.step(actions)
-            next_states = sanitize_states(ensure_obs_shape(extract_policy_obs(next_obs), num_envs, obs_dim), state_dim=state_dim, lidar_dim=lidar_dim)
+            next_states = sanitize_states(
+                ensure_obs_shape(extract_policy_obs(next_obs), num_envs, obs_dim),
+                state_dim=state_dim,
+                lidar_dim=lidar_dim,
+                lidar_max_distance=float(args.lidar_max_distance),
+            )
             if lidarcheck_root is not None and (global_step % lidarcheck_interval == 0):
                 try:
                     with torch.no_grad():

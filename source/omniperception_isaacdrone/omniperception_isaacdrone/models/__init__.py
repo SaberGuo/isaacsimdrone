@@ -1,6 +1,6 @@
 """Public model exports for Test6 train/play scripts."""
 
-from .test6_policy import (
+from .test_policy import (
     Policy,
     StructuredFeatureExtractor,
     Test6ModelCfg,

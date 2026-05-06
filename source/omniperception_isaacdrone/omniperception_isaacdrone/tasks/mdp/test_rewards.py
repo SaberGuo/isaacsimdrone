@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import math
 import torch
 
 import isaaclab.envs.mdp as mdp
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
-from .test6_observations import get_lidar_grid_cached
-from .test6_terminations import (
+from .test_observations import get_lidar_grid_cached
+from .test_terminations import (
     termination_collision,
     termination_out_of_workspace,
     termination_reached_goal,
@@ -90,20 +89,13 @@ def _get_step_dt(env: ManagerBasedRLEnv) -> float:
         return 1.0 / 60.0
 
 
-def _get_lidar_max_distance(lidar) -> float:
+def _get_lidar_max_distance(lidar=None) -> float:
     try:
         if hasattr(lidar, "cfg") and hasattr(lidar.cfg, "max_distance"):
             return float(lidar.cfg.max_distance)
     except Exception:
         pass
     return 50.0
-
-
-def _get_exp_closeness(d: float, max_d: float, alpha: float = 3.0) -> float:
-    """将物理距离映射为指数型 closeness 值。"""
-    norm_dist = min(max(d / max_d, 0.0), 1.0)
-    exp_alpha = math.exp(-alpha)
-    return (math.exp(-alpha * norm_dist) - exp_alpha) / (1.0 - exp_alpha)
 
 
 # -----------------------------------------------------------------------------
@@ -274,7 +266,7 @@ def _compute_min_dist_from_lidar(
     delta_phi: float,
     max_vis_points: int | None,
 ) -> torch.Tensor | None:
-    """从 LiDAR 数据提取每个环境的最小障碍物距离，返回 (num_envs,) 张量。"""
+    """从精确几何 LiDAR 距离网格提取每个环境的最小障碍物距离。"""
 
     if bool(use_grid):
         grid = get_lidar_grid_cached(
@@ -284,15 +276,7 @@ def _compute_min_dist_from_lidar(
             delta_theta=delta_theta, delta_phi=delta_phi,
             empty_value=0.0, max_vis_points=max_vis_points, max_distance=max_d,
         )
-        max_close = grid.max(dim=1).values
-
-        # closeness → 物理距离（解析反演）
-        alpha = 3.0
-        exp_alpha = math.exp(-alpha)
-        val = max_close * (1.0 - exp_alpha) + exp_alpha
-        val = torch.clamp(val, min=exp_alpha, max=1.0)
-        min_dist = -(max_d / alpha) * torch.log(val)
-        return min_dist
+        return torch.clamp(grid, min=0.0, max=float(max_d)).min(dim=1).values
     else:
         env_ids = torch.arange(env.num_envs, device=env.device)
         dist = lidar.get_distances(env_ids)
@@ -331,12 +315,11 @@ def penalty_lidar_threat(
 
     zeros = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
 
+    lidar = None
     try:
         lidar = env.scene[lidar_name]
     except Exception:
-        _tb_store_reward(env, "lidar_threat", zeros)
-        return zeros
-
+        lidar = None
     max_d = _get_lidar_max_distance(lidar)
 
     min_dist = _compute_min_dist_from_lidar(
@@ -394,11 +377,9 @@ def penalty_safe_vel(
 
     try:
         lidar = env.scene[lidar_name]
-        max_d = _get_lidar_max_distance(lidar)
     except Exception:
-        out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
-        _tb_store_reward(env, "safe_vel_penalty", out0)
-        return out0
+        lidar = None
+    max_d = _get_lidar_max_distance(lidar)
 
     # ── 通过缓存接口获取网格 ──
     grid = get_lidar_grid_cached(
@@ -408,10 +389,6 @@ def penalty_safe_vel(
         delta_theta=delta_theta, delta_phi=delta_phi,
         empty_value=0.0, max_vis_points=max_vis_points, max_distance=max_d,
     )
-
-    alpha = 3.0
-    closeness_threshold = _get_exp_closeness(float(safe_dist), max_d, alpha)
-    safe_closeness = _get_exp_closeness(float(safe_dist) + float(margin), max_d, alpha)
 
     cache_key = f"_safe_vel_bins_{theta_min}_{theta_max}_{phi_min}_{phi_max}_{delta_theta}_{delta_phi}"
     bin_dirs = getattr(env, cache_key, None)
@@ -438,8 +415,8 @@ def penalty_safe_vel(
     cos_sim = torch.einsum('ni,ji->nj', v_dir, bin_dirs)
     front_cos_threshold = float(front_cos_threshold)
     front_mask = cos_sim >= front_cos_threshold
-    front_closeness = torch.where(front_mask, grid, torch.zeros_like(grid)).max(dim=1).values
-    threat_mask = front_closeness > closeness_threshold
+    front_distance = torch.where(front_mask, grid, torch.full_like(grid, max_d)).min(dim=1).values
+    threat_mask = front_distance < float(safe_dist)
 
     if not threat_mask.any():
         out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
@@ -447,9 +424,9 @@ def penalty_safe_vel(
         return out0
 
     current_heading_bin = torch.argmax(cos_sim, dim=1)
-    current_heading_closeness = grid.gather(1, current_heading_bin.unsqueeze(1)).squeeze(1)
+    current_heading_distance = grid.gather(1, current_heading_bin.unsqueeze(1)).squeeze(1)
 
-    is_heading_safe = current_heading_closeness <= safe_closeness
+    is_heading_safe = current_heading_distance >= (float(safe_dist) + float(margin))
     active_mask = threat_mask & ~is_heading_safe
 
     if not active_mask.any():
@@ -457,7 +434,7 @@ def penalty_safe_vel(
         _tb_store_reward(env, "safe_vel_penalty", out0)
         return out0
 
-    valid_mask = grid <= safe_closeness
+    valid_mask = grid >= (float(safe_dist) + float(margin))
 
     scored_bins = torch.where(valid_mask, cos_sim, torch.full_like(cos_sim, -2.0))
     best_scores, best_idx = torch.max(scored_bins, dim=1)

@@ -155,15 +155,19 @@ class Test6ObservationsCfg:
         lidar_grid = ObsTerm(
             func=my_mdp.obs_lidar_min_range_grid,
             params=dict(
-                lidar_name="lidar",
-                theta_min=75.0,
-                theta_max=105.0,
+                # Exact obstacle geometry range grid:
+                # theta is the polar angle from body +Z, phi is azimuth around body Z.
+                theta_min=30.0,
+                theta_max=90.0,
                 phi_min=0.0,
                 phi_max=360.0,
                 delta_theta=30.0,
                 delta_phi=5.0,
-                empty_value=0.0,
-                max_vis_points=12000,
+                min_range=0.2,
+                max_distance=50.0,
+                obstacle_size_xy=1.0,
+                obstacle_height=10.0,
+                surface_step=0.5,
             ),
         )
         def __post_init__(self):
@@ -319,7 +323,6 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         }
         self.rewards.lidar_threat.params = {
             "asset_cfg": SceneEntityCfg("robot"),
-            "lidar_name": "lidar",
             # 避障训练阶段需要在碰撞前给出足够早的密集惩罚；
             # 这里的 crash_distance 是 barrier 的基础安全距离，不是物理碰撞半径。
             "crash_distance": 8.0,
@@ -327,14 +330,13 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "use_horizontal_speed": True,
             "exp_clip": 1.0,
             "use_grid": True,
-            # 只用近水平碰撞带计算避障奖励，避免顶部/底部边界长期主导安全信号。
-            "theta_min": 75.0,
-            "theta_max": 105.0,
+            "theta_min": 30.0,
+            "theta_max": 90.0,
             "phi_min": 0.0,
             "phi_max": 360.0,
             "delta_theta": 30.0,
             "delta_phi": 5.0,
-            "max_vis_points": 12000,
+            "max_vis_points": None,
         }
         self.rewards.success_bonus.params = {
             "asset_cfg": SceneEntityCfg("robot"),

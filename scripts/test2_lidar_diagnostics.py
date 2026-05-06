@@ -18,7 +18,7 @@ os.environ.setdefault(
 
 
 parser = argparse.ArgumentParser("LiDAR point-cloud source diagnostics for the test6 drone env")
-parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lidar-v0")
+parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-ScanLidar-v0")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 parser.add_argument("--num_envs", type=int, default=12)
 parser.add_argument("--num_obstacles", type=int, default=16)
@@ -68,7 +68,7 @@ import gymnasium as gym
 import isaacsim.core.utils.prims as prim_utils
 import numpy as np
 import torch
-import omniperception_isaacdrone.tasks.test6_registry as _test6_registry  # noqa: F401
+import omniperception_isaacdrone.tasks.test_registry as _test_registry  # noqa: F401
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse
 from isaaclab_tasks.utils import parse_env_cfg

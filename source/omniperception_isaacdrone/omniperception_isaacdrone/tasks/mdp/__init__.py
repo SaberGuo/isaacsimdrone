@@ -2,10 +2,10 @@
 """MDP components for OmniPerception IsaacDrone (Test6)."""
 
 # Keep exports grouped by Manager type so env cfg files can import this module as my_mdp.
-from .test6_actions import RootTwistVelocityActionTerm
-from .test6_curriculums import update_obstacle_curriculum
-from .test6_events import reset_root_state_on_square_edge, randomize_obstacles_on_reset
-from .test6_observations import (
+from .test_actions import RootTwistVelocityActionTerm
+from .test_curriculums import update_obstacle_curriculum
+from .test_events import reset_root_state_on_square_edge, randomize_obstacles_on_reset
+from .test_observations import (
     obs_goal_delta,
     obs_lidar_min_range_grid,
     obs_root_ang_vel_norm,
@@ -18,7 +18,7 @@ from .test6_observations import (
     obs_projected_gravity_norm,
     obs_state_norm,
 )
-from .test6_rewards import (
+from .test_rewards import (
     penalty_safe_vel,
     penalty_collision,
     penalty_energy,
@@ -33,7 +33,7 @@ from .test6_rewards import (
     reward_stability,
     reward_velocity_towards_goal,
 )
-from .test6_terminations import (
+from .test_terminations import (
     termination_collision,
     termination_out_of_workspace,
     termination_reached_goal,

@@ -554,6 +554,8 @@ class LidarCNNEncoder(nn.Module):
             -1, 1, self.theta_bins, self.phi_bins
         )
         if self.input_rescale_to_neg_one_to_one:
+            denom = max(self.clamp_max - self.clamp_min, 1.0e-6)
+            lidar_grid = (lidar_grid - self.clamp_min) / denom
             lidar_grid = lidar_grid * 2.0 - 1.0
         return self.head(self.backbone(lidar_grid))
 

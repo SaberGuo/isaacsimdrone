@@ -12,7 +12,7 @@ os.environ.setdefault(
 )
 
 parser = argparse.ArgumentParser("Validate LiDAR body-frame output for test6 drone env")
-parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lidar-v0")
+parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-ScanLidar-v0")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--seed", type=int, default=42)
@@ -29,7 +29,7 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import torch
-import omniperception_isaacdrone.tasks.test6_registry as _test6_registry  # noqa: F401
+import omniperception_isaacdrone.tasks.test_registry as _test_registry  # noqa: F401
 from isaaclab.utils.math import quat_apply_inverse
 from isaaclab_tasks.utils import parse_env_cfg
 

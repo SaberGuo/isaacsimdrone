@@ -25,10 +25,19 @@ parser.add_argument("--num_obstacles", type=int, default=20)
 parser.add_argument("--seed", type=int, default=42)
 
 parser.add_argument("--state_dim", type=int, default=18)
-parser.add_argument("--lidar_dim", type=int, default=432)
+parser.add_argument("--lidar_dim", type=int, default=144)
 parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--model_cfg_path", type=str, default="")
 parser.add_argument("--model_cfg_json", type=str, default="")
+parser.add_argument("--theta_min", type=float, default=30.0)
+parser.add_argument("--theta_max", type=float, default=90.0)
+parser.add_argument("--phi_min", type=float, default=0.0)
+parser.add_argument("--phi_max", type=float, default=360.0)
+parser.add_argument("--delta_theta", type=float, default=30.0)
+parser.add_argument("--delta_phi", type=float, default=5.0)
+parser.add_argument("--lidar_max_distance", type=float, default=50.0)
+parser.add_argument("--lidar_min_range", type=float, default=0.2)
+parser.add_argument("--lidar_surface_step", type=float, default=0.5)
 
 parser.add_argument(
     "--checkpoint",
@@ -89,7 +98,7 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import numpy as np
 import torch
-import omniperception_isaacdrone.tasks.test6_registry as _test6_registry  # noqa: F401
+import omniperception_isaacdrone.tasks.test_registry as _test_registry  # noqa: F401
 from gymnasium.spaces import Box
 from isaaclab_tasks.utils import parse_env_cfg
 import isaacsim.core.utils.prims as prim_utils
@@ -214,12 +223,18 @@ def ensure_vec_shape(x: torch.Tensor, num_envs: int, name: str) -> torch.Tensor:
     raise RuntimeError(f"Invalid {name} shape {tuple(x.shape)}")
 
 
-def sanitize_states(states: torch.Tensor, state_dim: int, lidar_dim: int) -> torch.Tensor:
+def sanitize_states(
+    states: torch.Tensor,
+    state_dim: int,
+    lidar_dim: int,
+    lidar_max_distance: float = 50.0,
+) -> torch.Tensor:
     states = torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0)
     state = torch.clamp(states[:, :state_dim], -1.0, 1.0)
     if lidar_dim <= 0:
         return state
-    lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim], 0.0, 1.0)
+    max_distance = max(float(lidar_max_distance), 1.0e-6)
+    lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim] / max_distance, 0.0, 1.0)
     return torch.cat([state, lidar], dim=-1)
 
 
@@ -269,7 +284,32 @@ def infer_lidar_grid_shape(base_env: Any, lidar_dim: int) -> tuple[int, int] | N
     return None
 
 
-def build_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int, int, gym.spaces.Dict, Box]:
+def apply_lidar_grid_cli_params(env_cfg: Any) -> None:
+    params = {
+        "theta_min": float(args.theta_min),
+        "theta_max": float(args.theta_max),
+        "phi_min": float(args.phi_min),
+        "phi_max": float(args.phi_max),
+        "delta_theta": float(args.delta_theta),
+        "delta_phi": float(args.delta_phi),
+        "min_range": float(args.lidar_min_range),
+        "max_distance": float(args.lidar_max_distance),
+        "obstacle_size_xy": 1.0,
+        "obstacle_height": 10.0,
+        "surface_step": float(args.lidar_surface_step),
+    }
+    try:
+        env_cfg.observations.policy.lidar_grid.params = dict(params)
+    except Exception:
+        pass
+
+
+def build_spaces(
+    base_env: Any,
+    state_dim: int,
+    lidar_dim: int,
+    lidar_max_distance: float,
+) -> tuple[int, int, gym.spaces.Dict, Box]:
     act_space = getattr(base_env, "single_action_space", None)
     if not isinstance(act_space, gym.spaces.Box):
         act_space = getattr(base_env, "action_space", None)
@@ -283,6 +323,7 @@ def build_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[int, in
     obs_high =  np.ones((obs_dim,), dtype=np.float32)
     if lidar_dim > 0:
         obs_low[state_dim:] = 0.0
+        obs_high[state_dim:] = 1.0
 
     obs_space = gym.spaces.Dict({"policy": Box(low=obs_low, high=obs_high, dtype=np.float32)})
     act_box   = Box(
@@ -307,11 +348,13 @@ class PlaySpaceAdapter(gym.Wrapper):
         act_space: Box,
         state_dim: int,
         lidar_dim: int,
+        lidar_max_distance: float = 50.0,
     ):
         super().__init__(env)
         self.state_dim = int(state_dim)
         self.lidar_dim = int(lidar_dim)
         self.obs_dim   = self.state_dim + self.lidar_dim
+        self.lidar_max_distance = float(lidar_max_distance)
 
         self.observation_space        = obs_space
         self.single_observation_space = obs_space
@@ -327,6 +370,7 @@ class PlaySpaceAdapter(gym.Wrapper):
                 ensure_obs_shape(extract_policy_obs(raw_obs), self.num_envs, self.obs_dim),
                 self.state_dim,
                 self.lidar_dim,
+                lidar_max_distance=self.lidar_max_distance,
             )
         }
 
@@ -571,6 +615,7 @@ def main() -> None:
         num_envs=args.num_envs,
         use_fabric=not args.disable_fabric,
     )
+    apply_lidar_grid_cli_params(env_cfg)
     env_cfg.scene.replicate_physics = True
     env_cfg.scene.filter_collisions = True
     try:
@@ -621,7 +666,12 @@ def main() -> None:
     obs_dim_raw          = int(np.prod(policy_space.shape))
     state_dim, lidar_dim = get_state_lidar_dims(base_env, obs_dim_raw)
     lidar_grid_shape     = infer_lidar_grid_shape(base_env, lidar_dim)
-    obs_dim, act_dim, obs_space, act_space = build_spaces(base_env, state_dim, lidar_dim)
+    obs_dim, act_dim, obs_space, act_space = build_spaces(
+        base_env,
+        state_dim,
+        lidar_dim,
+        lidar_max_distance=float(args.lidar_max_distance),
+    )
 
     print_space_bounds("play_obs_space", obs_space)
     print_space_bounds("play_act_space", act_space)
@@ -632,6 +682,7 @@ def main() -> None:
         act_space=act_space,
         state_dim=state_dim,
         lidar_dim=lidar_dim,
+        lidar_max_distance=float(args.lidar_max_distance),
     )
 
     num_envs = int(getattr(env, "num_envs", args.num_envs))
@@ -654,6 +705,10 @@ def main() -> None:
         feat_dim=int(args.feat_dim),
         lidar_grid_shape=lidar_grid_shape,
     )
+    if int(lidar_dim) > 0:
+        model_cfg.lidar_encoder.input_clamp = [0.0, 1.0]
+        model_cfg.lidar_encoder.input_rescale_to_neg_one_to_one = True
+        model_cfg_dict = model_cfg_to_dict(model_cfg)
 
     print(
         f"[INFO] play spaces -> obs={obs_dim} (state={state_dim}, lidar={lidar_dim}), "
@@ -691,6 +746,7 @@ def main() -> None:
         ensure_obs_shape(extract_policy_obs(obs), num_envs, obs_dim),
         state_dim=state_dim,
         lidar_dim=lidar_dim,
+        lidar_max_distance=float(args.lidar_max_distance),
     )
 
     maybe_print_goal(base_env)
@@ -730,6 +786,7 @@ def main() -> None:
                 ensure_obs_shape(extract_policy_obs(next_obs), num_envs, obs_dim),
                 state_dim=state_dim,
                 lidar_dim=lidar_dim,
+                lidar_max_distance=float(args.lidar_max_distance),
             )
             rewards    = ensure_vec_shape(
                 torch.nan_to_num(rewards.float(),    nan=0.0, posinf=0.0, neginf=0.0),
