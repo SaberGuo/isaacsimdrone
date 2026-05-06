@@ -33,7 +33,7 @@ import omniperception_isaacdrone.tasks.test6_registry as _test6_registry  # noqa
 from isaaclab.utils.math import quat_apply_inverse
 from isaaclab_tasks.utils import parse_env_cfg
 
-from omniperception_isaacdrone.envs.test6_env import WallSpawner, setup_global_obstacles
+from omniperception_isaacdrone.envs.test_env import WallSpawner, setup_global_obstacles
 
 
 def euler_xyz_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> torch.Tensor:

@@ -95,7 +95,7 @@ from isaaclab_tasks.utils import parse_env_cfg
 import isaacsim.core.utils.prims as prim_utils
 from pxr import UsdGeom, Gf
 
-from omniperception_isaacdrone.envs.test6_env import WallSpawner, setup_global_obstacles
+from omniperception_isaacdrone.envs.test_env import WallSpawner, setup_global_obstacles
 from omniperception_isaacdrone.models import (
     Policy,
     find_config_snapshot_for_checkpoint,
@@ -447,7 +447,7 @@ def load_policy_checkpoint(
     except RuntimeError as exc:
         raise RuntimeError(
             "Policy checkpoint does not match the play network definition. "
-            "This usually means test6_play.py and the training-time feature extractor are not aligned."
+            "This usually means test_play.py and the training-time feature extractor are not aligned."
         ) from exc
     print("[INFO] Policy checkpoint loaded successfully.", flush=True)
 

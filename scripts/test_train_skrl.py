@@ -77,6 +77,7 @@ parser.add_argument("--finite_check_interval", type=int, default=0)
 parser.add_argument("--lidarcheck_step", type=int, default=1000)
 parser.add_argument("--lidarcheck_dir", type=str, default="")
 parser.add_argument("--lidarcheck_max_points", type=int, default=4000)
+parser.add_argument("--K_accumulate", type=int, default=4)
 
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -102,7 +103,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
-from omniperception_isaacdrone.envs.test6_env import WallSpawner, setup_global_obstacles
+from omniperception_isaacdrone.envs.test_env import WallSpawner, setup_global_obstacles
 from omniperception_isaacdrone.models import Policy, Value, model_cfg_to_dict, resolve_model_cfg
 
 # -----------------------------------------------------------------------------
@@ -310,24 +311,90 @@ def build_skrl_spaces(base_env: Any, state_dim: int, lidar_dim: int) -> tuple[in
 
 class SkrlSpaceAdapter(gym.Wrapper):
     """将原始环境观测/动作空间适配为 skrl 所需格式。"""
-    def __init__(self, env: gym.Env, obs_space: gym.spaces.Dict, act_space: Box, state_dim: int, lidar_dim: int):
+    def __init__(
+        self,
+        env: gym.Env,
+        obs_space: gym.spaces.Dict,
+        act_space: Box,
+        state_dim: int,
+        lidar_dim: int,
+        k_accumulate: int = 1,
+    ):
         super().__init__(env)
         self.state_dim, self.lidar_dim, self.obs_dim = int(state_dim), int(lidar_dim), int(state_dim) + int(lidar_dim)
+        self.k_accumulate = max(int(k_accumulate), 1)
+        self._lidar_hist: torch.Tensor | None = None
+        self._lidar_hist_index = 0
+        self._lidar_hist_count = 0
         self.observation_space = self.single_observation_space = obs_space
         self.action_space = self.single_action_space = act_space
         self.num_envs = int(getattr(env, "num_envs", 1))
         self.device = getattr(env, "device", None)
 
+    def _reset_lidar_history(self, env_mask: torch.Tensor | None = None) -> None:
+        if self._lidar_hist is None:
+            return
+        if env_mask is None:
+            self._lidar_hist.zero_()
+            self._lidar_hist_index = 0
+            self._lidar_hist_count = 0
+            return
+        mask = env_mask.detach().to(device=self._lidar_hist.device).reshape(self.num_envs).bool()
+        if mask.any():
+            self._lidar_hist[:, mask, :] = 0.0
+
+    def _accumulate_lidar(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.lidar_dim <= 0 or self.k_accumulate <= 1:
+            return obs
+        if obs.shape[-1] < self.state_dim + self.lidar_dim:
+            return obs
+
+        state = obs[:, :self.state_dim]
+        lidar = obs[:, self.state_dim:self.state_dim + self.lidar_dim]
+
+        if (
+            self._lidar_hist is None
+            or self._lidar_hist.shape != (self.k_accumulate, self.num_envs, self.lidar_dim)
+            or self._lidar_hist.device != obs.device
+            or self._lidar_hist.dtype != obs.dtype
+        ):
+            self._lidar_hist = torch.zeros(
+                (self.k_accumulate, self.num_envs, self.lidar_dim),
+                device=obs.device,
+                dtype=obs.dtype,
+            )
+            self._lidar_hist_index = 0
+            self._lidar_hist_count = 0
+
+        self._lidar_hist[self._lidar_hist_index].copy_(lidar)
+        self._lidar_hist_index = (self._lidar_hist_index + 1) % self.k_accumulate
+        self._lidar_hist_count = min(self._lidar_hist_count + 1, self.k_accumulate)
+
+        lidar_acc = self._lidar_hist[:self._lidar_hist_count].max(dim=0).values
+        return torch.cat([state, lidar_acc], dim=-1)
+
     def _convert_obs(self, raw_obs: Any) -> dict[str, torch.Tensor]:
-        return {"policy": sanitize_states(ensure_obs_shape(extract_policy_obs(raw_obs), self.num_envs, self.obs_dim), self.state_dim, self.lidar_dim)}
+        obs = sanitize_states(
+            ensure_obs_shape(extract_policy_obs(raw_obs), self.num_envs, self.obs_dim),
+            self.state_dim,
+            self.lidar_dim,
+        )
+        return {"policy": self._accumulate_lidar(obs)}
 
     def reset(self, **kwargs):
         raw_obs, infos = self.env.reset(**kwargs)
+        self._reset_lidar_history()
         return self._convert_obs(raw_obs), infos
 
     def step(self, actions):
         raw_obs, rewards, terminated, truncated, infos = self.env.step(actions)
-        return self._convert_obs(raw_obs), rewards, terminated, truncated, infos
+        try:
+            done_mask = terminated.reshape(self.num_envs).bool() | truncated.reshape(self.num_envs).bool()
+            self._reset_lidar_history(done_mask)
+        except Exception:
+            pass
+        obs = self._convert_obs(raw_obs)
+        return obs, rewards, terminated, truncated, infos
 
 
 # -----------------------------------------------------------------------------
@@ -600,10 +667,10 @@ def write_run_config_snapshot(
     except Exception as exc:
         env_cfg_dict = {"_error": f"Failed to serialize env_cfg: {exc}"}
     content = "\n".join([
-        "[test6_train_skrl.py args]",
+        "[test_train_skrl.py args]",
         json_dumps_pretty(vars(args_ns)),
         "",
-        "[test6_env_cfg.py resolved_cfg]",
+        "[test_env_cfg.py resolved_cfg]",
         json_dumps_pretty(env_cfg_dict),
         "",
         "[runtime_meta]",
@@ -826,12 +893,21 @@ def main() -> None:
     )
     model_cfg_dict = model_cfg_to_dict(model_cfg)
     obs_dim, act_dim, obs_space, act_space = build_skrl_spaces(base_env, state_dim, lidar_dim)
-    adapted_env = SkrlSpaceAdapter(base_env, obs_space=obs_space, act_space=act_space, state_dim=state_dim, lidar_dim=lidar_dim)
+    adapted_env = SkrlSpaceAdapter(
+        base_env,
+        obs_space=obs_space,
+        act_space=act_space,
+        state_dim=state_dim,
+        lidar_dim=lidar_dim,
+        k_accumulate=int(args.K_accumulate),
+    )
     env = wrap_env(adapted_env, wrapper="isaaclab")
     num_envs = int(getattr(env, "num_envs", args.num_envs))
     device = torch.device(getattr(env, "device", args.device))
     step_dt = get_env_step_dt(base_env)
     print(f"[INFO] lidar_grid_shape={lidar_grid_shape}", flush=True)
+    if int(lidar_dim) > 0:
+        print(f"[INFO] lidar K_accumulate={max(int(args.K_accumulate), 1)}", flush=True)
     models = {
         "policy": Policy(
             obs_space,
@@ -926,6 +1002,7 @@ def main() -> None:
             "lidarcheck_step": int(lidarcheck_interval),
             "lidarcheck_dir": str(lidarcheck_root) if lidarcheck_root is not None else "",
             "lidarcheck_max_points": int(args.lidarcheck_max_points),
+            "K_accumulate": max(int(args.K_accumulate), 1),
         },
         model_cfg=model_cfg_dict,
     )
@@ -937,6 +1014,7 @@ def main() -> None:
         f"obs={obs_dim}, state={state_dim}, lidar={lidar_dim}, act={act_dim}, grid={model_cfg.lidar_encoder.grid_shape}, encoder={model_cfg.lidar_encoder.type}",
         0,
     )
+    writer.add_text("run/lidar_accumulate", f"K_accumulate={max(int(args.K_accumulate), 1)}", 0)
     writer.add_text("run/step_dt", f"{step_dt:.8f}", 0)
     memory = RandomMemory(memory_size=int(args.rollouts), num_envs=num_envs, device=device)
     agent = PPO(
