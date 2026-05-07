@@ -99,6 +99,50 @@ def _workspace_boundary_distance_grid(
     return out
 
 
+def _make_workspace_surface_points(
+    bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
+    surface_step: float,
+    device: torch.device,
+) -> torch.Tensor:
+    xb, yb, zb = bounds
+    step = max(float(surface_step), 0.05)
+    xs = torch.arange(float(xb[0]), float(xb[1]) + 0.5 * step, step, device=device, dtype=torch.float32)
+    ys = torch.arange(float(yb[0]), float(yb[1]) + 0.5 * step, step, device=device, dtype=torch.float32)
+    zs = torch.arange(float(zb[0]), float(zb[1]) + 0.5 * step, step, device=device, dtype=torch.float32)
+
+    surfaces = []
+    yy, zz = torch.meshgrid(ys, zs, indexing="ij")
+    surfaces.append(torch.stack([torch.full_like(yy, float(xb[0])), yy, zz], dim=-1).reshape(-1, 3))
+    surfaces.append(torch.stack([torch.full_like(yy, float(xb[1])), yy, zz], dim=-1).reshape(-1, 3))
+
+    xx, zz = torch.meshgrid(xs, zs, indexing="ij")
+    surfaces.append(torch.stack([xx, torch.full_like(xx, float(yb[0])), zz], dim=-1).reshape(-1, 3))
+    surfaces.append(torch.stack([xx, torch.full_like(xx, float(yb[1])), zz], dim=-1).reshape(-1, 3))
+
+    xx, yy = torch.meshgrid(xs, ys, indexing="ij")
+    surfaces.append(torch.stack([xx, yy, torch.full_like(xx, float(zb[0]))], dim=-1).reshape(-1, 3))
+    surfaces.append(torch.stack([xx, yy, torch.full_like(xx, float(zb[1]))], dim=-1).reshape(-1, 3))
+    return torch.cat(surfaces, dim=0)
+
+
+def _get_workspace_surface_points_cached(
+    env: ManagerBasedRLEnv,
+    surface_step: float,
+) -> torch.Tensor:
+    bounds = _get_workspace_bounds(env)
+    key = (
+        tuple(round(float(v), 6) for pair in bounds for v in pair),
+        round(float(surface_step), 6),
+        str(env.device),
+    )
+    cache = getattr(env, "_exact_lidar_workspace_surface_cache", None)
+    if isinstance(cache, dict) and cache.get("key") == key and isinstance(cache.get("points"), torch.Tensor):
+        return cache["points"]
+    points = _make_workspace_surface_points(bounds, surface_step=surface_step, device=env.device)
+    env._exact_lidar_workspace_surface_cache = {"key": key, "points": points}
+    return points
+
+
 def _workspace_boundary_pointcloud_body(
     env: ManagerBasedRLEnv,
     theta_min: float,
@@ -109,25 +153,26 @@ def _workspace_boundary_pointcloud_body(
     delta_phi: float,
     min_range: float,
     max_distance: float,
+    surface_step: float = 0.5,
 ) -> list[torch.Tensor]:
-    dirs_b, _, _ = _lidar_bin_center_dirs_body(
-        theta_min, theta_max, phi_min, phi_max, delta_theta, delta_phi, env.device
-    )
-    distances = _workspace_boundary_distance_grid(
-        env,
-        theta_min=theta_min,
-        theta_max=theta_max,
-        phi_min=phi_min,
-        phi_max=phi_max,
-        delta_theta=delta_theta,
-        delta_phi=delta_phi,
-        min_range=min_range,
-        max_distance=max_distance,
-    )
+    robot = env.scene["robot"]
+    robot_pos_w = robot.data.root_pos_w.to(torch.float32)
+    robot_quat_w = robot.data.root_quat_w.to(torch.float32)
+    surface_w = _get_workspace_surface_points_cached(env, surface_step=surface_step)
     clouds: list[torch.Tensor] = []
     for env_id in range(int(env.num_envs)):
-        valid = distances[env_id] < (float(max_distance) - 1.0e-5)
-        clouds.append((dirs_b[valid] * distances[env_id, valid].unsqueeze(-1)).contiguous())
+        rel_w = surface_w - robot_pos_w[env_id].unsqueeze(0)
+        quat = robot_quat_w[env_id].unsqueeze(0).expand(rel_w.shape[0], -1)
+        rel_b = quat_apply_inverse(quat, rel_w)
+        ranges = torch.linalg.norm(rel_b, dim=-1)
+        safe_r = torch.clamp(ranges, min=1.0e-12)
+        theta = torch.rad2deg(torch.acos(torch.clamp(rel_b[:, 2] / safe_r, -1.0, 1.0)))
+        phi = torch.remainder(torch.rad2deg(torch.atan2(rel_b[:, 1], rel_b[:, 0])), 360.0)
+        valid = torch.isfinite(rel_b).all(dim=-1)
+        valid &= (ranges >= float(min_range)) & (ranges <= float(max_distance))
+        valid &= (theta >= float(theta_min)) & (theta < float(theta_max))
+        valid &= (phi >= float(phi_min)) & (phi < float(phi_max))
+        clouds.append(rel_b[valid].contiguous())
     return clouds
 
 
@@ -228,6 +273,7 @@ def exact_obstacle_pointcloud_body(
             delta_phi=delta_phi,
             min_range=min_range,
             max_distance=max_distance,
+            surface_step=surface_step,
         )
         if bool(include_workspace)
         else None
