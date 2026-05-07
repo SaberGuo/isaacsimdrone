@@ -231,7 +231,7 @@ class Test6CurriculumCfg:
     obstacle_count = CurrTerm(
         func=my_mdp.update_obstacle_curriculum,
         params={
-            "levels": (30, 5, 10, 15, 20, 30, 50, 100),
+            "levels": (0, 5, 10, 15, 20, 30, 50, 100),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
             "success_thresholds": (0.90, 0.86, 0.82, 0.80, 0.76, 0.72, 0.68, 0.64),

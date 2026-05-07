@@ -35,24 +35,24 @@ parser.add_argument("--lidar_dim", type=int, default=24)
 parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--model_cfg_path", type=str, default="")
 parser.add_argument("--model_cfg_json", type=str, default="")
-parser.add_argument("--rollouts", type=int, default=384)
-parser.add_argument("--learning_epochs", type=int, default=6)
-parser.add_argument("--mini_batches", type=int, default=12)
-parser.add_argument("--learning_rate", type=float, default=1.0e-5)
+parser.add_argument("--rollouts", type=int, default=256)
+parser.add_argument("--learning_epochs", type=int, default=5)
+parser.add_argument("--mini_batches", type=int, default=8)
+parser.add_argument("--learning_rate", type=float, default=2.5e-5)
 parser.add_argument("--_lambda", type=float, default=0.95)
 parser.add_argument("--discount_factor", type=float, default=0.995)
 parser.add_argument("--ratio_clip", type=float, default=0.15)
-parser.add_argument("--value_clip", type=float, default=0.2)
-parser.add_argument("--value_loss_scale", type=float, default=0.6)
-parser.add_argument("--grad_norm_clip", type=float, default=0.8)
-parser.add_argument("--entropy_coef", type=float, default=6.0e-3)
-parser.add_argument("--kl_threshold", type=float, default=0.008)
+parser.add_argument("--value_clip", type=float, default=0.4)
+parser.add_argument("--value_loss_scale", type=float, default=0.8)
+parser.add_argument("--grad_norm_clip", type=float, default=0.6)
+parser.add_argument("--entropy_coef", type=float, default=3.5e-3)
+parser.add_argument("--kl_threshold", type=float, default=0.012)
 parser.add_argument("--use_kl_adaptive_lr", action="store_true")
 parser.add_argument("--no_use_kl_adaptive_lr", dest="use_kl_adaptive_lr", action="store_false")
 parser.set_defaults(use_kl_adaptive_lr=True)
-parser.add_argument("--kl_adaptive_lr_threshold", type=float, default=0.006)
+parser.add_argument("--kl_adaptive_lr_threshold", type=float, default=0.008)
 parser.add_argument("--kl_adaptive_min_lr", type=float, default=2e-6)
-parser.add_argument("--kl_adaptive_max_lr", type=float, default=2e-5)
+parser.add_argument("--kl_adaptive_max_lr", type=float, default=5e-5)
 parser.add_argument("--kl_adaptive_kl_factor", type=float, default=2.0)
 parser.add_argument("--kl_adaptive_lr_factor", type=float, default=1.5)
 parser.add_argument("--clip_predicted_values", action="store_true")
@@ -86,6 +86,8 @@ parser.add_argument("--delta_phi", type=float, default=15.0)
 parser.add_argument("--lidar_max_distance", type=float, default=50.0)
 parser.add_argument("--lidar_min_range", type=float, default=0.2)
 parser.add_argument("--lidar_surface_step", type=float, default=0.5)
+parser.add_argument("--lidar_safe_distance", type=float, default=5.0)
+parser.add_argument("--lidar_closeness_exponent", type=float, default=4.0)
 
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -113,7 +115,7 @@ from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 from omniperception_isaacdrone.envs.test_env import WallSpawner, setup_global_obstacles
 from omniperception_isaacdrone.models import Policy, Value, model_cfg_to_dict, resolve_model_cfg
-from omniperception_isaacdrone.tasks.mdp.test_lidar_data import exact_obstacle_pointcloud_body
+from omniperception_isaacdrone.tasks.mdp.test_lidar_data import exact_lidar_distance_grid, exact_obstacle_pointcloud_body
 
 # -----------------------------------------------------------------------------
 # Runtime metadata and backend settings
@@ -256,17 +258,53 @@ def ensure_vec_shape(x: torch.Tensor, num_envs: int, name: str) -> torch.Tensor:
     if x.dim() == 2 and x.shape[0] == num_envs: return x
     raise RuntimeError(f"Invalid {name} shape")
 
-def sanitize_states(states: torch.Tensor, state_dim: int, lidar_dim: int, lidar_max_distance: float = 50.0) -> torch.Tensor:
-    """Clean raw base-env observations and normalize raw lidar distances to [0, 1]."""
+def normalized_exp01(x: torch.Tensor, exponent: float) -> torch.Tensor:
+    exponent = max(float(exponent), 1.0e-6)
+    denom = torch.expm1(torch.tensor(exponent, device=x.device, dtype=x.dtype)).clamp_min(1.0e-12)
+    return torch.expm1(torch.clamp(x, 0.0, 1.0) * exponent) / denom
+
+def lidar_distance_to_closeness(
+    distances: torch.Tensor,
+    max_distance: float,
+    safe_distance: float,
+    exponent: float,
+) -> torch.Tensor:
+    """Map raw LiDAR distance to [0, 1] closeness; smaller distance means larger feature."""
+    max_d = max(float(max_distance), 1.0e-6)
+    safe_d = min(max(float(safe_distance), 1.0e-6), max_d)
+    d = torch.clamp(torch.nan_to_num(distances.float(), nan=max_d, posinf=max_d, neginf=0.0), 0.0, max_d)
+    if safe_d >= max_d - 1.0e-6:
+        x = (max_d - d) / max_d
+        return torch.clamp(normalized_exp01(x, exponent), 0.0, 1.0)
+
+    far_x = (max_d - d) / (max_d - safe_d)
+    near_x = (safe_d - d) / safe_d
+    far = 0.5 * normalized_exp01(far_x, exponent)
+    near = 0.5 + 0.5 * normalized_exp01(near_x, exponent)
+    return torch.clamp(torch.where(d <= safe_d, near, far), 0.0, 1.0)
+
+def sanitize_states(
+    states: torch.Tensor,
+    state_dim: int,
+    lidar_dim: int,
+    lidar_max_distance: float = 50.0,
+    lidar_safe_distance: float = 5.0,
+    lidar_closeness_exponent: float = 4.0,
+) -> torch.Tensor:
+    """Clean raw base-env observations and convert raw lidar distances to closeness features in [0, 1]."""
     states = torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0)
     state = torch.clamp(states[:, :state_dim], -1.0, 1.0)
     if lidar_dim <= 0: return state
-    max_distance = max(float(lidar_max_distance), 1.0e-6)
-    lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim] / max_distance, 0.0, 1.0)
+    lidar = lidar_distance_to_closeness(
+        states[:, state_dim: state_dim + lidar_dim],
+        max_distance=lidar_max_distance,
+        safe_distance=lidar_safe_distance,
+        exponent=lidar_closeness_exponent,
+    )
     return torch.cat([state, lidar], dim=-1)
 
 def sanitize_wrapped_states(states: torch.Tensor, state_dim: int, lidar_dim: int) -> torch.Tensor:
-    """Clean observations returned by the skrl wrapper; lidar is already normalized."""
+    """Clean observations returned by the skrl wrapper; lidar is already a closeness feature."""
     states = torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0)
     state = torch.clamp(states[:, :state_dim], -1.0, 1.0)
     if lidar_dim <= 0: return state
@@ -392,6 +430,8 @@ class SkrlSpaceAdapter(gym.Wrapper):
             self.state_dim,
             self.lidar_dim,
             lidar_max_distance=self.lidar_max_distance,
+            lidar_safe_distance=float(args.lidar_safe_distance),
+            lidar_closeness_exponent=float(args.lidar_closeness_exponent),
         )
         return {"policy": obs}
 
@@ -804,7 +844,7 @@ def _save_lidar_distance_heatmap(
     ax.set_xlabel("phi bin")
     ax.set_ylabel("theta bin")
     ax.set_title(title)
-    fig.colorbar(im, ax=ax, label="nearest exact obstacle range (m); gray = empty bin")
+    fig.colorbar(im, ax=ax, label="nearest exact scene range (m); gray = empty bin")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -816,6 +856,7 @@ def _save_lidar_state_heatmap(
     path: Path,
     title: str,
     valid_flat: torch.Tensor | None = None,
+    colorbar_label: str = "normalized nearest range [0, 1]; gray = empty bin",
 ) -> None:
     plt = _import_plotting()
     lidar = torch.clamp(
@@ -841,7 +882,7 @@ def _save_lidar_state_heatmap(
     ax.set_xlabel("phi bin")
     ax.set_ylabel("theta bin")
     ax.set_title(title)
-    fig.colorbar(im, ax=ax, label="normalized nearest range [0, 1]; gray = empty bin")
+    fig.colorbar(im, ax=ax, label=colorbar_label)
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -873,6 +914,7 @@ def _save_lidar_state_3d(
     grid_shape: tuple[int, int] | None,
     path: Path,
     title: str,
+    value_label: str = "normalized range state [0, 1]",
 ) -> None:
     plt = _import_plotting()
     state = torch.clamp(
@@ -898,7 +940,7 @@ def _save_lidar_state_3d(
             s=18,
             alpha=0.24,
             linewidths=0,
-            label="empty bins at state=1",
+            label="empty bins",
         )
     if valid.any():
         sc = ax.scatter(
@@ -912,9 +954,9 @@ def _save_lidar_state_3d(
             s=36,
             alpha=0.96,
             linewidths=0,
-            label="state bins",
+            label="feature bins",
         )
-        fig.colorbar(sc, ax=ax, shrink=0.72, pad=0.08, label="normalized range state [0, 1]")
+        fig.colorbar(sc, ax=ax, shrink=0.72, pad=0.08, label=value_label)
     else:
         ax.text2D(0.18, 0.5, "No occupied LiDAR state bins", transform=ax.transAxes)
 
@@ -925,7 +967,7 @@ def _save_lidar_state_3d(
     ax.set_zlim(-radius, radius)
     ax.set_xlabel("body x forward (normalized)")
     ax.set_ylabel("body y left (normalized)")
-    ax.set_zlabel("body z up (normalized)")
+    ax.set_zlabel("body z up (feature-scaled)")
     ax.set_title(f"{title}\noccupied={int(valid.sum())}/{int(valid.size)}")
     ax.view_init(elev=22.0, azim=-58.0)
     ax.legend(loc="upper right")
@@ -974,13 +1016,41 @@ def save_lidarcheck_outputs(
             surface_step=float(args.lidar_surface_step),
             min_range=float(args.lidar_min_range),
             max_distance=float(args.lidar_max_distance),
+            theta_min=float(args.theta_min),
+            theta_max=float(args.theta_max),
+            phi_min=float(args.phi_min),
+            phi_max=float(args.phi_max),
+            delta_theta=float(args.delta_theta),
+            delta_phi=float(args.delta_phi),
         )
     except Exception as exc:
         print(f"[LIDARCHECK] exact pointcloud build failed at step={global_step}: {exc}", flush=True)
         pointcloud = None
 
-    lidar_state = states[:, state_dim: state_dim + lidar_dim]
-    lidar_distance = torch.clamp(lidar_state, 0.0, 1.0) * float(args.lidar_max_distance)
+    try:
+        lidar_distance = exact_lidar_distance_grid(
+            base_env,
+            theta_min=float(args.theta_min),
+            theta_max=float(args.theta_max),
+            phi_min=float(args.phi_min),
+            phi_max=float(args.phi_max),
+            delta_theta=float(args.delta_theta),
+            delta_phi=float(args.delta_phi),
+            min_range=float(args.lidar_min_range),
+            max_distance=float(args.lidar_max_distance),
+            obstacle_size_xy=1.0,
+            obstacle_height=10.0,
+            surface_step=float(args.lidar_surface_step),
+        )
+    except Exception as exc:
+        print(f"[LIDARCHECK] exact distance grid failed at step={global_step}: {exc}", flush=True)
+        lidar_distance = torch.full(
+            (num_envs, lidar_dim),
+            float(args.lidar_max_distance),
+            device=states.device,
+            dtype=torch.float32,
+        )
+    lidar_closeness = states[:, state_dim: state_dim + lidar_dim]
     valid_mask = lidar_distance < (float(args.lidar_max_distance) - 1.0e-5)
     for env_id in range(num_envs):
         prefix = f"env_{env_id:04d}"
@@ -989,22 +1059,23 @@ def save_lidarcheck_outputs(
             _save_pointcloud_3d(
                 pts_np,
                 step_dir / f"{prefix}_exact_pointcloud3d.png",
-                title=f"Exact obstacle point cloud env={env_id} step={global_step}",
+                title=f"Exact scene point cloud env={env_id} step={global_step}",
             )
         _save_lidar_distance_heatmap(
             lidar_distance[env_id],
             grid_shape=lidar_grid_shape,
             path=step_dir / f"{prefix}_distance_grid.png",
-            title=f"Exact LiDAR distance grid env={env_id} step={global_step}",
+            title=f"Exact scene LiDAR distance grid env={env_id} step={global_step}",
             max_distance=float(args.lidar_max_distance),
             valid_flat=valid_mask[env_id],
         )
         _save_lidar_state_heatmap(
-            lidar_state[env_id],
+            lidar_closeness[env_id],
             grid_shape=lidar_grid_shape,
-            path=step_dir / f"{prefix}_state_0_1_grid.png",
-            title=f"Exact LiDAR normalized state env={env_id} step={global_step}",
+            path=step_dir / f"{prefix}_closeness_grid.png",
+            title=f"Exact LiDAR closeness feature env={env_id} step={global_step}",
             valid_flat=valid_mask[env_id],
+            colorbar_label="lidar closeness feature [0, 1]; gray = empty bin",
         )
         _save_lidar_valid_mask(
             valid_mask[env_id],
@@ -1013,11 +1084,12 @@ def save_lidarcheck_outputs(
             title=f"Exact LiDAR occupied bins env={env_id} step={global_step}",
         )
         _save_lidar_state_3d(
-            lidar_state[env_id],
+            lidar_closeness[env_id],
             valid_mask[env_id],
             grid_shape=lidar_grid_shape,
-            path=step_dir / f"{prefix}_state_0_1_3d.png",
-            title=f"Exact LiDAR normalized state 3D env={env_id} step={global_step}",
+            path=step_dir / f"{prefix}_closeness_3d.png",
+            title=f"Exact LiDAR closeness feature 3D env={env_id} step={global_step}",
+            value_label="lidar closeness feature [0, 1]",
         )
     print(f"[LIDARCHECK] saved {num_envs} envs to {step_dir}", flush=True)
 
@@ -1214,6 +1286,9 @@ def main() -> None:
             "lidar_max_distance": float(args.lidar_max_distance),
             "lidar_min_range": float(args.lidar_min_range),
             "lidar_surface_step": float(args.lidar_surface_step),
+            "lidar_feature": "exponential_closeness",
+            "lidar_safe_distance": float(args.lidar_safe_distance),
+            "lidar_closeness_exponent": float(args.lidar_closeness_exponent),
         },
         model_cfg=model_cfg_dict,
     )

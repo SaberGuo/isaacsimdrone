@@ -1,8 +1,8 @@
-"""Exact obstacle-geometry LiDAR state for the drone task.
+"""Exact scene-geometry LiDAR state for the drone task.
 
 This module intentionally does not read ``LidarSensor.get_pointcloud()``.  It
-uses the current obstacle geometry and the robot pose to build a body-frame
-range grid directly from obstacle surface samples.
+uses the current obstacle/workspace geometry and the robot pose to build a
+body-frame range grid directly from scene geometry.
 """
 
 from __future__ import annotations
@@ -11,6 +11,124 @@ import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.utils.math import quat_apply, quat_apply_inverse
+
+
+def _get_workspace_bounds(
+    env: ManagerBasedRLEnv,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    norm = getattr(getattr(env, "cfg", None), "normalization", None)
+    if norm is not None:
+        try:
+            return (
+                tuple(float(v) for v in getattr(norm, "x_bounds")),
+                tuple(float(v) for v in getattr(norm, "y_bounds")),
+                tuple(float(v) for v in getattr(norm, "z_bounds")),
+            )
+        except Exception:
+            pass
+    return (-80.0, 80.0), (-80.0, 80.0), (0.0, 10.0)
+
+
+def _lidar_bin_center_dirs_body(
+    theta_min: float,
+    theta_max: float,
+    phi_min: float,
+    phi_max: float,
+    delta_theta: float,
+    delta_phi: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, int, int]:
+    theta_bins = max(int((float(theta_max) - float(theta_min)) / float(delta_theta)), 1)
+    phi_bins = max(int((float(phi_max) - float(phi_min)) / float(delta_phi)), 1)
+
+    theta_idx = torch.arange(theta_bins, device=device, dtype=torch.float32)
+    phi_idx = torch.arange(phi_bins, device=device, dtype=torch.float32)
+    theta = torch.deg2rad(float(theta_min) + (theta_idx + 0.5) * float(delta_theta))
+    phi = torch.deg2rad(float(phi_min) + (phi_idx + 0.5) * float(delta_phi))
+    tt, pp = torch.meshgrid(theta, phi, indexing="ij")
+    dirs = torch.stack(
+        [torch.sin(tt) * torch.cos(pp), torch.sin(tt) * torch.sin(pp), torch.cos(tt)],
+        dim=-1,
+    ).reshape(-1, 3)
+    return dirs, theta_bins, phi_bins
+
+
+def _workspace_boundary_distance_grid(
+    env: ManagerBasedRLEnv,
+    theta_min: float,
+    theta_max: float,
+    phi_min: float,
+    phi_max: float,
+    delta_theta: float,
+    delta_phi: float,
+    min_range: float,
+    max_distance: float,
+) -> torch.Tensor:
+    """Distance from lidar rays to ground and workspace boundary walls."""
+    robot = env.scene["robot"]
+    origin_w = robot.data.root_pos_w.to(torch.float32)
+    quat_w = robot.data.root_quat_w.to(torch.float32)
+    dirs_b, _, _ = _lidar_bin_center_dirs_body(
+        theta_min, theta_max, phi_min, phi_max, delta_theta, delta_phi, env.device
+    )
+    num_bins = int(dirs_b.shape[0])
+    out = torch.full((env.num_envs, num_bins), float(max_distance), device=env.device, dtype=torch.float32)
+
+    dirs_expand = dirs_b.unsqueeze(0).expand(env.num_envs, -1, -1)
+    quat_expand = quat_w.unsqueeze(1).expand(-1, num_bins, -1)
+    dirs_w = quat_apply(quat_expand.reshape(-1, 4), dirs_expand.reshape(-1, 3)).view(env.num_envs, num_bins, 3)
+    xb, yb, zb = _get_workspace_bounds(env)
+    bounds = (xb, yb, zb)
+    eps = 1.0e-6
+    tol = 1.0e-4
+
+    for axis, axis_bounds in enumerate(bounds):
+        other_axes = [i for i in range(3) if i != axis]
+        for plane_value in axis_bounds:
+            denom = dirs_w[:, :, axis]
+            valid = denom.abs() > eps
+            t = (float(plane_value) - origin_w[:, axis].unsqueeze(1)) / torch.where(
+                valid, denom, torch.ones_like(denom)
+            )
+            valid &= (t >= float(min_range)) & (t <= float(max_distance))
+            hit = origin_w.unsqueeze(1) + dirs_w * t.unsqueeze(-1)
+            for other_axis in other_axes:
+                lo, hi = bounds[other_axis]
+                valid &= (hit[:, :, other_axis] >= float(lo) - tol) & (hit[:, :, other_axis] <= float(hi) + tol)
+            out = torch.minimum(out, torch.where(valid, t.to(torch.float32), out))
+    return out
+
+
+def _workspace_boundary_pointcloud_body(
+    env: ManagerBasedRLEnv,
+    theta_min: float,
+    theta_max: float,
+    phi_min: float,
+    phi_max: float,
+    delta_theta: float,
+    delta_phi: float,
+    min_range: float,
+    max_distance: float,
+) -> list[torch.Tensor]:
+    dirs_b, _, _ = _lidar_bin_center_dirs_body(
+        theta_min, theta_max, phi_min, phi_max, delta_theta, delta_phi, env.device
+    )
+    distances = _workspace_boundary_distance_grid(
+        env,
+        theta_min=theta_min,
+        theta_max=theta_max,
+        phi_min=phi_min,
+        phi_max=phi_max,
+        delta_theta=delta_theta,
+        delta_phi=delta_phi,
+        min_range=min_range,
+        max_distance=max_distance,
+    )
+    clouds: list[torch.Tensor] = []
+    for env_id in range(int(env.num_envs)):
+        valid = distances[env_id] < (float(max_distance) - 1.0e-5)
+        clouds.append((dirs_b[valid] * distances[env_id, valid].unsqueeze(-1)).contiguous())
+    return clouds
 
 
 def _make_cuboid_surface_points(
@@ -86,14 +204,39 @@ def exact_obstacle_pointcloud_body(
     surface_step: float = 0.5,
     min_range: float = 0.2,
     max_distance: float = 50.0,
+    include_workspace: bool = True,
+    theta_min: float = 75.0,
+    theta_max: float = 105.0,
+    phi_min: float = 0.0,
+    phi_max: float = 360.0,
+    delta_theta: float = 30.0,
+    delta_phi: float = 15.0,
 ) -> list[torch.Tensor]:
-    """Return per-env obstacle surface points in the robot body frame."""
+    """Return per-env scene points in the robot body frame."""
     robot = env.scene["robot"]
     robot_pos_w = robot.data.root_pos_w.to(torch.float32)
     robot_quat_w = robot.data.root_quat_w.to(torch.float32)
 
+    workspace_clouds = (
+        _workspace_boundary_pointcloud_body(
+            env,
+            theta_min=theta_min,
+            theta_max=theta_max,
+            phi_min=phi_min,
+            phi_max=phi_max,
+            delta_theta=delta_theta,
+            delta_phi=delta_phi,
+            min_range=min_range,
+            max_distance=max_distance,
+        )
+        if bool(include_workspace)
+        else None
+    )
+
     obstacle_pos_w, obstacle_quat_w = _active_obstacle_pose(env)
     if obstacle_pos_w.numel() == 0:
+        if workspace_clouds is not None:
+            return workspace_clouds
         return [torch.empty((0, 3), device=env.device, dtype=torch.float32) for _ in range(env.num_envs)]
 
     surface = _get_surface_points_cached(env, obstacle_size_xy, obstacle_height, surface_step)
@@ -110,7 +253,11 @@ def exact_obstacle_pointcloud_body(
         rel_b = quat_apply_inverse(quat, rel_w)
         ranges = torch.linalg.norm(rel_b, dim=-1)
         valid = (ranges >= float(min_range)) & (ranges <= float(max_distance))
-        clouds.append(rel_b[valid].contiguous())
+        obstacle_cloud = rel_b[valid].contiguous()
+        if workspace_clouds is not None and workspace_clouds[env_id].numel() > 0:
+            clouds.append(torch.cat([obstacle_cloud, workspace_clouds[env_id]], dim=0))
+        else:
+            clouds.append(obstacle_cloud)
     return clouds
 
 
@@ -141,6 +288,7 @@ def exact_lidar_distance_grid(
         surface_step=surface_step,
         min_range=min_range,
         max_distance=max_distance,
+        include_workspace=False,
     )
     for env_id, points in enumerate(clouds):
         if points.numel() == 0:
@@ -167,6 +315,18 @@ def exact_lidar_distance_grid(
         )
         lin_idx = t_idx * phi_bins + p_idx
         out[env_id].scatter_reduce_(0, lin_idx, r[valid].to(torch.float32), reduce="amin", include_self=True)
+    workspace_grid = _workspace_boundary_distance_grid(
+        env,
+        theta_min=theta_min,
+        theta_max=theta_max,
+        phi_min=phi_min,
+        phi_max=phi_max,
+        delta_theta=delta_theta,
+        delta_phi=delta_phi,
+        min_range=min_range,
+        max_distance=max_distance,
+    )
+    out = torch.minimum(out, workspace_grid)
     return out
 
 
