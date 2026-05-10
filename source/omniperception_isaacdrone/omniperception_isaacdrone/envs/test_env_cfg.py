@@ -207,13 +207,14 @@ class Test6EventCfg:
 class Test6RewardsCfg:
     """奖励配置。"""
     progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=3.0, params={})
-    height = RewTerm(func=my_mdp.reward_height_tracking, weight=0.3, params={})
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-15.0, params={})
+    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=0.8, params={})
+    height = RewTerm(func=my_mdp.penalty_height_error, weight=-0.6, params={})
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-13.5, params={})
     # IsaacLab RewardManager 会额外乘以 dt=1/60；这里按“单次事件”目标值反推权重。
-    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=480.0, params={})
-    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-900.0, params={})
+    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=1500.0, params={})
+    collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-1400.0, params={})
     oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-900.0, params={})
-    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-480.0, params={})
+    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-1200.0, params={})
 
 
 @configclass
@@ -316,16 +317,23 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "speed_ref": 4.0,
             "clip": 1.0,
         }
+        self.rewards.vel_towards_goal.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
+            "min_speed": 0.2,
+            "speed_ref": 4.0,
+            "use_relu": True,
+        }
         self.rewards.height.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "target_z": 5.0,
             "std": 2.5,
+            "clip": 4.0,
         }
         self.rewards.lidar_threat.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             # 避障训练阶段需要在碰撞前给出足够早的密集惩罚；
             # 这里的 crash_distance 是 barrier 的基础安全距离，不是物理碰撞半径。
-            "crash_distance": 8.0,
+            "crash_distance": 6.0,
             "acc_max": 3.0,
             "use_horizontal_speed": True,
             "exp_clip": 1.0,
@@ -351,6 +359,9 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         self.rewards.collision_penalty.params = {
             "sensor_cfg": SceneEntityCfg("contact_sensor"),
             "threshold": 1.0,
+        }
+        self.rewards.timeout_penalty.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
         }
         self.scene.replicate_physics = True
         self.scene.filter_collisions = True

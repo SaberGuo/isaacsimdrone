@@ -22,6 +22,7 @@ from .test_rewards import (
     penalty_safe_vel,
     penalty_collision,
     penalty_energy,
+    penalty_height_error,
     penalty_lidar_threat,
     penalty_out_of_workspace,
     penalty_time_out,
@@ -65,6 +66,7 @@ __all__ = [
     
     # rewards
     "penalty_safe_vel",
+    "penalty_height_error",
     "reward_distance_to_goal",
     "reward_progress_to_goal",
     "reward_height_tracking",

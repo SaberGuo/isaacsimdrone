@@ -220,9 +220,9 @@ class LidarEncoderCfg:
 
 @dataclass
 class PolicyHeadCfg:
-    log_std_init: float = -1.4
+    log_std_init: float = -1.45
     log_std_min: float = -5.0
-    log_std_max: float = -0.9
+    log_std_max: float = -0.85
     mean_activation: str = "tanh"
 
     def normalize(self) -> "PolicyHeadCfg":

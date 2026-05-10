@@ -210,6 +210,26 @@ def reward_height_tracking(
     return out
 
 
+def penalty_height_error(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    target_z: float = 5.0,
+    std: float = 2.5,
+    clip: float = 4.0,
+) -> torch.Tensor:
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
+    dz = pos[:, 2] - float(target_z)
+    std = max(float(std), 1e-6)
+    out = (dz / std) ** 2
+    if float(clip) > 0.0:
+        out = torch.clamp(out, 0.0, float(clip))
+
+    out = out.to(torch.float32)
+    _tb_store_reward(env, "height_error_penalty", out)
+    _tb_store_aux(env, "height_error", dz)
+    return out
+
+
 def reward_stability(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -563,8 +583,32 @@ def penalty_out_of_workspace(
     return out
 
 
-def penalty_time_out(env: ManagerBasedRLEnv) -> torch.Tensor:
-    out = mdp.time_out(env).to(torch.float32)
+def penalty_time_out(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    time_out = mdp.time_out(env).to(torch.float32)
+    if not time_out.any():
+        out = torch.zeros_like(time_out)
+        _tb_store_reward(env, "timeout_penalty", out)
+        return out
+
+    pos = mdp.root_pos_w(env, asset_cfg=asset_cfg)
+    goal = _get_goal_pos(env, pos)
+    final_dist = _safe_norm(goal - pos)
+
+    initial_dist = getattr(env, "_timeout_initial_goal_dist", None)
+    if initial_dist is None or (not isinstance(initial_dist, torch.Tensor)) or initial_dist.shape != final_dist.shape:
+        initial_dist = final_dist.detach().clone()
+        setattr(env, "_timeout_initial_goal_dist", torch.clamp(initial_dist, min=1.0e-6))
+    initial_dist = torch.clamp(initial_dist.to(device=final_dist.device, dtype=torch.float32), min=1.0e-6)
+
+    progress = torch.clamp((initial_dist - final_dist) / initial_dist, 0.0, 1.0)
+    out = time_out * (1.0 - progress)
+
+    _tb_store_aux(env, "timeout_goal_initial_dist", initial_dist)
+    _tb_store_aux(env, "timeout_goal_final_dist", final_dist)
+    _tb_store_aux(env, "timeout_goal_progress", progress)
     _tb_store_reward(env, "timeout_penalty", out)
     return out
 

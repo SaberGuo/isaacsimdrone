@@ -165,6 +165,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._energy_prev_lin_vel_w = torch.zeros((1, 3), dtype=torch.float32)
         self._energy_prev_ang_vel_w = torch.zeros((1, 3), dtype=torch.float32)
         self._progress_prev_goal_dist = torch.zeros((1,), dtype=torch.float32)
+        self._timeout_initial_goal_dist = torch.zeros((1,), dtype=torch.float32)
 
         self._lidar_grid_cache = None
 
@@ -190,6 +191,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._energy_prev_lin_vel_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
         self._energy_prev_ang_vel_w = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
         self._progress_prev_goal_dist = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float32)
+        self._timeout_initial_goal_dist = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float32)
 
         if self._goal_vis_enabled:
             self._create_goal_visualizers()
@@ -198,6 +200,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._sample_goals(env_ids)
         self._refresh_energy_prev_buffers(env_ids)
         self._refresh_progress_prev_dist(env_ids)
+        self._refresh_timeout_initial_goal_dist(env_ids)
 
         print("\n[MyDroneRLEnv] ===== Env Initialized =====", flush=True)
         print(f"[MyDroneRLEnv] num_envs={self.num_envs}, device={self.device}", flush=True)
@@ -324,6 +327,14 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         except Exception:
             self._progress_prev_goal_dist[env_ids] = 0.0
 
+    def _refresh_timeout_initial_goal_dist(self, env_ids: torch.Tensor):
+        try:
+            pos = mdp.root_pos_w(self, asset_cfg=SceneEntityCfg("robot"))
+            dist = torch.norm(self.goal_pos_w - pos, dim=-1)
+            self._timeout_initial_goal_dist[env_ids] = torch.clamp(dist[env_ids].detach(), min=1.0e-6)
+        except Exception:
+            self._timeout_initial_goal_dist[env_ids] = 1.0
+
     def _clear_lidar_grid_cache(self) -> None:
         self._lidar_grid_cache = None
 
@@ -334,6 +345,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._clear_lidar_grid_cache()
         self._refresh_energy_prev_buffers(env_ids)
         self._refresh_progress_prev_dist(env_ids)
+        self._refresh_timeout_initial_goal_dist(env_ids)
 
     def reset_idx(self, env_ids: torch.Tensor | None = None):
         self._reset_idx(env_ids)
