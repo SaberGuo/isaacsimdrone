@@ -7,6 +7,7 @@ import torch
 import isaaclab.envs.mdp as mdp
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import quat_apply
 
 from .test_observations import get_lidar_grid_cached
 from .test_terminations import (
@@ -186,6 +187,33 @@ def reward_velocity_towards_goal(
     _tb_store_aux(env, "speed", speed)
     _tb_store_aux(env, "goal_direction_cos", cos)
     _tb_store_aux(env, "towards_speed", projected_speed.to(torch.float32))
+    return out
+
+
+def reward_heading_align_velocity(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    min_speed: float = 0.25,
+) -> torch.Tensor:
+    """Reward body +X heading alignment with the global velocity direction."""
+    quat_w = mdp.root_quat_w(env, asset_cfg=asset_cfg).to(torch.float32)
+    vel_w = mdp.root_lin_vel_w(env, asset_cfg=asset_cfg).to(torch.float32)
+
+    forward_b = torch.zeros_like(vel_w)
+    forward_b[:, 0] = 1.0
+    forward_w = quat_apply(quat_w, forward_b)
+
+    speed = torch.linalg.norm(vel_w, dim=-1)
+    vel_dir_w = vel_w / torch.clamp(speed, min=1.0e-6).unsqueeze(-1)
+    cos = torch.sum(forward_w * vel_dir_w, dim=-1).clamp(-1.0, 1.0)
+
+    out = torch.clamp(cos, min=0.0, max=1.0)
+    out = torch.where(speed >= float(min_speed), out, torch.zeros_like(out))
+    out = out.to(torch.float32)
+
+    _tb_store_reward(env, "heading_align_velocity", out)
+    _tb_store_aux(env, "heading_velocity_cos", cos.to(torch.float32))
+    _tb_store_aux(env, "heading_velocity_speed", speed.to(torch.float32))
     return out
 
 

@@ -211,6 +211,7 @@ class Test6RewardsCfg:
     """奖励配置。"""
     progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=3.0, params={})
     vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=0.8, params={})
+    heading_align_velocity = RewTerm(func=my_mdp.reward_heading_align_velocity, weight=0.08, params={})
     height = RewTerm(func=my_mdp.penalty_height_error, weight=-0.6, params={})
     lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-13.5, params={})
     # IsaacLab RewardManager 会额外乘以 dt=1/60；这里按“单次事件”目标值反推权重。
@@ -325,6 +326,10 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "min_speed": 0.2,
             "speed_ref": 4.0,
             "use_relu": True,
+        }
+        self.rewards.heading_align_velocity.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
+            "min_speed": 0.25,
         }
         self.rewards.height.params = {
             "asset_cfg": SceneEntityCfg("robot"),
