@@ -180,15 +180,6 @@ class Test6ObservationsCfg:
 @configclass
 class Test6EventCfg:
     """事件配置。"""
-    reset_robot_base = EventTerm(
-        func=my_mdp.reset_root_state_on_square_edge,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "square_half_size": 35.0,
-            "z_range": (3.0, 7.0),
-        },
-    )
     randomize_obstacles = EventTerm(
         func=my_mdp.randomize_obstacles_on_reset,
         mode="reset",
@@ -196,12 +187,30 @@ class Test6EventCfg:
             "asset_cfg": SceneEntityCfg("obstacles"),
             "x_range": (-75.0, 75.0),
             "y_range": (-75.0, 75.0),
+            "workspace_x_bounds": (-80.0, 80.0),
+            "workspace_y_bounds": (-80.0, 80.0),
+            "workspace_z_bounds": (0.0, 10.0),
             "z_height": 10.0,
+            "obstacle_size_xy": 1.0,
             "edge_margin": 0.0,
             "spawn_half_size": 35.0,
             "spawn_edge_clearance": 6.0,
             "min_separation": 3.5,
             "max_sample_tries": 4000,
+            "occupancy_resolution": 0.5,
+            "safe_clearance": 2.0,
+        },
+    )
+    reset_robot_base = EventTerm(
+        func=my_mdp.reset_root_state_on_square_edge,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "square_half_size": 35.0,
+            "z_range": (3.0, 7.0),
+            "goal_z": 5.0,
+            "goal_noise_xy": 5.0,
+            "max_reset_sample_tries": 128,
         },
     )
 
@@ -239,8 +248,8 @@ class Test6CurriculumCfg:
             "levels": (0, 50, 100, 200, 300),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
-            "success_thresholds": (0.85, 0.85, 0.85, 0.85, 0.85),
-            "k_roll": 8,
+            "success_thresholds": (0.0, 0.0, 0.85, 0.85, 0.85),
+            "k_roll": 1,
         },
     )
 
@@ -278,6 +287,8 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         WORKSPACE_Y = (-80.0, 80.0)
         WORKSPACE_Z = (0.0, 10.0)
         GOAL_RADIUS = 2.5
+        OCCUPANCY_RESOLUTION = 0.5
+        SAFE_CLEARANCE = 2.0
         self.normalization.x_bounds = WORKSPACE_X
         self.normalization.y_bounds = WORKSPACE_Y
         self.normalization.z_bounds = WORKSPACE_Z
@@ -297,10 +308,30 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
             "debug_env_id": 0,
             "debug_cmd_sat_eps": 0.995,
         }
+        self.events.randomize_obstacles.params = {
+            "asset_cfg": SceneEntityCfg("obstacles"),
+            "x_range": (-75.0, 75.0),
+            "y_range": (-75.0, 75.0),
+            "workspace_x_bounds": WORKSPACE_X,
+            "workspace_y_bounds": WORKSPACE_Y,
+            "workspace_z_bounds": WORKSPACE_Z,
+            "z_height": 10.0,
+            "obstacle_size_xy": 1.0,
+            "edge_margin": 0.0,
+            "spawn_half_size": 35.0,
+            "spawn_edge_clearance": 6.0,
+            "min_separation": 3.5,
+            "max_sample_tries": 4000,
+            "occupancy_resolution": OCCUPANCY_RESOLUTION,
+            "safe_clearance": SAFE_CLEARANCE,
+        }
         self.events.reset_robot_base.params = {
             "asset_cfg": SceneEntityCfg("robot"),
             "square_half_size": 35.0,
             "z_range": (3.0, 7.0),
+            "goal_z": 5.0,
+            "goal_noise_xy": 5.0,
+            "max_reset_sample_tries": 128,
         }
         self.terminations.reached_goal.params = {
             "asset_cfg": SceneEntityCfg("robot"),
