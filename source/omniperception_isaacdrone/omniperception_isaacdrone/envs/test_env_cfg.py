@@ -248,8 +248,8 @@ class Test6CurriculumCfg:
             "levels": (0, 50, 100, 200, 300),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
-            "success_thresholds": (0.0, 0.0, 0.85, 0.85, 0.85),
-            "k_roll": 1,
+            "success_thresholds": (0.85, 0.85, 0.85, 0.85, 0.85),
+            "k_roll": 8,
         },
     )
 
