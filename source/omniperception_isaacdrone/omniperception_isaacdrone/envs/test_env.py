@@ -177,7 +177,7 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
         self._goal_vis_paths: list[str] = []
 
         # metadata used by the training script
-        self.policy_state_dim = 18
+        self.policy_state_dim = 22
         self.policy_lidar_dim = 0
         self._batched_observation_space = None
         self._batched_action_space = None
@@ -246,6 +246,8 @@ class MyDroneRLEnv(ManagerBasedRLEnv):
 
     def _make_policy_obs_box(self, obs_dim: int, state_dim: int) -> Box:
         low, high = -np.ones((obs_dim,), dtype=np.float32), np.ones((obs_dim,), dtype=np.float32)
+        if state_dim >= 22:
+            low[18:22] = 0.0
         if obs_dim > state_dim:
             low[state_dim:] = 0.0
         return Box(low=low, high=high, dtype=np.float32)

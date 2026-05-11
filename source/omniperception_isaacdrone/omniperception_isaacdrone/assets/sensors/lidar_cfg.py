@@ -22,7 +22,7 @@ LIDAR_CFG = LidarSensorCfg(
         downsample=1,
     ),
 
-    max_distance=50.0,
+    max_distance=10.0,
     min_range=0.2,
 
     return_pointcloud=True,

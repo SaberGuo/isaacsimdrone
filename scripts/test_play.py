@@ -24,7 +24,7 @@ parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--num_obstacles", type=int, default=20)
 parser.add_argument("--seed", type=int, default=42)
 
-parser.add_argument("--state_dim", type=int, default=18)
+parser.add_argument("--state_dim", type=int, default=22)
 parser.add_argument("--lidar_dim", type=int, default=24)
 parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--model_cfg_path", type=str, default="")
@@ -35,9 +35,11 @@ parser.add_argument("--phi_min", type=float, default=0.0)
 parser.add_argument("--phi_max", type=float, default=360.0)
 parser.add_argument("--delta_theta", type=float, default=30.0)
 parser.add_argument("--delta_phi", type=float, default=15.0)
-parser.add_argument("--lidar_max_distance", type=float, default=50.0)
+parser.add_argument("--lidar_max_distance", type=float, default=10.0)
 parser.add_argument("--lidar_min_range", type=float, default=0.2)
 parser.add_argument("--lidar_surface_step", type=float, default=0.5)
+parser.add_argument("--lidar_safe_distance", type=float, default=5.0)
+parser.add_argument("--lidar_closeness_exponent", type=float, default=0.810930216216329)
 
 parser.add_argument(
     "--checkpoint",
@@ -125,6 +127,8 @@ STATE_OBS_NAMES_18 = [
 ]
 
 ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
+PREV_ACTION_STATE_NAMES_4 = [f"prev_{name}_01" for name in ACTION_NAMES_4]
+STATE_OBS_NAMES_22 = STATE_OBS_NAMES_18 + PREV_ACTION_STATE_NAMES_4
 
 
 # -----------------------------------------------------------------------------
@@ -223,19 +227,43 @@ def ensure_vec_shape(x: torch.Tensor, num_envs: int, name: str) -> torch.Tensor:
     raise RuntimeError(f"Invalid {name} shape {tuple(x.shape)}")
 
 
+def normalized_exp01(x: torch.Tensor, exponent: float) -> torch.Tensor:
+    exponent = max(float(exponent), 1.0e-6)
+    denom = torch.expm1(torch.tensor(exponent, device=x.device, dtype=x.dtype)).clamp_min(1.0e-12)
+    return torch.expm1(torch.clamp(x, 0.0, 1.0) * exponent) / denom
+
+
+def lidar_distance_to_closeness(
+    distances: torch.Tensor,
+    max_distance: float,
+    safe_distance: float,
+    exponent: float,
+) -> torch.Tensor:
+    max_d = max(float(max_distance), 1.0e-6)
+    d = torch.clamp(torch.nan_to_num(distances.float(), nan=max_d, posinf=max_d, neginf=0.0), 0.0, max_d)
+    x = (max_d - d) / max_d
+    return torch.clamp(normalized_exp01(x, exponent), 0.0, 1.0)
+
+
 def sanitize_states(
     states: torch.Tensor,
     state_dim: int,
     lidar_dim: int,
-    lidar_max_distance: float = 50.0,
+    lidar_max_distance: float = 10.0,
+    lidar_safe_distance: float = 5.0,
+    lidar_closeness_exponent: float = 0.810930216216329,
 ) -> torch.Tensor:
-    """Clean raw base-env observations and normalize raw lidar distances to [0, 1]."""
+    """Clean raw base-env observations and convert raw lidar distances to closeness in [0, 1]."""
     states = torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0)
     state = torch.clamp(states[:, :state_dim], -1.0, 1.0)
     if lidar_dim <= 0:
         return state
-    max_distance = max(float(lidar_max_distance), 1.0e-6)
-    lidar = torch.clamp(states[:, state_dim: state_dim + lidar_dim] / max_distance, 0.0, 1.0)
+    lidar = lidar_distance_to_closeness(
+        states[:, state_dim: state_dim + lidar_dim],
+        max_distance=lidar_max_distance,
+        safe_distance=lidar_safe_distance,
+        exponent=lidar_closeness_exponent,
+    )
     return torch.cat([state, lidar], dim=-1)
 
 
@@ -317,6 +345,11 @@ def apply_lidar_grid_cli_params(env_cfg: Any) -> None:
         env_cfg.observations.policy.lidar_grid.params = dict(params)
     except Exception:
         pass
+    try:
+        env_cfg.scene.lidar.max_distance = params["max_distance"]
+        env_cfg.scene.lidar.min_range = params["min_range"]
+    except Exception:
+        pass
 
 
 def build_spaces(
@@ -336,6 +369,8 @@ def build_spaces(
 
     obs_low  = -np.ones((obs_dim,), dtype=np.float32)
     obs_high =  np.ones((obs_dim,), dtype=np.float32)
+    if state_dim >= len(STATE_OBS_NAMES_22):
+        obs_low[len(STATE_OBS_NAMES_18):len(STATE_OBS_NAMES_22)] = 0.0
     if lidar_dim > 0:
         obs_low[state_dim:] = 0.0
         obs_high[state_dim:] = 1.0
@@ -363,7 +398,7 @@ class PlaySpaceAdapter(gym.Wrapper):
         act_space: Box,
         state_dim: int,
         lidar_dim: int,
-        lidar_max_distance: float = 50.0,
+        lidar_max_distance: float = 10.0,
     ):
         super().__init__(env)
         self.state_dim = int(state_dim)
@@ -386,6 +421,8 @@ class PlaySpaceAdapter(gym.Wrapper):
                 self.state_dim,
                 self.lidar_dim,
                 lidar_max_distance=self.lidar_max_distance,
+                lidar_safe_distance=float(args.lidar_safe_distance),
+                lidar_closeness_exponent=float(args.lidar_closeness_exponent),
             )
         }
 
@@ -405,7 +442,11 @@ class PlaySpaceAdapter(gym.Wrapper):
 # -----------------------------------------------------------------------------
 
 def build_state_names(state_dim: int) -> list[str]:
-    return list(STATE_OBS_NAMES_18) if int(state_dim) == len(STATE_OBS_NAMES_18) else [f"state_{i}" for i in range(int(state_dim))]
+    if int(state_dim) == len(STATE_OBS_NAMES_22):
+        return list(STATE_OBS_NAMES_22)
+    if int(state_dim) == len(STATE_OBS_NAMES_18):
+        return list(STATE_OBS_NAMES_18)
+    return [f"state_{i}" for i in range(int(state_dim))]
 
 
 def build_action_names(act_dim: int) -> list[str]:

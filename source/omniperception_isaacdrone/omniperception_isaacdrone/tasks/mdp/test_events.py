@@ -17,6 +17,8 @@ def _sample_obstacle_positions(
     y_range: tuple[float, float],
     z_height: float,
     edge_margin: float,
+    spawn_half_size: float,
+    spawn_edge_clearance: float,
     min_separation: float,
     max_sample_tries: int,
 ) -> torch.Tensor:
@@ -44,6 +46,20 @@ def _sample_obstacle_positions(
     tries = 0
     total_try_budget = max(int(max_sample_tries), num_active * 32)
     base_min_separation = max(float(min_separation), 0.0)
+    spawn_half_size = abs(float(spawn_half_size))
+    spawn_edge_clearance = max(float(spawn_edge_clearance), 0.0)
+
+    def _near_spawn_edge(candidate_xy: torch.Tensor) -> bool:
+        if spawn_half_size <= 0.0 or spawn_edge_clearance <= 0.0:
+            return False
+
+        x = float(candidate_xy[0].item())
+        y = float(candidate_xy[1].item())
+        inside_spawn_y_span = abs(y) <= spawn_half_size + spawn_edge_clearance
+        inside_spawn_x_span = abs(x) <= spawn_half_size + spawn_edge_clearance
+        near_vertical_spawn_edge = abs(abs(x) - spawn_half_size) < spawn_edge_clearance and inside_spawn_y_span
+        near_horizontal_spawn_edge = abs(abs(y) - spawn_half_size) < spawn_edge_clearance and inside_spawn_x_span
+        return bool(near_vertical_spawn_edge or near_horizontal_spawn_edge)
 
     while placed < num_active and tries < total_try_budget:
         candidate = torch.tensor(
@@ -55,10 +71,13 @@ def _sample_obstacle_positions(
             dtype=torch.float32,
         )
 
+        tries += 1
+        if _near_spawn_edge(candidate):
+            continue
+
         if placed == 0 or base_min_separation <= 0.0:
             positions_xy[placed] = candidate
             placed += 1
-            tries += 1
             continue
 
         progress = tries / float(total_try_budget)
@@ -68,13 +87,42 @@ def _sample_obstacle_positions(
             positions_xy[placed] = candidate
             placed += 1
 
-        tries += 1
-
     if placed < num_active:
         remaining = num_active - placed
         fallback_xy = torch.empty((remaining, 2), device=device, dtype=torch.float32)
-        fallback_xy[:, 0].uniform_(inner_x_min, inner_x_max)
-        fallback_xy[:, 1].uniform_(inner_y_min, inner_y_max)
+        filled = 0
+        fallback_tries = 0
+        fallback_budget = max(remaining * 128, 1024)
+        while filled < remaining and fallback_tries < fallback_budget:
+            candidate = torch.tensor(
+                [
+                    torch.empty((), device=device).uniform_(inner_x_min, inner_x_max).item(),
+                    torch.empty((), device=device).uniform_(inner_y_min, inner_y_max).item(),
+                ],
+                device=device,
+                dtype=torch.float32,
+            )
+            fallback_tries += 1
+            if _near_spawn_edge(candidate):
+                continue
+            fallback_xy[filled] = candidate
+            filled += 1
+        if filled < remaining:
+            xs = torch.linspace(inner_x_min, inner_x_max, steps=24, device=device)
+            ys = torch.linspace(inner_y_min, inner_y_max, steps=24, device=device)
+            grid_x, grid_y = torch.meshgrid(xs, ys, indexing="ij")
+            safe_grid = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=-1)
+            keep = torch.tensor(
+                [not _near_spawn_edge(point) for point in safe_grid],
+                device=device,
+                dtype=torch.bool,
+            )
+            safe_grid = safe_grid[keep]
+            if safe_grid.numel() == 0:
+                safe_grid = torch.zeros((1, 2), device=device, dtype=torch.float32)
+            need = remaining - filled
+            repeat = (need + safe_grid.shape[0] - 1) // safe_grid.shape[0]
+            fallback_xy[filled:] = safe_grid.repeat((repeat, 1))[:need]
         positions_xy[placed:] = fallback_xy
 
     positions = torch.zeros((num_active, 3), device=device, dtype=torch.float32)
@@ -154,6 +202,8 @@ def randomize_obstacles_on_reset(
     y_range: tuple = (-33.0, 33.0),
     z_height: float = 10.0,
     edge_margin: float = 8.0,
+    spawn_half_size: float = 35.0,
+    spawn_edge_clearance: float = 6.0,
     min_separation: float = 3.5,
     max_sample_tries: int = 4000,
 ):
@@ -245,6 +295,8 @@ def randomize_obstacles_on_reset(
             y_range=y_range,
             z_height=z_height,
             edge_margin=edge_margin,
+            spawn_half_size=spawn_half_size,
+            spawn_edge_clearance=spawn_edge_clearance,
             min_separation=min_separation,
             max_sample_tries=max_sample_tries,
         )

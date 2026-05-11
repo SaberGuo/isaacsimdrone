@@ -248,7 +248,7 @@ def exact_obstacle_pointcloud_body(
     obstacle_height: float = 10.0,
     surface_step: float = 0.5,
     min_range: float = 0.2,
-    max_distance: float = 50.0,
+    max_distance: float = 10.0,
     include_workspace: bool = True,
     theta_min: float = 75.0,
     theta_max: float = 105.0,
@@ -316,7 +316,7 @@ def exact_lidar_distance_grid(
     delta_theta: float = 30.0,
     delta_phi: float = 15.0,
     min_range: float = 0.2,
-    max_distance: float = 50.0,
+    max_distance: float = 10.0,
     obstacle_size_xy: float = 1.0,
     obstacle_height: float = 10.0,
     surface_step: float = 0.5,
@@ -387,7 +387,7 @@ def workspace_lidar_distance_grid(
     delta_theta: float = 30.0,
     delta_phi: float = 15.0,
     min_range: float = 0.2,
-    max_distance: float = 50.0,
+    max_distance: float = 10.0,
 ) -> torch.Tensor:
     """Return nearest-distance grid for workspace walls/ground/ceiling only."""
     return _workspace_boundary_distance_grid(
@@ -412,7 +412,7 @@ def get_exact_lidar_grid_cached(
     delta_theta: float = 30.0,
     delta_phi: float = 15.0,
     min_range: float = 0.2,
-    max_distance: float = 50.0,
+    max_distance: float = 10.0,
     obstacle_size_xy: float = 1.0,
     obstacle_height: float = 10.0,
     surface_step: float = 0.5,

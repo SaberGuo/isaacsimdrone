@@ -3,7 +3,6 @@ from __future__ import annotations
 # Standard-library imports must stay above AppLauncher construction.
 import argparse
 import copy
-import csv
 import gc
 import json
 import os
@@ -31,7 +30,7 @@ parser.add_argument("--num_envs", type=int, default=128)
 parser.add_argument("--num_obstacles", type=int, default=100)
 parser.add_argument("--timesteps", type=int, default=10_000_000)
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--state_dim", type=int, default=18)
+parser.add_argument("--state_dim", type=int, default=22)
 parser.add_argument("--lidar_dim", type=int, default=24)
 parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--model_cfg_path", type=str, default="")
@@ -39,21 +38,21 @@ parser.add_argument("--model_cfg_json", type=str, default="")
 parser.add_argument("--rollouts", type=int, default=256)
 parser.add_argument("--learning_epochs", type=int, default=5)
 parser.add_argument("--mini_batches", type=int, default=8)
-parser.add_argument("--learning_rate", type=float, default=1.0e-5)
+parser.add_argument("--learning_rate", type=float, default=8.0e-6)
 parser.add_argument("--_lambda", type=float, default=0.95)
 parser.add_argument("--discount_factor", type=float, default=0.995)
 parser.add_argument("--ratio_clip", type=float, default=0.10)
 parser.add_argument("--value_clip", type=float, default=0.4)
 parser.add_argument("--value_loss_scale", type=float, default=0.8)
 parser.add_argument("--grad_norm_clip", type=float, default=0.6)
-parser.add_argument("--entropy_coef", type=float, default=1.2e-3)
+parser.add_argument("--entropy_coef", type=float, default=8.0e-4)
 parser.add_argument("--kl_threshold", type=float, default=0.010)
 parser.add_argument("--use_kl_adaptive_lr", action="store_true")
 parser.add_argument("--no_use_kl_adaptive_lr", dest="use_kl_adaptive_lr", action="store_false")
 parser.set_defaults(use_kl_adaptive_lr=True)
 parser.add_argument("--kl_adaptive_lr_threshold", type=float, default=0.006)
 parser.add_argument("--kl_adaptive_min_lr", type=float, default=2e-6)
-parser.add_argument("--kl_adaptive_max_lr", type=float, default=2e-5)
+parser.add_argument("--kl_adaptive_max_lr", type=float, default=1.6e-5)
 parser.add_argument("--kl_adaptive_kl_factor", type=float, default=2.0)
 parser.add_argument("--kl_adaptive_lr_factor", type=float, default=1.5)
 parser.add_argument("--clip_predicted_values", action="store_true")
@@ -84,11 +83,11 @@ parser.add_argument("--phi_min", type=float, default=0.0)
 parser.add_argument("--phi_max", type=float, default=360.0)
 parser.add_argument("--delta_theta", type=float, default=30.0)
 parser.add_argument("--delta_phi", type=float, default=15.0)
-parser.add_argument("--lidar_max_distance", type=float, default=50.0)
+parser.add_argument("--lidar_max_distance", type=float, default=10.0)
 parser.add_argument("--lidar_min_range", type=float, default=0.2)
 parser.add_argument("--lidar_surface_step", type=float, default=0.5)
 parser.add_argument("--lidar_safe_distance", type=float, default=5.0)
-parser.add_argument("--lidar_closeness_exponent", type=float, default=4.0)
+parser.add_argument("--lidar_closeness_exponent", type=float, default=0.810930216216329)
 
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -118,6 +117,7 @@ from omniperception_isaacdrone.envs.test_env import WallSpawner, setup_global_ob
 from omniperception_isaacdrone.models import Policy, Value, model_cfg_to_dict, resolve_model_cfg
 from omniperception_isaacdrone.tasks.mdp.test_lidar_data import (
     exact_lidar_distance_grid,
+    exact_obstacle_pointcloud_body,
     get_exact_lidar_grid_cached,
     workspace_lidar_distance_grid,
 )
@@ -133,6 +133,8 @@ STATE_OBS_NAMES_18 = [
     "goal_dir_x", "goal_dir_y", "goal_dir_z", "goal_dist",
 ]
 ACTION_NAMES_4 = ["vx_cmd", "vy_cmd", "vz_cmd", "yaw_rate_cmd"]
+PREV_ACTION_STATE_NAMES_4 = [f"prev_{name}_01" for name in ACTION_NAMES_4]
+STATE_OBS_NAMES_22 = STATE_OBS_NAMES_18 + PREV_ACTION_STATE_NAMES_4
 
 DEBUG_PRINT = False
 
@@ -274,27 +276,19 @@ def lidar_distance_to_closeness(
     safe_distance: float,
     exponent: float,
 ) -> torch.Tensor:
-    """Map raw LiDAR distance to [0, 1] closeness; smaller distance means larger feature."""
+    """Map raw LiDAR distance to [0, 1] closeness; 0 m -> 1, max range -> 0."""
     max_d = max(float(max_distance), 1.0e-6)
-    safe_d = min(max(float(safe_distance), 1.0e-6), max_d)
     d = torch.clamp(torch.nan_to_num(distances.float(), nan=max_d, posinf=max_d, neginf=0.0), 0.0, max_d)
-    if safe_d >= max_d - 1.0e-6:
-        x = (max_d - d) / max_d
-        return torch.clamp(normalized_exp01(x, exponent), 0.0, 1.0)
-
-    far_x = (max_d - d) / (max_d - safe_d)
-    near_x = (safe_d - d) / safe_d
-    far = 0.5 * normalized_exp01(far_x, exponent)
-    near = 0.5 + 0.5 * normalized_exp01(near_x, exponent)
-    return torch.clamp(torch.where(d <= safe_d, near, far), 0.0, 1.0)
+    x = (max_d - d) / max_d
+    return torch.clamp(normalized_exp01(x, exponent), 0.0, 1.0)
 
 def sanitize_states(
     states: torch.Tensor,
     state_dim: int,
     lidar_dim: int,
-    lidar_max_distance: float = 50.0,
+    lidar_max_distance: float = 10.0,
     lidar_safe_distance: float = 5.0,
-    lidar_closeness_exponent: float = 4.0,
+    lidar_closeness_exponent: float = 0.810930216216329,
 ) -> torch.Tensor:
     """Clean raw base-env observations and convert raw lidar distances to closeness features in [0, 1]."""
     states = torch.nan_to_num(states.float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -377,6 +371,11 @@ def apply_lidar_grid_cli_params(env_cfg: Any) -> None:
     except Exception:
         pass
     try:
+        env_cfg.scene.lidar.max_distance = params["max_distance"]
+        env_cfg.scene.lidar.min_range = params["min_range"]
+    except Exception:
+        pass
+    try:
         reward_params = getattr(env_cfg.rewards.lidar_threat, "params", None) or {}
         reward_params.update(
             {
@@ -404,6 +403,8 @@ def build_skrl_spaces(base_env: Any, state_dim: int, lidar_dim: int, lidar_max_d
     act_dim = infer_single_dim_from_box(act_space, num_envs) if isinstance(act_space, gym.spaces.Box) else 4
     obs_dim = state_dim + lidar_dim
     obs_low, obs_high = -np.ones((obs_dim,), dtype=np.float32), np.ones((obs_dim,), dtype=np.float32)
+    if state_dim >= len(STATE_OBS_NAMES_22):
+        obs_low[len(STATE_OBS_NAMES_18):len(STATE_OBS_NAMES_22)] = 0.0
     if lidar_dim > 0:
         obs_low[state_dim:] = 0.0
         obs_high[state_dim:] = 1.0
@@ -419,7 +420,7 @@ class SkrlSpaceAdapter(gym.Wrapper):
         act_space: Box,
         state_dim: int,
         lidar_dim: int,
-        lidar_max_distance: float = 50.0,
+        lidar_max_distance: float = 10.0,
     ):
         super().__init__(env)
         self.state_dim, self.lidar_dim, self.obs_dim = int(state_dim), int(lidar_dim), int(state_dim) + int(lidar_dim)
@@ -698,7 +699,11 @@ def log_gradients(writer, models, step, max_samples):
 # Run configuration helpers
 # -----------------------------------------------------------------------------
 def build_state_names(state_dim: int) -> List[str]:
-    return list(STATE_OBS_NAMES_18) if int(state_dim) == len(STATE_OBS_NAMES_18) else [f"state_{i}" for i in range(int(state_dim))]
+    if int(state_dim) == len(STATE_OBS_NAMES_22):
+        return list(STATE_OBS_NAMES_22)
+    if int(state_dim) == len(STATE_OBS_NAMES_18):
+        return list(STATE_OBS_NAMES_18)
+    return [f"state_{i}" for i in range(int(state_dim))]
 
 def build_action_names(act_dim: int) -> List[str]:
     return list(ACTION_NAMES_4) if int(act_dim) == len(ACTION_NAMES_4) else [f"action_{i}" for i in range(int(act_dim))]
@@ -1008,72 +1013,6 @@ def _lidarcheck_distance_params() -> dict[str, float]:
     }
 
 
-def _write_lidarcheck_summary_csv(
-    path: Path,
-    *,
-    global_step: int,
-    scene_distance: torch.Tensor,
-    obstacle_distance: torch.Tensor,
-    workspace_distance: torch.Tensor,
-    actual_distance: torch.Tensor,
-    policy_closeness: torch.Tensor,
-    expected_closeness: torch.Tensor,
-) -> tuple[float, float]:
-    max_d = float(args.lidar_max_distance)
-    scene_valid = scene_distance < (max_d - 1.0e-5)
-    obstacle_valid = obstacle_distance < (max_d - 1.0e-5)
-    workspace_valid = workspace_distance < (max_d - 1.0e-5)
-    actual_valid = actual_distance < (max_d - 1.0e-5)
-    closeness_abs_err = torch.abs(policy_closeness - expected_closeness)
-    scene_actual_abs_err = torch.abs(scene_distance - actual_distance)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "step",
-                "env_id",
-                "scene_min_m",
-                "obstacle_min_m",
-                "workspace_min_m",
-                "actual_used_min_m",
-                "scene_valid_bins",
-                "obstacle_valid_bins",
-                "workspace_valid_bins",
-                "actual_valid_bins",
-                "policy_closeness_min",
-                "policy_closeness_mean",
-                "policy_closeness_max",
-                "closeness_expected_abs_max",
-                "closeness_expected_abs_mean",
-                "scene_vs_actual_distance_abs_max",
-            ]
-        )
-        for env_id in range(int(actual_distance.shape[0])):
-            writer.writerow(
-                [
-                    int(global_step),
-                    int(env_id),
-                    float(scene_distance[env_id].min().item()),
-                    float(obstacle_distance[env_id].min().item()),
-                    float(workspace_distance[env_id].min().item()),
-                    float(actual_distance[env_id].min().item()),
-                    int(scene_valid[env_id].sum().item()),
-                    int(obstacle_valid[env_id].sum().item()),
-                    int(workspace_valid[env_id].sum().item()),
-                    int(actual_valid[env_id].sum().item()),
-                    float(policy_closeness[env_id].min().item()),
-                    float(policy_closeness[env_id].mean().item()),
-                    float(policy_closeness[env_id].max().item()),
-                    float(closeness_abs_err[env_id].max().item()),
-                    float(closeness_abs_err[env_id].mean().item()),
-                    float(scene_actual_abs_err[env_id].max().item()),
-                ]
-            )
-    return float(closeness_abs_err.max().item()), float(scene_actual_abs_err.max().item())
-
-
 def save_lidarcheck_outputs(
     *,
     base_env: Any,
@@ -1092,6 +1031,32 @@ def save_lidarcheck_outputs(
     step_dir = output_root / f"step_{int(global_step):08d}"
     step_dir.mkdir(parents=True, exist_ok=True)
     distance_params = _lidarcheck_distance_params()
+
+    try:
+        scene_pointcloud = exact_obstacle_pointcloud_body(
+            base_env,
+            obstacle_size_xy=1.0,
+            obstacle_height=10.0,
+            surface_step=float(args.lidar_surface_step),
+            include_workspace=True,
+            **distance_params,
+        )
+    except Exception as exc:
+        print(f"[LIDARCHECK] generated scene pointcloud failed at step={global_step}: {exc}", flush=True)
+        scene_pointcloud = None
+
+    try:
+        obstacle_pointcloud = exact_obstacle_pointcloud_body(
+            base_env,
+            obstacle_size_xy=1.0,
+            obstacle_height=10.0,
+            surface_step=float(args.lidar_surface_step),
+            include_workspace=False,
+            **distance_params,
+        )
+    except Exception as exc:
+        print(f"[LIDARCHECK] generated obstacle-only pointcloud failed at step={global_step}: {exc}", flush=True)
+        obstacle_pointcloud = None
 
     try:
         scene_distance = exact_lidar_distance_grid(
@@ -1153,18 +1118,26 @@ def save_lidarcheck_outputs(
     scene_valid_mask = scene_distance < (float(args.lidar_max_distance) - 1.0e-5)
     obstacle_valid_mask = obstacle_distance < (float(args.lidar_max_distance) - 1.0e-5)
     actual_valid_mask = actual_distance < (float(args.lidar_max_distance) - 1.0e-5)
-    closeness_err_max, scene_actual_err_max = _write_lidarcheck_summary_csv(
-        step_dir / "lidarcheck_summary.csv",
-        global_step=global_step,
-        scene_distance=scene_distance,
-        obstacle_distance=obstacle_distance,
-        workspace_distance=workspace_distance,
-        actual_distance=actual_distance,
-        policy_closeness=policy_closeness,
-        expected_closeness=expected_closeness,
-    )
+    closeness_err_max = float(torch.abs(policy_closeness - expected_closeness).max().item())
+    scene_actual_err_max = float(torch.abs(scene_distance - actual_distance).max().item())
+    scene_valid_mean = float(scene_valid_mask.to(torch.float32).sum(dim=-1).mean().item())
+    obstacle_valid_mean = float(obstacle_valid_mask.to(torch.float32).sum(dim=-1).mean().item())
     for env_id in range(num_envs):
         prefix = f"env_{env_id:04d}"
+        if isinstance(scene_pointcloud, list) and env_id < len(scene_pointcloud):
+            pts_np = _finite_downsample_points(scene_pointcloud[env_id], max_points=max_points)
+            _save_pointcloud_3d(
+                pts_np,
+                step_dir / f"{prefix}_generated_scene_pointcloud3d.png",
+                title=f"Generated scene point cloud with workspace env={env_id} step={global_step}",
+            )
+        if isinstance(obstacle_pointcloud, list) and env_id < len(obstacle_pointcloud):
+            pts_np = _finite_downsample_points(obstacle_pointcloud[env_id], max_points=max_points)
+            _save_pointcloud_3d(
+                pts_np,
+                step_dir / f"{prefix}_generated_obstacle_only_pointcloud3d.png",
+                title=f"Generated obstacle-only point cloud env={env_id} step={global_step}",
+            )
         _save_lidar_distance_heatmap(
             scene_distance[env_id],
             grid_shape=lidar_grid_shape,
@@ -1199,6 +1172,11 @@ def save_lidarcheck_outputs(
         )
     print(
         f"[LIDARCHECK] saved {num_envs} envs to {step_dir}; "
+        f"scene_pointcloud=env_XXXX_generated_scene_pointcloud3d.png; "
+        f"obstacle_pointcloud=env_XXXX_generated_obstacle_only_pointcloud3d.png; "
+        f"scene_heatmap=env_XXXX_generated_scene_distance_grid.png; "
+        f"obstacle_heatmap=env_XXXX_generated_obstacle_only_distance_grid.png; "
+        f"mean_valid_bins(scene={scene_valid_mean:.2f}, obstacle={obstacle_valid_mean:.2f}); "
         f"policy_closeness_vs_recomputed max_abs={closeness_err_max:.6g}; "
         f"scene_vs_actual_distance max_abs={scene_actual_err_max:.6g}",
         flush=True,
@@ -1381,6 +1359,7 @@ def main() -> None:
             "num_envs": int(num_envs),
             "obs_dim": int(obs_dim),
             "state_dim": int(state_dim),
+            "prev_action_state_dim": 4 if int(state_dim) >= len(STATE_OBS_NAMES_22) else 0,
             "lidar_dim": int(lidar_dim),
             "base_learning_rate": float(args.learning_rate),
             "learning_rate_scheduler": "KLAdaptiveLR" if bool(args.use_kl_adaptive_lr) else None,
@@ -1397,7 +1376,7 @@ def main() -> None:
             "lidar_max_distance": float(args.lidar_max_distance),
             "lidar_min_range": float(args.lidar_min_range),
             "lidar_surface_step": float(args.lidar_surface_step),
-            "lidar_feature": "exponential_closeness",
+            "lidar_feature": "full_range_exponential_closeness",
             "lidar_safe_distance": float(args.lidar_safe_distance),
             "lidar_closeness_exponent": float(args.lidar_closeness_exponent),
         },

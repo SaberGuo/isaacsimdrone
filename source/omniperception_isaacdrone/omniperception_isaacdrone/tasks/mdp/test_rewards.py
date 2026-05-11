@@ -95,7 +95,7 @@ def _get_lidar_max_distance(lidar=None) -> float:
             return float(lidar.cfg.max_distance)
     except Exception:
         pass
-    return 50.0
+    return 10.0
 
 
 # -----------------------------------------------------------------------------

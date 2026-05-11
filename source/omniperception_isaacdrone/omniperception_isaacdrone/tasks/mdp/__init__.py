@@ -15,6 +15,7 @@ from .test_observations import (
     obs_root_pos_z_norm,
     obs_goal_delta_norm,
     obs_goal_dir_dist_norm,
+    obs_prev_action_norm01,
     obs_projected_gravity_norm,
     obs_state_norm,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "obs_projected_gravity_norm",
     "obs_goal_delta_norm",
     "obs_goal_dir_dist_norm",
+    "obs_prev_action_norm01",
     "obs_state_norm",
     
     # rewards

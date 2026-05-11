@@ -235,6 +235,25 @@ def obs_goal_dir_dist_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) ->
     return torch.cat([_clamp_m11(unit_dir), dist_norm], dim=-1)
 
 
+def obs_prev_action_norm01(env: ManagerBasedRLEnv, action_name: str = "root_twist") -> torch.Tensor:
+    try:
+        term = env.action_manager.get_term(action_name)
+        action = getattr(term, "raw_actions", None)
+    except Exception:
+        action = None
+
+    if not isinstance(action, torch.Tensor):
+        return torch.full((env.num_envs, 4), 0.5, device=env.device, dtype=torch.float32)
+
+    action = torch.nan_to_num(action.to(device=env.device, dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if action.dim() == 1:
+        action = action.unsqueeze(0).expand(env.num_envs, -1)
+    if action.shape[0] != env.num_envs:
+        action = action[:1].expand(env.num_envs, -1)
+    action = torch.clamp(action, -1.0, 1.0)
+    return _clamp_01(0.5 * (action + 1.0))
+
+
 def obs_state_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     # 拼接完整的无人机观测状态向量
     z = obs_root_pos_z_norm(env, asset_cfg)
@@ -274,7 +293,7 @@ def get_lidar_grid_cached(
     ``lidar_name``, ``empty_value`` and ``max_vis_points`` are accepted only for
     backward-compatible call sites.
     """
-    resolved_max_d = 50.0 if max_distance is None else float(max_distance)
+    resolved_max_d = 10.0 if max_distance is None else float(max_distance)
     return get_exact_lidar_grid_cached(
         env,
         theta_min=theta_min,

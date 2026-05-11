@@ -42,18 +42,18 @@ class NormalizationCfg:
     ang_vel_max: float = 31.4
     goal_distance_max: float = 80.0
     quat_hemisphere: bool = True
-    state_dim: int = 18
+    state_dim: int = 22
 
 
 @configclass
 class ObstacleCurriculumSettingsCfg:
     """障碍物课程学习配置。"""
     enabled: bool = True
-    levels: tuple[int, ...] = (0, 5, 10, 15, 20, 30, 50, 100)
+    levels: tuple[int, ...] = (0, 50, 100, 200, 300)
     initial_level: int = 0
     success_term_name: str = "reached_goal"
     success_threshold: float = 0.85
-    success_thresholds: tuple[float, ...] = (0.90, 0.86, 0.82, 0.80, 0.76, 0.72, 0.68, 0.64)
+    success_thresholds: tuple[float, ...] = (0.85, 0.85, 0.85, 0.85, 0.85)
     k_roll: int = 8
     clear_history_on_promotion: bool = True
 
@@ -152,6 +152,7 @@ class Test6ObservationsCfg:
         root_ang_vel = ObsTerm(func=my_mdp.obs_root_ang_vel_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         projected_gravity = ObsTerm(func=my_mdp.obs_projected_gravity_norm, params={"asset_cfg": SceneEntityCfg("robot")})
         goal_dir_dist = ObsTerm(func=my_mdp.obs_goal_dir_dist_norm, params={"asset_cfg": SceneEntityCfg("robot")})
+        prev_action = ObsTerm(func=my_mdp.obs_prev_action_norm01, params={"action_name": "root_twist"})
         lidar_grid = ObsTerm(
             func=my_mdp.obs_lidar_min_range_grid,
             params=dict(
@@ -164,7 +165,7 @@ class Test6ObservationsCfg:
                 delta_theta=30.0,
                 delta_phi=15.0,
                 min_range=0.2,
-                max_distance=50.0,
+                max_distance=10.0,
                 obstacle_size_xy=1.0,
                 obstacle_height=10.0,
                 surface_step=0.5,
@@ -193,10 +194,12 @@ class Test6EventCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("obstacles"),
-            "x_range": (-33.0, 33.0),
-            "y_range": (-33.0, 33.0),
+            "x_range": (-75.0, 75.0),
+            "y_range": (-75.0, 75.0),
             "z_height": 10.0,
-            "edge_margin": 8.0,
+            "edge_margin": 0.0,
+            "spawn_half_size": 35.0,
+            "spawn_edge_clearance": 6.0,
             "min_separation": 3.5,
             "max_sample_tries": 4000,
         },
@@ -232,10 +235,10 @@ class Test6CurriculumCfg:
     obstacle_count = CurrTerm(
         func=my_mdp.update_obstacle_curriculum,
         params={
-            "levels": (0, 5, 10, 15, 20, 30, 50, 100),
+            "levels": (0, 50, 100, 200, 300),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
-            "success_thresholds": (0.90, 0.86, 0.82, 0.80, 0.76, 0.72, 0.68, 0.64),
+            "success_thresholds": (0.85, 0.85, 0.85, 0.85, 0.85),
             "k_roll": 8,
         },
     )

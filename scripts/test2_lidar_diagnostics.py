@@ -47,7 +47,7 @@ parser.add_argument(
 parser.add_argument("--max_points", type=int, default=5000)
 parser.add_argument("--max_env_plots", type=int, default=0, help="0 means plot every env")
 parser.add_argument("--settle_steps", type=int, default=4)
-parser.add_argument("--state_dim", type=int, default=18)
+parser.add_argument("--state_dim", type=int, default=22)
 parser.add_argument("--theta_min", type=float, default=75.0)
 parser.add_argument("--theta_max", type=float, default=105.0)
 parser.add_argument("--phi_min", type=float, default=0.0)
@@ -529,7 +529,7 @@ def save_pattern_diagnostics(lidar, output_dir: Path, max_points: int) -> None:
 
 def get_lidar_ranges(lidar) -> tuple[float, float]:
     min_r = float(getattr(lidar.cfg, "min_range", 0.2))
-    max_d = float(getattr(lidar.cfg, "max_distance", 50.0))
+    max_d = float(getattr(lidar.cfg, "max_distance", 10.0))
     return min_r, max_d
 
 
@@ -839,7 +839,7 @@ def main() -> int:
             "update_frequency": float(getattr(lidar.cfg, "update_frequency", 0.0)),
             "update_period": float(getattr(lidar.cfg, "update_period", 0.0)),
             "min_range": float(getattr(lidar.cfg, "min_range", 0.2)),
-            "max_distance": float(getattr(lidar.cfg, "max_distance", 50.0)),
+            "max_distance": float(getattr(lidar.cfg, "max_distance", 10.0)),
             "mesh_prim_paths": list(getattr(lidar.cfg, "mesh_prim_paths", [])),
             "pattern_cfg": {
                 "class": lidar.cfg.pattern_cfg.__class__.__name__,
