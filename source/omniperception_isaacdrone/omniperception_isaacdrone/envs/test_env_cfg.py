@@ -218,16 +218,18 @@ class Test6EventCfg:
 @configclass
 class Test6RewardsCfg:
     """奖励配置。"""
-    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=3.0, params={})
-    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=0.8, params={})
+    progress_to_goal = RewTerm(func=my_mdp.reward_progress_to_goal, weight=4.0, params={})
+    vel_towards_goal = RewTerm(func=my_mdp.reward_velocity_towards_goal, weight=1.2, params={})
     heading_align_velocity = RewTerm(func=my_mdp.reward_heading_align_velocity, weight=0.08, params={})
     height = RewTerm(func=my_mdp.penalty_height_error, weight=-0.6, params={})
-    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-13.5, params={})
+    lidar_threat = RewTerm(func=my_mdp.penalty_lidar_threat, weight=-7.0, params={})
+    safe_vel = RewTerm(func=my_mdp.penalty_safe_vel, weight=-1.2, params={})
+    time_cost = RewTerm(func=my_mdp.penalty_time_cost, weight=-0.15, params={})
     # IsaacLab RewardManager 会额外乘以 dt=1/60；这里按“单次事件”目标值反推权重。
-    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=1500.0, params={})
+    success_bonus = RewTerm(func=my_mdp.reward_goal_reached, weight=2500.0, params={})
     collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-1400.0, params={})
     oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-900.0, params={})
-    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-1200.0, params={})
+    timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-2500.0, params={})
 
 
 @configclass
@@ -370,13 +372,26 @@ class Test6DroneEnvCfg(ManagerBasedRLEnvCfg):
         }
         self.rewards.lidar_threat.params = {
             "asset_cfg": SceneEntityCfg("robot"),
-            # 避障训练阶段需要在碰撞前给出足够早的密集惩罚；
-            # 这里的 crash_distance 是 barrier 的基础安全距离，不是物理碰撞半径。
-            "crash_distance": 6.0,
-            "acc_max": 3.0,
+            # 作为弱全方向 barrier；主要方向相关避障交给 safe_vel。
+            "crash_distance": 4.0,
+            "acc_max": 4.5,
             "use_horizontal_speed": True,
             "exp_clip": 1.0,
             "use_grid": True,
+            "theta_min": 75.0,
+            "theta_max": 105.0,
+            "phi_min": 0.0,
+            "phi_max": 360.0,
+            "delta_theta": 30.0,
+            "delta_phi": 15.0,
+            "max_vis_points": None,
+        }
+        self.rewards.safe_vel.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
+            "lidar_name": "lidar",
+            "safe_dist": 3.0,
+            "margin": 1.0,
+            "front_cos_threshold": 0.65,
             "theta_min": 75.0,
             "theta_max": 105.0,
             "phi_min": 0.0,

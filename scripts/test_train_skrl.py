@@ -27,7 +27,7 @@ parser = argparse.ArgumentParser("Stable skrl PPO trainer for IsaacLab drone lid
 parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lidar-v0")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 parser.add_argument("--num_envs", type=int, default=128)
-parser.add_argument("--num_obstacles", type=int, default=100)
+parser.add_argument("--num_obstacles", type=int, default=500)
 parser.add_argument("--timesteps", type=int, default=10_000_000)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--state_dim", type=int, default=22)
@@ -35,24 +35,24 @@ parser.add_argument("--lidar_dim", type=int, default=24)
 parser.add_argument("--feat_dim", type=int, default=256)
 parser.add_argument("--model_cfg_path", type=str, default="")
 parser.add_argument("--model_cfg_json", type=str, default="")
-parser.add_argument("--rollouts", type=int, default=256)
-parser.add_argument("--learning_epochs", type=int, default=5)
-parser.add_argument("--mini_batches", type=int, default=8)
-parser.add_argument("--learning_rate", type=float, default=8.0e-6)
-parser.add_argument("--_lambda", type=float, default=0.95)
-parser.add_argument("--discount_factor", type=float, default=0.995)
-parser.add_argument("--ratio_clip", type=float, default=0.10)
+parser.add_argument("--rollouts", type=int, default=512)
+parser.add_argument("--learning_epochs", type=int, default=4)
+parser.add_argument("--mini_batches", type=int, default=16)
+parser.add_argument("--learning_rate", type=float, default=1.0e-5)
+parser.add_argument("--_lambda", type=float, default=0.995)
+parser.add_argument("--discount_factor", type=float, default=0.9995)
+parser.add_argument("--ratio_clip", type=float, default=0.12)
 parser.add_argument("--value_clip", type=float, default=0.4)
-parser.add_argument("--value_loss_scale", type=float, default=0.8)
-parser.add_argument("--grad_norm_clip", type=float, default=0.6)
-parser.add_argument("--entropy_coef", type=float, default=8.0e-4)
+parser.add_argument("--value_loss_scale", type=float, default=0.6)
+parser.add_argument("--grad_norm_clip", type=float, default=0.8)
+parser.add_argument("--entropy_coef", type=float, default=1.5e-3)
 parser.add_argument("--kl_threshold", type=float, default=0.010)
 parser.add_argument("--use_kl_adaptive_lr", action="store_true")
 parser.add_argument("--no_use_kl_adaptive_lr", dest="use_kl_adaptive_lr", action="store_false")
 parser.set_defaults(use_kl_adaptive_lr=True)
-parser.add_argument("--kl_adaptive_lr_threshold", type=float, default=0.006)
+parser.add_argument("--kl_adaptive_lr_threshold", type=float, default=0.008)
 parser.add_argument("--kl_adaptive_min_lr", type=float, default=2e-6)
-parser.add_argument("--kl_adaptive_max_lr", type=float, default=1.6e-5)
+parser.add_argument("--kl_adaptive_max_lr", type=float, default=2.0e-5)
 parser.add_argument("--kl_adaptive_kl_factor", type=float, default=2.0)
 parser.add_argument("--kl_adaptive_lr_factor", type=float, default=1.5)
 parser.add_argument("--clip_predicted_values", action="store_true")
@@ -390,6 +390,22 @@ def apply_lidar_grid_cli_params(env_cfg: Any) -> None:
             }
         )
         env_cfg.rewards.lidar_threat.params = reward_params
+    except Exception:
+        pass
+    try:
+        safe_vel_params = getattr(env_cfg.rewards.safe_vel, "params", None) or {}
+        safe_vel_params.update(
+            {
+                "theta_min": params["theta_min"],
+                "theta_max": params["theta_max"],
+                "phi_min": params["phi_min"],
+                "phi_max": params["phi_max"],
+                "delta_theta": params["delta_theta"],
+                "delta_phi": params["delta_phi"],
+                "max_vis_points": None,
+            }
+        )
+        env_cfg.rewards.safe_vel.params = safe_vel_params
     except Exception:
         pass
 

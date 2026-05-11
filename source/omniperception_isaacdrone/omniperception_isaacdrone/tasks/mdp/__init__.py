@@ -27,6 +27,7 @@ from .test_rewards import (
     penalty_lidar_threat,
     penalty_out_of_workspace,
     penalty_time_out,
+    penalty_time_cost,
     reward_action_l2,
     reward_distance_to_goal,
     reward_goal_reached,
@@ -81,6 +82,7 @@ __all__ = [
     "reward_goal_reached",
     "penalty_out_of_workspace",
     "penalty_time_out",
+    "penalty_time_cost",
     "penalty_collision",
     "reward_action_l2",
     

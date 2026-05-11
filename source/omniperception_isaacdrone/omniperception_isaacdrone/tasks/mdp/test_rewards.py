@@ -296,6 +296,13 @@ def reward_action_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
     return out
 
 
+def penalty_time_cost(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Dense per-step time cost used to discourage waiting until timeout."""
+    out = torch.ones((env.num_envs,), device=env.device, dtype=torch.float32)
+    _tb_store_reward(env, "time_cost", out)
+    return out
+
+
 # -----------------------------------------------------------------------------
 # Obstacle-avoidance penalties
 # -----------------------------------------------------------------------------
@@ -417,7 +424,11 @@ def penalty_safe_vel(
     delta_phi: float = 15.0,
     max_vis_points: int | None = 12000,
 ) -> torch.Tensor:
-    """动态安全速度惩罚 (NavRL 风格)。"""
+    """Direction-aware safe-velocity penalty.
+
+    This term only activates when the current velocity direction points into a
+    near obstacle and no sufficiently clear continuation exists.
+    """
 
     v = mdp.base_lin_vel(env, asset_cfg=asset_cfg)
     v_norm = _safe_norm(v)
@@ -465,21 +476,26 @@ def penalty_safe_vel(
     front_mask = cos_sim >= front_cos_threshold
     front_distance = torch.where(front_mask, grid, torch.full_like(grid, max_d)).min(dim=1).values
     threat_mask = front_distance < float(safe_dist)
+    _tb_store_aux(env, "safe_vel_front_distance", front_distance)
+    _tb_store_aux(env, "safe_vel_threat_ratio", threat_mask.float())
 
     if not threat_mask.any():
         out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
-        _tb_store_reward(env, "safe_vel_penalty", out0)
+        _tb_store_reward(env, "safe_vel", out0)
+        _tb_store_aux(env, "safe_vel_trigger_ratio", out0)
         return out0
 
     current_heading_bin = torch.argmax(cos_sim, dim=1)
     current_heading_distance = grid.gather(1, current_heading_bin.unsqueeze(1)).squeeze(1)
+    _tb_store_aux(env, "safe_vel_current_heading_distance", current_heading_distance)
 
     is_heading_safe = current_heading_distance >= (float(safe_dist) + float(margin))
     active_mask = threat_mask & ~is_heading_safe
 
     if not active_mask.any():
         out0 = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
-        _tb_store_reward(env, "safe_vel_penalty", out0)
+        _tb_store_reward(env, "safe_vel", out0)
+        _tb_store_aux(env, "safe_vel_trigger_ratio", out0)
         return out0
 
     valid_mask = grid >= (float(safe_dist) + float(margin))
@@ -489,6 +505,7 @@ def penalty_safe_vel(
 
     has_safe_bin = best_scores > -1.5
     chosen_safe_dirs = bin_dirs[best_idx]
+    _tb_store_aux(env, "safe_vel_has_safe_bin_ratio", has_safe_bin.float())
 
     safe_dir_final = torch.where(has_safe_bin.unsqueeze(-1), chosen_safe_dirs, -v_dir)
     safe_v_norm = torch.where(has_safe_bin, v_norm, torch.zeros_like(v_norm))
@@ -499,7 +516,7 @@ def penalty_safe_vel(
 
     penalty = (dir_penalty + mag_penalty) * active_mask.float()
 
-    _tb_store_reward(env, "safe_vel_penalty", penalty)
+    _tb_store_reward(env, "safe_vel", penalty)
     _tb_store_aux(env, "safe_vel_trigger_ratio", active_mask.float())
     return penalty
 
