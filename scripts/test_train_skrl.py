@@ -66,7 +66,7 @@ parser.add_argument("--dist_window", type=int, default=10)
 parser.add_argument("--dist_max_samples", type=int, default=2048)
 parser.add_argument("--checkpoint_interval", type=int, default=50000)
 parser.add_argument("--cuda_clean_interval", type=int, default=0)
-parser.add_argument("--extra_tb_subdir", type=str, default="extra_tb")
+parser.add_argument("--extra_tb_subdir", type=str, default="", help="Deprecated: TensorBoard logs are unified under the run directory.")
 parser.add_argument("--keep_infos", action="store_true", default=False)
 parser.add_argument("--grad_hist_interval", type=int, default=0)
 parser.add_argument("--grad_hist_samples", type=int, default=65536)
@@ -524,12 +524,6 @@ def build_primary_termination_count_dict(base_env: Any, terminated: torch.Tensor
 
     return counts
 
-def build_termination_ratio_dict(count_dict: Dict[str, float], done_count: int) -> Dict[str, float]:
-    if int(done_count) <= 0 or len(count_dict) == 0:
-        return {}
-    denom = max(float(done_count), 1.0)
-    return {k: float(v) / denom for k, v in count_dict.items()}
-
 def extract_prefixed_log_scalars(infos: Any, prefix: str) -> Dict[str, float]:
     return {k: to_float(v) for k, v in extract_log_dict(infos).items() if k.startswith(prefix)}
 
@@ -624,25 +618,27 @@ class RewardBreakdownAccumulator:
     def __init__(self): self.raw, self.weighted, self.scaled = TensorDictStats(), TensorDictStats(), TensorDictStats()
     def reset(self): self.raw.reset(); self.weighted.reset(); self.scaled.reset()
     def update(self, raw_terms, weighted_terms, scaled_terms): self.raw.update(raw_terms); self.weighted.update(weighted_terms); self.scaled.update(scaled_terms)
-    def flush(self, writer, step): self.raw.flush(writer, "RewardRaw", step); self.weighted.flush(writer, "RewardWeighted", step); self.scaled.flush(writer, "RewardScaled", step)
+    def flush(self, writer, step): self.raw.flush(writer, "Reward/Raw", step); self.weighted.flush(writer, "Reward/Weighted", step); self.scaled.flush(writer, "Reward/Scaled", step)
 
 
-class InfoTerminationRatioAccumulator:
-    """累积各终止原因的比率统计。"""
+class TerminationWindowAccumulator:
+    """累积 TensorBoard 窗口内的终止原因计数和占比。"""
     def __init__(self): self.reset()
-    def reset(self): self.update_steps, self.sum_ratios, self.last_ratios = 0, {}, {}
-    def update(self, ratio_dict: Dict[str, float]):
-        if len(ratio_dict) == 0: return
-        self.update_steps += 1
-        for name, value in ratio_dict.items():
-            self.sum_ratios[name] = self.sum_ratios.get(name, 0.0) + float(value)
-            self.last_ratios[name] = float(value)
+    def reset(self): self.window_steps, self.done_count_sum, self.counts = 0, 0.0, {}
+    def update(self, count_dict: Dict[str, float], done_count: int):
+        self.window_steps += 1
+        self.done_count_sum += float(done_count)
+        for name, value in count_dict.items():
+            self.counts[name] = self.counts.get(name, 0.0) + float(value)
     def flush(self, writer, step):
-        if self.update_steps <= 0: return
-        writer.add_scalar("TerminationInfoRatio/update_steps", float(self.update_steps), step)
-        for name in sorted(self.sum_ratios.keys()):
-            writer.add_scalar(f"TerminationInfoRatio/{sanitize_tb_tag(name)}/mean", self.sum_ratios[name] / float(self.update_steps), step)
-            writer.add_scalar(f"TerminationInfoRatio/{sanitize_tb_tag(name)}/latest", self.last_ratios.get(name, 0.0), step)
+        if self.window_steps <= 0: return
+        writer.add_scalar("Termination/done_count/window_sum", float(self.done_count_sum), step)
+        denom = max(float(self.done_count_sum), 1.0)
+        for name in sorted(self.counts.keys()):
+            tag = sanitize_tb_tag(name)
+            count = float(self.counts[name])
+            writer.add_scalar(f"Termination/{tag}/count_window_sum", count, step)
+            writer.add_scalar(f"Termination/{tag}/ratio_window", count / denom, step)
 
 
 class RollingHistogramLogger:
@@ -664,21 +660,33 @@ class RollingHistogramLogger:
             if len(buffer) > 0: writer.add_histogram(f"ActionDist/{sanitize_tb_tag(name)}", torch.cat(list(buffer), dim=0), step)
 
 
-class SkrlLossMirror:
-    """拦截 skrl agent.track_data 以记录策略/价值损失。"""
-    def __init__(self): self.reset()
-    def reset(self): self.policy_losses, self.value_losses = [], []
-    def bind(self, agent: PPO):
-        original_track_data = agent.track_data
-        def wrapped_track_data(tag, value):
-            if "loss" in (low := str(tag).lower()) and "policy" in low: self.policy_losses.append(to_float(value))
-            elif "loss" in low and "value" in low: self.value_losses.append(to_float(value))
-            original_track_data(tag, value)
-        agent.track_data = wrapped_track_data
-    def flush(self, writer, step):
-        if len(self.policy_losses) > 0: writer.add_scalar("Loss/policy", float(np.mean(self.policy_losses)), step)
-        if len(self.value_losses) > 0: writer.add_scalar("Loss/value", float(np.mean(self.value_losses)), step)
-        self.reset()
+def normalize_skrl_tb_tag(tag: str) -> str:
+    """Map skrl default TensorBoard tags into the project's tag hierarchy."""
+    text = str(tag).strip()
+    mapping = {
+        "Reward / Instantaneous reward (max)": "Train/Reward/instantaneous/max",
+        "Reward / Instantaneous reward (min)": "Train/Reward/instantaneous/min",
+        "Reward / Instantaneous reward (mean)": "Train/Reward/instantaneous/mean",
+        "Reward / Total reward (max)": "Train/Reward/episode_total/max",
+        "Reward / Total reward (min)": "Train/Reward/episode_total/min",
+        "Reward / Total reward (mean)": "Train/Reward/episode_total/mean",
+        "Loss / Policy loss": "Train/Loss/policy",
+        "Loss / Value loss": "Train/Loss/value",
+        "Loss / Entropy loss": "Train/Loss/entropy",
+        "Policy / Standard deviation": "Train/Policy/std",
+        "Learning / Learning rate": "Train/Learning/lr",
+        "Episode / Total timesteps (max)": "Train/Episode/total_timesteps/max",
+        "Episode / Total timesteps (min)": "Train/Episode/total_timesteps/min",
+        "Episode / Total timesteps (mean)": "Train/Episode/total_timesteps/mean",
+    }
+    return mapping.get(text, sanitize_tb_tag(text).replace("_/_", "/"))
+
+
+def bind_skrl_tb_tag_normalizer(agent: PPO) -> None:
+    original_track_data = agent.track_data
+    def wrapped_track_data(tag, value):
+        original_track_data(normalize_skrl_tb_tag(str(tag)), value)
+    agent.track_data = wrapped_track_data
 
 
 def log_gradients(writer, models, step, max_samples):
@@ -1332,8 +1340,6 @@ def main() -> None:
     log_root.mkdir(parents=True, exist_ok=True)
     run_name = datetime.now().strftime("%y-%m-%d_%H-%M-%S-%f") + "_PPO"
     exp_dir = log_root / run_name
-    tb_dir = exp_dir / args.extra_tb_subdir
-    tb_dir.mkdir(parents=True, exist_ok=True)
     config_path = exp_dir / "config" / "config.txt"
     lidarcheck_interval = int(args.lidarcheck_step)
     lidarcheck_root = (
@@ -1379,18 +1385,11 @@ def main() -> None:
             "lidar_feature": "full_range_exponential_closeness",
             "lidar_safe_distance": float(args.lidar_safe_distance),
             "lidar_closeness_exponent": float(args.lidar_closeness_exponent),
+            "tensorboard_log_dir": str(exp_dir),
+            "tensorboard_extra_tb_subdir": "",
         },
         model_cfg=model_cfg_dict,
     )
-    writer = SummaryWriter(log_dir=str(tb_dir))
-    writer.add_text("run/args", str(vars(args)), 0)
-    writer.add_text("run/model_cfg", json_dumps_pretty(model_cfg_dict), 0)
-    writer.add_text(
-        "run/dims",
-        f"obs={obs_dim}, state={state_dim}, lidar={lidar_dim}, act={act_dim}, grid={model_cfg.lidar_encoder.grid_shape}, encoder={model_cfg.lidar_encoder.type}",
-        0,
-    )
-    writer.add_text("run/step_dt", f"{step_dt:.8f}", 0)
     memory = RandomMemory(memory_size=int(args.rollouts), num_envs=num_envs, device=device)
     agent = PPO(
         models=models,
@@ -1400,9 +1399,19 @@ def main() -> None:
         action_space=act_space,
         device=device,
     )
+    bind_skrl_tb_tag_normalizer(agent)
     agent.init()
-    loss_mirror = SkrlLossMirror()
-    loss_mirror.bind(agent)
+    writer = getattr(agent, "writer", None)
+    if writer is None:
+        writer = SummaryWriter(log_dir=str(exp_dir))
+    writer.add_text("run/args", str(vars(args)), 0)
+    writer.add_text("run/model_cfg", json_dumps_pretty(model_cfg_dict), 0)
+    writer.add_text(
+        "run/dims",
+        f"obs={obs_dim}, state={state_dim}, lidar={lidar_dim}, act={act_dim}, grid={model_cfg.lidar_encoder.grid_shape}, encoder={model_cfg.lidar_encoder.type}",
+        0,
+    )
+    writer.add_text("run/step_dt", f"{step_dt:.8f}", 0)
     raw_obs, infos = env.reset()
     states = sanitize_wrapped_states(
         ensure_obs_shape(extract_policy_obs(raw_obs), num_envs, obs_dim),
@@ -1417,7 +1426,7 @@ def main() -> None:
     reward_weights = extract_reward_weights(base_env)
     reward_window = RewardBreakdownAccumulator() if enable_scalar_logging else None
     aux_window = TensorDictStats() if enable_scalar_logging else None
-    termination_ratio_window = InfoTerminationRatioAccumulator()
+    termination_window = TerminationWindowAccumulator()
     hist_logger = RollingHistogramLogger(
         obs_names=build_state_names(state_dim),
         action_names=build_action_names(act_dim),
@@ -1476,11 +1485,9 @@ def main() -> None:
                     aux_window.update(extract_tb_aux_terms(base_env))
                 clear_tb_caches(base_env)
             done_count = int((terminated | truncated).sum().item())
-            termination_ratio_window.update(
-                build_termination_ratio_dict(
-                    build_primary_termination_count_dict(base_env, terminated=terminated, truncated=truncated),
-                    done_count=done_count,
-                )
+            termination_window.update(
+                build_primary_termination_count_dict(base_env, terminated=terminated, truncated=truncated),
+                done_count=done_count,
             )
             if done_count > 0:
                 if len(curriculum_log_dict := extract_prefixed_log_scalars(infos, "Curriculum/")) > 0:
@@ -1488,7 +1495,6 @@ def main() -> None:
             with torch.no_grad():
                 agent.record_transition(states=states, actions=actions, rewards=train_rewards, next_states=next_states, terminated=terminated, truncated=truncated, infos=infos if args.keep_infos else {}, timestep=t, timesteps=int(args.timesteps))
             agent.post_interaction(timestep=t, timesteps=int(args.timesteps))
-            if rollout_boundary: loss_mirror.flush(writer, global_step)
             if keep_nan_snapshot and rollout_boundary and finite_check_interval > 0 and ((global_step // int(args.rollouts)) % finite_check_interval == 0):
                 if not models_are_finite(models):
                     debug_dir = exp_dir / "debug"
@@ -1510,13 +1516,13 @@ def main() -> None:
                     reward_window.flush(writer, global_step)
                 if aux_window is not None:
                     aux_window.flush(writer, "Aux", global_step)
-                termination_ratio_window.flush(writer, global_step)
+                termination_window.flush(writer, global_step)
                 writer.flush()
                 if reward_window is not None:
                     reward_window.reset()
                 if aux_window is not None:
                     aux_window.reset()
-                termination_ratio_window.reset()
+                termination_window.reset()
             if int(args.grad_hist_interval) > 0 and rollout_boundary and (global_step // int(args.rollouts)) % int(args.grad_hist_interval) == 0:
                 log_gradients(writer, models, global_step, int(args.grad_hist_samples))
                 writer.flush()
