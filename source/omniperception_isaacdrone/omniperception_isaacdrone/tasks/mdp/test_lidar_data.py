@@ -320,6 +320,7 @@ def exact_lidar_distance_grid(
     obstacle_size_xy: float = 1.0,
     obstacle_height: float = 10.0,
     surface_step: float = 0.5,
+    include_workspace: bool = True,
 ) -> torch.Tensor:
     """Return an ``(num_envs, theta_bins * phi_bins)`` nearest-distance grid."""
     theta_bins = max(int((float(theta_max) - float(theta_min)) / float(delta_theta)), 1)
@@ -361,7 +362,35 @@ def exact_lidar_distance_grid(
         )
         lin_idx = t_idx * phi_bins + p_idx
         out[env_id].scatter_reduce_(0, lin_idx, r[valid].to(torch.float32), reduce="amin", include_self=True)
-    workspace_grid = _workspace_boundary_distance_grid(
+    if bool(include_workspace):
+        workspace_grid = workspace_lidar_distance_grid(
+            env,
+            theta_min=theta_min,
+            theta_max=theta_max,
+            phi_min=phi_min,
+            phi_max=phi_max,
+            delta_theta=delta_theta,
+            delta_phi=delta_phi,
+            min_range=min_range,
+            max_distance=max_distance,
+        )
+        out = torch.minimum(out, workspace_grid)
+    return out
+
+
+def workspace_lidar_distance_grid(
+    env: ManagerBasedRLEnv,
+    theta_min: float = 75.0,
+    theta_max: float = 105.0,
+    phi_min: float = 0.0,
+    phi_max: float = 360.0,
+    delta_theta: float = 30.0,
+    delta_phi: float = 15.0,
+    min_range: float = 0.2,
+    max_distance: float = 50.0,
+) -> torch.Tensor:
+    """Return nearest-distance grid for workspace walls/ground/ceiling only."""
+    return _workspace_boundary_distance_grid(
         env,
         theta_min=theta_min,
         theta_max=theta_max,
@@ -372,8 +401,6 @@ def exact_lidar_distance_grid(
         min_range=min_range,
         max_distance=max_distance,
     )
-    out = torch.minimum(out, workspace_grid)
-    return out
 
 
 def get_exact_lidar_grid_cached(
@@ -389,6 +416,7 @@ def get_exact_lidar_grid_cached(
     obstacle_size_xy: float = 1.0,
     obstacle_height: float = 10.0,
     surface_step: float = 0.5,
+    include_workspace: bool = True,
 ) -> torch.Tensor:
     current_step = getattr(env, "common_step_counter", -1)
     params = (
@@ -403,6 +431,7 @@ def get_exact_lidar_grid_cached(
         obstacle_size_xy,
         obstacle_height,
         surface_step,
+        bool(include_workspace),
     )
     cache = getattr(env, "_lidar_grid_cache", None)
     if isinstance(cache, dict) and cache.get("step") == current_step and cache.get("params") == params:
@@ -422,6 +451,7 @@ def get_exact_lidar_grid_cached(
         obstacle_size_xy=obstacle_size_xy,
         obstacle_height=obstacle_height,
         surface_step=surface_step,
+        include_workspace=include_workspace,
     )
     env._lidar_grid_cache = {"step": current_step, "params": params, "data": grid}
     return grid

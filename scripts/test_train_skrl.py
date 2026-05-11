@@ -3,6 +3,7 @@ from __future__ import annotations
 # Standard-library imports must stay above AppLauncher construction.
 import argparse
 import copy
+import csv
 import gc
 import json
 import os
@@ -115,7 +116,11 @@ from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 from omniperception_isaacdrone.envs.test_env import WallSpawner, setup_global_obstacles
 from omniperception_isaacdrone.models import Policy, Value, model_cfg_to_dict, resolve_model_cfg
-from omniperception_isaacdrone.tasks.mdp.test_lidar_data import exact_lidar_distance_grid, exact_obstacle_pointcloud_body
+from omniperception_isaacdrone.tasks.mdp.test_lidar_data import (
+    exact_lidar_distance_grid,
+    get_exact_lidar_grid_cached,
+    workspace_lidar_distance_grid,
+)
 
 # -----------------------------------------------------------------------------
 # Runtime metadata and backend settings
@@ -990,6 +995,85 @@ def _save_lidar_valid_mask(valid_flat: torch.Tensor, grid_shape: tuple[int, int]
     plt.close(fig)
 
 
+def _lidarcheck_distance_params() -> dict[str, float]:
+    return {
+        "theta_min": float(args.theta_min),
+        "theta_max": float(args.theta_max),
+        "phi_min": float(args.phi_min),
+        "phi_max": float(args.phi_max),
+        "delta_theta": float(args.delta_theta),
+        "delta_phi": float(args.delta_phi),
+        "min_range": float(args.lidar_min_range),
+        "max_distance": float(args.lidar_max_distance),
+    }
+
+
+def _write_lidarcheck_summary_csv(
+    path: Path,
+    *,
+    global_step: int,
+    scene_distance: torch.Tensor,
+    obstacle_distance: torch.Tensor,
+    workspace_distance: torch.Tensor,
+    actual_distance: torch.Tensor,
+    policy_closeness: torch.Tensor,
+    expected_closeness: torch.Tensor,
+) -> tuple[float, float]:
+    max_d = float(args.lidar_max_distance)
+    scene_valid = scene_distance < (max_d - 1.0e-5)
+    obstacle_valid = obstacle_distance < (max_d - 1.0e-5)
+    workspace_valid = workspace_distance < (max_d - 1.0e-5)
+    actual_valid = actual_distance < (max_d - 1.0e-5)
+    closeness_abs_err = torch.abs(policy_closeness - expected_closeness)
+    scene_actual_abs_err = torch.abs(scene_distance - actual_distance)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "step",
+                "env_id",
+                "scene_min_m",
+                "obstacle_min_m",
+                "workspace_min_m",
+                "actual_used_min_m",
+                "scene_valid_bins",
+                "obstacle_valid_bins",
+                "workspace_valid_bins",
+                "actual_valid_bins",
+                "policy_closeness_min",
+                "policy_closeness_mean",
+                "policy_closeness_max",
+                "closeness_expected_abs_max",
+                "closeness_expected_abs_mean",
+                "scene_vs_actual_distance_abs_max",
+            ]
+        )
+        for env_id in range(int(actual_distance.shape[0])):
+            writer.writerow(
+                [
+                    int(global_step),
+                    int(env_id),
+                    float(scene_distance[env_id].min().item()),
+                    float(obstacle_distance[env_id].min().item()),
+                    float(workspace_distance[env_id].min().item()),
+                    float(actual_distance[env_id].min().item()),
+                    int(scene_valid[env_id].sum().item()),
+                    int(obstacle_valid[env_id].sum().item()),
+                    int(workspace_valid[env_id].sum().item()),
+                    int(actual_valid[env_id].sum().item()),
+                    float(policy_closeness[env_id].min().item()),
+                    float(policy_closeness[env_id].mean().item()),
+                    float(policy_closeness[env_id].max().item()),
+                    float(closeness_abs_err[env_id].max().item()),
+                    float(closeness_abs_err[env_id].mean().item()),
+                    float(scene_actual_abs_err[env_id].max().item()),
+                ]
+            )
+    return float(closeness_abs_err.max().item()), float(scene_actual_abs_err.max().item())
+
+
 def save_lidarcheck_outputs(
     *,
     base_env: Any,
@@ -1007,91 +1091,118 @@ def save_lidarcheck_outputs(
     num_envs = int(getattr(base_env, "num_envs", states.shape[0]))
     step_dir = output_root / f"step_{int(global_step):08d}"
     step_dir.mkdir(parents=True, exist_ok=True)
+    distance_params = _lidarcheck_distance_params()
 
     try:
-        pointcloud = exact_obstacle_pointcloud_body(
+        scene_distance = exact_lidar_distance_grid(
             base_env,
             obstacle_size_xy=1.0,
             obstacle_height=10.0,
             surface_step=float(args.lidar_surface_step),
-            min_range=float(args.lidar_min_range),
-            max_distance=float(args.lidar_max_distance),
-            theta_min=float(args.theta_min),
-            theta_max=float(args.theta_max),
-            phi_min=float(args.phi_min),
-            phi_max=float(args.phi_max),
-            delta_theta=float(args.delta_theta),
-            delta_phi=float(args.delta_phi),
+            include_workspace=True,
+            **distance_params,
         )
     except Exception as exc:
-        print(f"[LIDARCHECK] exact pointcloud build failed at step={global_step}: {exc}", flush=True)
-        pointcloud = None
-
-    try:
-        lidar_distance = exact_lidar_distance_grid(
-            base_env,
-            theta_min=float(args.theta_min),
-            theta_max=float(args.theta_max),
-            phi_min=float(args.phi_min),
-            phi_max=float(args.phi_max),
-            delta_theta=float(args.delta_theta),
-            delta_phi=float(args.delta_phi),
-            min_range=float(args.lidar_min_range),
-            max_distance=float(args.lidar_max_distance),
-            obstacle_size_xy=1.0,
-            obstacle_height=10.0,
-            surface_step=float(args.lidar_surface_step),
-        )
-    except Exception as exc:
-        print(f"[LIDARCHECK] exact distance grid failed at step={global_step}: {exc}", flush=True)
-        lidar_distance = torch.full(
+        print(f"[LIDARCHECK] generated scene distance grid failed at step={global_step}: {exc}", flush=True)
+        scene_distance = torch.full(
             (num_envs, lidar_dim),
             float(args.lidar_max_distance),
             device=states.device,
             dtype=torch.float32,
         )
-    lidar_closeness = states[:, state_dim: state_dim + lidar_dim]
-    valid_mask = lidar_distance < (float(args.lidar_max_distance) - 1.0e-5)
+
+    try:
+        obstacle_distance = exact_lidar_distance_grid(
+            base_env,
+            obstacle_size_xy=1.0,
+            obstacle_height=10.0,
+            surface_step=float(args.lidar_surface_step),
+            include_workspace=False,
+            **distance_params,
+        )
+    except Exception as exc:
+        print(f"[LIDARCHECK] generated obstacle-only distance grid failed at step={global_step}: {exc}", flush=True)
+        obstacle_distance = torch.full_like(scene_distance, float(args.lidar_max_distance))
+
+    try:
+        workspace_distance = workspace_lidar_distance_grid(base_env, **distance_params)
+    except Exception as exc:
+        print(f"[LIDARCHECK] generated workspace-only distance grid failed at step={global_step}: {exc}", flush=True)
+        workspace_distance = torch.full_like(scene_distance, float(args.lidar_max_distance))
+
+    try:
+        actual_distance = get_exact_lidar_grid_cached(
+            base_env,
+            obstacle_size_xy=1.0,
+            obstacle_height=10.0,
+            surface_step=float(args.lidar_surface_step),
+            include_workspace=True,
+            **distance_params,
+        )
+    except Exception as exc:
+        print(f"[LIDARCHECK] actual-used distance grid lookup failed at step={global_step}: {exc}", flush=True)
+        actual_distance = scene_distance
+
+    policy_closeness = states[:, state_dim: state_dim + lidar_dim]
+    expected_closeness = lidar_distance_to_closeness(
+        actual_distance,
+        max_distance=float(args.lidar_max_distance),
+        safe_distance=float(args.lidar_safe_distance),
+        exponent=float(args.lidar_closeness_exponent),
+    )
+    scene_valid_mask = scene_distance < (float(args.lidar_max_distance) - 1.0e-5)
+    obstacle_valid_mask = obstacle_distance < (float(args.lidar_max_distance) - 1.0e-5)
+    actual_valid_mask = actual_distance < (float(args.lidar_max_distance) - 1.0e-5)
+    closeness_err_max, scene_actual_err_max = _write_lidarcheck_summary_csv(
+        step_dir / "lidarcheck_summary.csv",
+        global_step=global_step,
+        scene_distance=scene_distance,
+        obstacle_distance=obstacle_distance,
+        workspace_distance=workspace_distance,
+        actual_distance=actual_distance,
+        policy_closeness=policy_closeness,
+        expected_closeness=expected_closeness,
+    )
     for env_id in range(num_envs):
         prefix = f"env_{env_id:04d}"
-        if isinstance(pointcloud, list) and env_id < len(pointcloud):
-            pts_np = _finite_downsample_points(pointcloud[env_id], max_points=max_points)
-            _save_pointcloud_3d(
-                pts_np,
-                step_dir / f"{prefix}_exact_pointcloud3d.png",
-                title=f"Exact scene point cloud env={env_id} step={global_step}",
-            )
         _save_lidar_distance_heatmap(
-            lidar_distance[env_id],
+            scene_distance[env_id],
             grid_shape=lidar_grid_shape,
-            path=step_dir / f"{prefix}_distance_grid.png",
-            title=f"Exact scene LiDAR distance grid env={env_id} step={global_step}",
+            path=step_dir / f"{prefix}_generated_scene_distance_grid.png",
+            title=f"Generated scene LiDAR distance with workspace env={env_id} step={global_step}",
             max_distance=float(args.lidar_max_distance),
-            valid_flat=valid_mask[env_id],
+            valid_flat=scene_valid_mask[env_id],
+        )
+        _save_lidar_distance_heatmap(
+            obstacle_distance[env_id],
+            grid_shape=lidar_grid_shape,
+            path=step_dir / f"{prefix}_generated_obstacle_only_distance_grid.png",
+            title=f"Generated obstacle-only LiDAR distance env={env_id} step={global_step}",
+            max_distance=float(args.lidar_max_distance),
+            valid_flat=obstacle_valid_mask[env_id],
+        )
+        _save_lidar_distance_heatmap(
+            actual_distance[env_id],
+            grid_shape=lidar_grid_shape,
+            path=step_dir / f"{prefix}_actual_used_distance_grid.png",
+            title=f"Actual-used raw LiDAR distance grid env={env_id} step={global_step}",
+            max_distance=float(args.lidar_max_distance),
+            valid_flat=actual_valid_mask[env_id],
         )
         _save_lidar_state_heatmap(
-            lidar_closeness[env_id],
+            policy_closeness[env_id],
             grid_shape=lidar_grid_shape,
-            path=step_dir / f"{prefix}_closeness_grid.png",
-            title=f"Exact LiDAR closeness feature env={env_id} step={global_step}",
-            valid_flat=valid_mask[env_id],
-            colorbar_label="lidar closeness feature [0, 1]; gray = empty bin",
+            path=step_dir / f"{prefix}_actual_used_closeness_grid.png",
+            title=f"Actual-used policy LiDAR closeness env={env_id} step={global_step}",
+            valid_flat=actual_valid_mask[env_id],
+            colorbar_label="policy input LiDAR closeness [0, 1]; gray = empty bin",
         )
-        _save_lidar_valid_mask(
-            valid_mask[env_id],
-            grid_shape=lidar_grid_shape,
-            path=step_dir / f"{prefix}_valid_mask.png",
-            title=f"Exact LiDAR occupied bins env={env_id} step={global_step}",
-        )
-        _save_lidar_state_3d(
-            lidar_closeness[env_id],
-            valid_mask[env_id],
-            grid_shape=lidar_grid_shape,
-            path=step_dir / f"{prefix}_closeness_3d.png",
-            title=f"Exact LiDAR closeness feature 3D env={env_id} step={global_step}",
-            value_label="lidar closeness feature [0, 1]",
-        )
-    print(f"[LIDARCHECK] saved {num_envs} envs to {step_dir}", flush=True)
+    print(
+        f"[LIDARCHECK] saved {num_envs} envs to {step_dir}; "
+        f"policy_closeness_vs_recomputed max_abs={closeness_err_max:.6g}; "
+        f"scene_vs_actual_distance max_abs={scene_actual_err_max:.6g}",
+        flush=True,
+    )
 
 
 # -----------------------------------------------------------------------------
