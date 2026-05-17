@@ -26,7 +26,7 @@ os.environ.setdefault(
 parser = argparse.ArgumentParser("Stable skrl PPO trainer for IsaacLab drone lidar task")
 parser.add_argument("--task", type=str, default="Isaac-OmniPerception-Drone-Lidar-v0")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
-parser.add_argument("--num_envs", type=int, default=128)
+parser.add_argument("--num_envs", type=int, default=30)
 parser.add_argument("--num_obstacles", type=int, default=500)
 parser.add_argument("--timesteps", type=int, default=10_000_000)
 parser.add_argument("--seed", type=int, default=42)

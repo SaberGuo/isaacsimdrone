@@ -13,6 +13,27 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from pxr import Gf, UsdGeom
 
+
+# ---------------------------------------------------------------------------
+# Patch ArticulationData.update to tolerate zero-DOF articulations.
+# The Iris USD has no revolute joints exposed to PhysX (rotors are visual
+# only), so max_dofs == 0 and get_dof_velocities() raises an exception.
+# ---------------------------------------------------------------------------
+def _patched_articulation_data_update(self, dt: float):
+    self._sim_timestamp += dt
+    if self._root_physx_view.max_dofs > 0:
+        try:
+            self.joint_acc
+        except Exception:
+            pass
+
+
+try:
+    from isaaclab.assets.articulation.articulation_data import ArticulationData
+    ArticulationData.update = _patched_articulation_data_update
+except Exception:
+    pass
+
 try:
     import gymnasium as gym
     from gymnasium.spaces import Box

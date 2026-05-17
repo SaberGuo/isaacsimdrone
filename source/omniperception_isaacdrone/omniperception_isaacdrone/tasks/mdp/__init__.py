@@ -20,6 +20,7 @@ from .test_observations import (
     obs_state_norm,
 )
 from .test_rewards import (
+    penalty_apf_repulsive,
     penalty_safe_vel,
     penalty_collision,
     penalty_energy,
@@ -29,6 +30,7 @@ from .test_rewards import (
     penalty_time_out,
     penalty_time_cost,
     reward_action_l2,
+    reward_apf_attractive,
     reward_distance_to_goal,
     reward_goal_reached,
     reward_height_tracking,
@@ -69,8 +71,10 @@ __all__ = [
     "obs_state_norm",
     
     # rewards
+    "penalty_apf_repulsive",
     "penalty_safe_vel",
     "penalty_height_error",
+    "reward_apf_attractive",
     "reward_distance_to_goal",
     "reward_progress_to_goal",
     "reward_height_tracking",

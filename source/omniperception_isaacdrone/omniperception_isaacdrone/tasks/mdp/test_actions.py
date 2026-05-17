@@ -176,13 +176,11 @@ class RootTwistVelocityActionTerm(ActionTerm):
         self._torques[:, 0, 1] = tau_y
         self._torques[:, 0, 2] = tau_z
 
-        self._asset.permanent_wrench_composer.set_forces_and_torques(
+        self._asset.set_external_force_and_torque(
             forces=self._forces,
             torques=self._torques,
-            positions=None,
             body_ids=self._body_ids,
             env_ids=None,
-            is_global=False,
         )
         self._debug_counter += 1
         if self._debug_print and (self._debug_counter % self._debug_interval == 0):

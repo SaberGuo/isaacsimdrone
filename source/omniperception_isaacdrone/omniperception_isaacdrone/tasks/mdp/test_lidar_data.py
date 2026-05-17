@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
-from isaaclab.utils.math import quat_apply, quat_apply_inverse
+from isaaclab.utils.math import quat_apply, quat_inv
 
 
 def _get_workspace_bounds(
@@ -163,7 +163,7 @@ def _workspace_boundary_pointcloud_body(
     for env_id in range(int(env.num_envs)):
         rel_w = surface_w - robot_pos_w[env_id].unsqueeze(0)
         quat = robot_quat_w[env_id].unsqueeze(0).expand(rel_w.shape[0], -1)
-        rel_b = quat_apply_inverse(quat, rel_w)
+        rel_b = quat_apply(quat_inv(quat), rel_w)
         ranges = torch.linalg.norm(rel_b, dim=-1)
         safe_r = torch.clamp(ranges, min=1.0e-12)
         theta = torch.rad2deg(torch.acos(torch.clamp(rel_b[:, 2] / safe_r, -1.0, 1.0)))
@@ -296,7 +296,7 @@ def exact_obstacle_pointcloud_body(
     for env_id in range(int(env.num_envs)):
         rel_w = points_w - robot_pos_w[env_id].unsqueeze(0)
         quat = robot_quat_w[env_id].unsqueeze(0).expand(rel_w.shape[0], -1)
-        rel_b = quat_apply_inverse(quat, rel_w)
+        rel_b = quat_apply(quat_inv(quat), rel_w)
         ranges = torch.linalg.norm(rel_b, dim=-1)
         valid = (ranges >= float(min_range)) & (ranges <= float(max_distance))
         obstacle_cloud = rel_b[valid].contiguous()

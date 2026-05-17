@@ -230,6 +230,16 @@ class Test6RewardsCfg:
     collision_penalty = RewTerm(func=my_mdp.penalty_collision, weight=-1400.0, params={})
     oob_penalty = RewTerm(func=my_mdp.penalty_out_of_workspace, weight=-900.0, params={})
     timeout_penalty = RewTerm(func=my_mdp.penalty_time_out, weight=-2500.0, params={})
+    apf_attractive = RewTerm(
+        func=my_mdp.reward_apf_attractive,
+        weight=0.0,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    apf_repulsive = RewTerm(
+        func=my_mdp.penalty_apf_repulsive,
+        weight=0.0,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
 
 
 @configclass
@@ -247,7 +257,7 @@ class Test6CurriculumCfg:
     obstacle_count = CurrTerm(
         func=my_mdp.update_obstacle_curriculum,
         params={
-            "levels": (0, 50, 100, 200, 300),
+            "levels": (50, 50, 100, 200, 300),
             "success_term_name": "reached_goal",
             "success_threshold": 0.85,
             "success_thresholds": (0.85, 0.85, 0.85, 0.85, 0.85),

@@ -9,7 +9,7 @@ import torch
 import isaaclab.envs.mdp as mdp
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_apply_inverse, quat_unique
+from isaaclab.utils.math import quat_apply, quat_inv, quat_unique
 
 from .test_lidar_data import get_exact_lidar_grid_cached
 
@@ -132,7 +132,7 @@ def obs_goal_delta(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.T
 
     # 将世界系目标误差转换到机体坐标系
     quat_w = mdp.root_quat_w(env, asset_cfg=asset_cfg)
-    return quat_apply_inverse(quat_w, delta_w)
+    return quat_apply(quat_inv(quat_w), delta_w)
 
 
 # -----------------------------------------------------------------------------
