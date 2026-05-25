@@ -41,6 +41,14 @@ parser.add_argument("--lidar_surface_step", type=float, default=0.5)
 parser.add_argument("--lidar_safe_distance", type=float, default=5.0)
 parser.add_argument("--lidar_closeness_exponent", type=float, default=0.810930216216329)
 
+parser.add_argument("--enable_apf", action="store_true", default=False,
+                    help="Enable APF (attractive + repulsive) reward terms.")
+parser.add_argument("--no_enable_apf", dest="enable_apf", action="store_false")
+parser.add_argument("--apf_attractive_weight", type=float, default=0.5,
+                    help="Weight for APF attractive reward (used when --enable_apf).")
+parser.add_argument("--apf_repulsive_weight", type=float, default=-0.5,
+                    help="Weight for APF repulsive penalty; should be negative.")
+
 parser.add_argument(
     "--checkpoint",
     type=str,
@@ -325,6 +333,20 @@ def infer_lidar_grid_shape(base_env: Any, lidar_dim: int) -> tuple[int, int] | N
     except Exception:
         pass
     return None
+
+
+def apply_apf_cli_params(env_cfg: Any) -> None:
+    """Toggle APF reward weights from CLI flags. No-op if reward terms are absent."""
+    rewards = getattr(env_cfg, "rewards", None)
+    if rewards is None:
+        return
+    att_w = float(args.apf_attractive_weight) if args.enable_apf else 0.0
+    rep_w = float(args.apf_repulsive_weight) if args.enable_apf else 0.0
+    if hasattr(rewards, "apf_attractive"):
+        rewards.apf_attractive.weight = att_w
+    if hasattr(rewards, "apf_repulsive"):
+        rewards.apf_repulsive.weight = rep_w
+    print(f"[INFO] APF: enable={args.enable_apf}, att_w={att_w}, rep_w={rep_w}", flush=True)
 
 
 def apply_lidar_grid_cli_params(env_cfg: Any) -> None:
@@ -672,6 +694,7 @@ def main() -> None:
         use_fabric=not args.disable_fabric,
     )
     apply_lidar_grid_cli_params(env_cfg)
+    apply_apf_cli_params(env_cfg)
     env_cfg.scene.replicate_physics = True
     env_cfg.scene.filter_collisions = True
     try:
