@@ -65,6 +65,12 @@ parser.add_argument("--dist_interval", type=int, default=0)
 parser.add_argument("--dist_window", type=int, default=10)
 parser.add_argument("--dist_max_samples", type=int, default=2048)
 parser.add_argument("--checkpoint_interval", type=int, default=50000)
+parser.add_argument("--resume_from", type=str, default="",
+                    help="Path to a checkpoint .pt file. Loads model weights and continues "
+                         "training from the embedded step (or 0 if not derivable).")
+parser.add_argument("--resume_latest", action="store_true", default=False,
+                    help="Auto-locate the newest manual_checkpoints/*.pt under logs/ and resume "
+                         "from it. Ignored when --resume_from is set.")
 parser.add_argument("--cuda_clean_interval", type=int, default=0)
 parser.add_argument("--extra_tb_subdir", type=str, default="", help="Deprecated: TensorBoard logs are unified under the run directory.")
 parser.add_argument("--keep_infos", action="store_true", default=False)
@@ -372,6 +378,23 @@ def apply_apf_cli_params(env_cfg: Any) -> None:
     if hasattr(rewards, "apf_repulsive"):
         rewards.apf_repulsive.weight = rep_w
     print(f"[INFO] APF: enable={args.enable_apf}, att_w={att_w}, rep_w={rep_w}", flush=True)
+
+
+def find_latest_manual_checkpoint(log_root: Path) -> Path | None:
+    """Find the newest checkpoint .pt under any logs/<run>/manual_checkpoints/ folder."""
+    if not log_root.exists():
+        return None
+    candidates = [p for p in log_root.rglob("manual_checkpoints/*.pt")]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def parse_step_from_checkpoint_name(path: Path) -> int:
+    """Extract integer step from filenames like 'models_t12345.pt' or 'agent_450000.pt'. Returns 0 if not derivable."""
+    import re
+    m = re.search(r"_t(\d+)\.pt$", path.name) or re.search(r"_(\d+)\.pt$", path.name)
+    return int(m.group(1)) if m else 0
 
 
 def apply_lidar_grid_cli_params(env_cfg: Any) -> None:
@@ -1440,6 +1463,37 @@ def main() -> None:
     )
     bind_skrl_tb_tag_normalizer(agent)
     agent.init()
+
+    # ----- Resume from checkpoint (model weights only; sim state cannot be restored) -----
+    resume_step_offset = 0
+    resume_path: Path | None = None
+    if args.resume_from.strip():
+        resume_path = Path(args.resume_from).expanduser().resolve()
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"--resume_from path does not exist: {resume_path}")
+    elif bool(args.resume_latest):
+        resume_path = find_latest_manual_checkpoint(log_root)
+        if resume_path is None:
+            print(f"[WARN] --resume_latest set but no checkpoint found under {log_root}. Starting fresh.",
+                  flush=True)
+    if resume_path is not None:
+        print(f"[INFO] Resuming from checkpoint: {resume_path}", flush=True)
+        payload = torch.load(resume_path, map_location=device)
+        loaded_any = False
+        for name, model in models.items():
+            sd = payload.get(name) if isinstance(payload, dict) else None
+            if isinstance(sd, dict):
+                missing, unexpected = model.load_state_dict(sd, strict=False)
+                print(f"[INFO]   loaded model '{name}': missing={len(missing)}, unexpected={len(unexpected)}",
+                      flush=True)
+                loaded_any = True
+            else:
+                print(f"[WARN]   no state_dict for model '{name}' in checkpoint payload", flush=True)
+        if not loaded_any:
+            raise RuntimeError(f"No model weights could be loaded from {resume_path}")
+        resume_step_offset = parse_step_from_checkpoint_name(resume_path)
+        print(f"[INFO] Resume step offset: {resume_step_offset}", flush=True)
+
     writer = getattr(agent, "writer", None)
     if writer is None:
         writer = SummaryWriter(log_dir=str(exp_dir))
@@ -1473,8 +1527,12 @@ def main() -> None:
         max_samples=int(args.dist_max_samples),
     ) if enable_hist_logging else None
     latest_curriculum_log: Dict[str, float] = {}
+    remaining_steps = max(int(args.timesteps) - int(resume_step_offset), 0)
+    if resume_step_offset > 0:
+        print(f"[INFO] Remaining timesteps to run: {remaining_steps} "
+              f"(target {args.timesteps} - resumed {resume_step_offset})", flush=True)
     pbar = tqdm(
-        range(int(args.timesteps)),
+        range(remaining_steps),
         ncols=110,
         disable=int(args.pbar_interval) <= 0,
         miniters=max(int(args.pbar_interval), 1),
@@ -1482,7 +1540,7 @@ def main() -> None:
     )
     try:
         for t in pbar:
-            global_step = t + 1
+            global_step = t + 1 + int(resume_step_offset)
             agent.pre_interaction(timestep=t, timesteps=int(args.timesteps))
             with torch.no_grad():
                 act_output = agent.act(states, timestep=t, timesteps=int(args.timesteps))

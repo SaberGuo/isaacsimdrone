@@ -20,6 +20,7 @@ DRY_RUN=false
 FORCE=false
 APF_ONLY=false
 BASELINE_ONLY=false
+RESUME=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,6 +34,8 @@ while [[ $# -gt 0 ]]; do
       APF_ONLY=true; shift ;;
     --baseline-only)
       BASELINE_ONLY=true; shift ;;
+    --resume)
+      RESUME=true; shift ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
@@ -40,6 +43,9 @@ while [[ $# -gt 0 ]]; do
       echo "  --scale {default|large}   Training scale (default: default)"
       echo "  --dry-run                 Print experiment plan without running"
       echo "  --force                   Ignore existing runs and re-run all"
+      echo "  --resume                  For each experiment whose params match a"
+      echo "                            previous run, resume from the newest .pt"
+      echo "                            checkpoint in that run (instead of skipping)"
       echo "  --apf-only                Skip baseline, run only APF variants"
       echo "  --baseline-only           Run only the baseline (no APF)"
       echo "  -h, --help                Show this help"
@@ -47,6 +53,7 @@ while [[ $# -gt 0 ]]; do
       echo "Examples:"
       echo "  $0 --dry-run"
       echo "  $0 --scale large --apf-only"
+      echo "  $0 --resume                  # continue any aborted experiments"
       echo "  nohup $0 > ablation.log 2>&1 &"
       exit 0 ;;
     *)
@@ -130,6 +137,12 @@ check_existing() {
   local rep="$3"
   local ts="$4"
   local ne="$5"
+  local with_path="${6:-false}"
+
+  local extra=()
+  if [[ "$with_path" == "true" ]]; then
+    extra+=("--print-path")
+  fi
 
   "$PYTHON_CMD" "$CHECK_DEDUP_SCRIPT" \
     --logs-dir "$LOGS_DIR" \
@@ -137,7 +150,21 @@ check_existing() {
     --apf-attractive-weight "$att" \
     --apf-repulsive-weight "$rep" \
     --timesteps "$ts" \
-    --num-envs "$ne" 2>/dev/null
+    --num-envs "$ne" \
+    "${extra[@]}" 2>/dev/null
+}
+
+# Returns absolute path of the newest manual_checkpoints/*.pt under a run dir,
+# or empty string if none exists.
+find_latest_ckpt_in_run() {
+  local run_dir="$1"
+  if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then
+    return 0
+  fi
+  local latest
+  latest="$(find "$run_dir" -type f -path '*/manual_checkpoints/*.pt' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr | head -n 1 | awk '{print $2}')"
+  echo "$latest"
 }
 
 # --- Header -----------------------------------------------------------------
@@ -152,12 +179,14 @@ echo "[INFO] Logs dir     : $LOGS_DIR"
 echo "[INFO] Ablation logs: $ABLATION_LOG_DIR"
 echo "[INFO] Dry-run      : $DRY_RUN"
 echo "[INFO] Force        : $FORCE"
+echo "[INFO] Resume       : $RESUME"
 echo ""
 
 mkdir -p "$ABLATION_LOG_DIR"
 
 skipped=0
 to_run=0
+resumed=0
 
 # --- Main loop --------------------------------------------------------------
 for i in "${!EXP_NAMES[@]}"; do
@@ -178,11 +207,31 @@ for i in "${!EXP_NAMES[@]}"; do
   fi
 
   status="RUN"
+  resume_arg=""
   if [[ "$FORCE" != "true" ]]; then
-    result=$(check_existing "$enable_apf" "$att" "$rep" "$TIMESTEPS" "$NUM_ENVS" || true)
-    if [[ "$result" == "FOUND" ]]; then
-      status="SKIP"
-      ((skipped++)) || true
+    if [[ "$RESUME" == "true" ]]; then
+      result=$(check_existing "$enable_apf" "$att" "$rep" "$TIMESTEPS" "$NUM_ENVS" "true" || true)
+    else
+      result=$(check_existing "$enable_apf" "$att" "$rep" "$TIMESTEPS" "$NUM_ENVS" "false" || true)
+    fi
+
+    if [[ "$result" == FOUND* ]]; then
+      if [[ "$RESUME" == "true" ]]; then
+        run_dir="${result#FOUND }"
+        ckpt="$(find_latest_ckpt_in_run "$run_dir")"
+        if [[ -n "$ckpt" ]]; then
+          status="RESUME"
+          resume_arg="--resume_from $ckpt"
+          ((resumed++)) || true
+          ((to_run++)) || true
+        else
+          status="SKIP"
+          ((skipped++)) || true
+        fi
+      else
+        status="SKIP"
+        ((skipped++)) || true
+      fi
     else
       ((to_run++)) || true
     fi
@@ -191,12 +240,19 @@ for i in "${!EXP_NAMES[@]}"; do
   fi
 
   echo "[$status] $name"
-  if [[ "$status" == "RUN" && "$DRY_RUN" != "true" ]]; then
+  if [[ "$status" == "RESUME" ]]; then
+    echo "[INFO] Resuming from: $ckpt"
+  fi
+  if [[ ( "$status" == "RUN" || "$status" == "RESUME" ) && "$DRY_RUN" != "true" ]]; then
     echo "[INFO] Launching: $name"
-    echo "[INFO] Command  : $ISAACLAB_SH -p $TRAIN_SCRIPT $args"
+    full_args="$args"
+    if [[ -n "$resume_arg" ]]; then
+      full_args="$full_args $resume_arg"
+    fi
+    echo "[INFO] Command  : $ISAACLAB_SH -p $TRAIN_SCRIPT $full_args"
     echo "[INFO] Log file : $log_file"
     cd "$REPO_ROOT/IsaacLab"
-    nohup "$ISAACLAB_SH" -p "$TRAIN_SCRIPT" $args > "$log_file" 2>&1 &
+    nohup "$ISAACLAB_SH" -p "$TRAIN_SCRIPT" $full_args > "$log_file" 2>&1 &
     PID=$!
     wait $PID
     exit_code=$?
@@ -210,8 +266,8 @@ for i in "${!EXP_NAMES[@]}"; do
 done
 
 echo "=============================================================================="
-echo "  Summary: $to_run run, $skipped skipped"
-echo "  Dry-run: $DRY_RUN, Force: $FORCE"
+echo "  Summary: $to_run run ($resumed resumed), $skipped skipped"
+echo "  Dry-run: $DRY_RUN, Force: $FORCE, Resume: $RESUME"
 echo "=============================================================================="
 
 if [[ "$DRY_RUN" == "true" ]]; then

@@ -5,8 +5,11 @@
 #   ./run_test6_train.sh
 #   ./run_test6_train.sh --num_envs 16 --timesteps 100000 --headless
 #   ./run_test6_train.sh --num_envs 32 --timesteps 2000000 --headless
+#   ./run_test6_train.sh --resume --num_envs 32 --timesteps 2000000 --headless
 #
 # Common flags:
+#   --resume                     Auto-resume from newest checkpoint under logs/
+#                                (alias for --resume_latest passed to the python script)
 #   --num_envs <N>               Number of parallel envs (default: 32)
 #   --timesteps <N>              Total training timesteps (default: 2_000_000)
 #   --headless                   Run without GUI (recommended for training)
@@ -27,12 +30,22 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ISAACLAB_SH="$REPO_ROOT/IsaacLab/isaaclab.sh"
 TRAIN_SCRIPT="$REPO_ROOT/omniperception_isaacdrone-v3/scripts/test_train_skrl.py"
 
+# Translate --resume -> --resume_latest before forwarding to python script
+PASS_ARGS=()
+for a in "$@"; do
+    case "$a" in
+        --resume) PASS_ARGS+=("--resume_latest") ;;
+        *) PASS_ARGS+=("$a") ;;
+    esac
+done
+
 cd "$REPO_ROOT/IsaacLab" || exit 1
 
 echo "[INFO] Launching SKRL training ..."
 echo "[INFO] Repo root: $REPO_ROOT"
 echo "[INFO] Conda env: $CONDA_PREFIX"
 echo "[INFO] Train script: $TRAIN_SCRIPT"
+echo "[INFO] Forwarded args: ${PASS_ARGS[*]}"
 
 if [ ! -f "$ISAACLAB_SH" ]; then
     echo "[ERROR] IsaacLab launcher not found: $ISAACLAB_SH"
@@ -44,7 +57,9 @@ if [ ! -f "$TRAIN_SCRIPT" ]; then
     exit 1
 fi
 
-"$ISAACLAB_SH" -p "$TRAIN_SCRIPT" --headless "$@" &
+"$ISAACLAB_SH" -p "$TRAIN_SCRIPT" --headless "${PASS_ARGS[@]}" &
+PID=$!
+wait $PID
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then

@@ -36,6 +36,11 @@ def main() -> int:
     parser.add_argument("--apf-repulsive-weight", type=float, required=True)
     parser.add_argument("--timesteps", type=int, required=True)
     parser.add_argument("--num-envs", type=int, required=True)
+    parser.add_argument(
+        "--print-path",
+        action="store_true",
+        help="On match, print 'FOUND <run_dir>' so callers can resume from it.",
+    )
     args = parser.parse_args()
 
     target = {
@@ -64,7 +69,10 @@ def main() -> int:
             if match:
                 run_dir = os.path.dirname(os.path.dirname(config_path))
                 if glob.glob(os.path.join(run_dir, "events.out.tfevents.*")):
-                    print("FOUND")
+                    if args.print_path:
+                        print(f"FOUND {run_dir}")
+                    else:
+                        print("FOUND")
                     return 0
         except Exception:
             continue
